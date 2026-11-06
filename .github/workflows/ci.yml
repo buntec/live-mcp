@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      # Formatting, clippy, the Remote Script syntax check, and the tests
+      # (the end-to-end tests use the runner's python3).
+      - run: just check
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Keep in sync with workspace.package.rust-version in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
+
+  bundle:
+    name: Bundle LiveMCP Ear (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask bundle live-mcp-ear --release
+      - run: cargo build --release --locked --bin live-mcp
+      # A tarball keeps the executable bits and the bundle's layout, which artifact zips lose.
+      - run: tar -czf live-mcp-macos-arm64.tar.gz -C target "bundled/LiveMCP Ear.vst3" release/live-mcp
+      - uses: actions/upload-artifact@v7
+        with:
+          name: live-mcp-macos-arm64
+          path: live-mcp-macos-arm64.tar.gz
+          retention-days: 14

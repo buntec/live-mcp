@@ -1,5 +1,7 @@
 # live-mcp
 
+[![CI](https://github.com/buntec/live-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/buntec/live-mcp/actions/workflows/ci.yml)
+
 An MCP server for Ableton Live, written in Rust.
 
 The only code that runs inside Live is a small, generic Python Remote Script
