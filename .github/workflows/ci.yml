@@ -68,6 +68,8 @@ jobs:
           test -f "$scratch/User Library/Remote Scripts/LiveMCP/__init__.py"
           diff -r "target/bundled/LiveMCP Ear.vst3" "$scratch/VST3/LiveMCP Ear.vst3"
           codesign --verify --strict --verbose "$scratch/VST3/LiveMCP Ear.vst3"
+          test "$(plutil -extract CFBundleIdentifier raw "$scratch/VST3/LiveMCP Ear.vst3/Contents/Info.plist")" \
+            = io.github.buntec.live-mcp-ear
           ./target/release/live-mcp install --user-library "$scratch/User Library" --vst3-dir "$scratch/VST3" \
             | grep -q "Already up to date: .*LiveMCP Ear.vst3"
       # A tarball keeps the executable bit, which artifact zips lose.
