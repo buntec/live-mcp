@@ -4,6 +4,8 @@
 //! Results are deliberately left as [`serde_json::Value`]: the Remote Script
 //! is a generic Live API bridge, so result shapes depend on what was asked.
 
+pub mod ear;
+
 use std::fmt;
 use std::str::FromStr;
 

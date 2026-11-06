@@ -3,7 +3,8 @@ from .Device import Device
 
 
 class BrowserItem(LiveObject):
-    def __init__(self, name, children=(), loadable=False, device=None, uri=None):
+    def __init__(self, name, children=(), loadable=False, device=None, uri=None, plugin=False):
+        self._plugin = plugin  # a third-party plugin: loadable, but not flagged as a device
         self._name = name
         self._children = list(children)
         self._loadable = loadable
@@ -45,7 +46,9 @@ class Browser(LiveObject):
             "sounds": BrowserItem("Sounds", [BrowserItem("Bass", [BrowserItem("Warm Sub Bass.adv", loadable=True,
                                                                               device="instrument")])]),
             "samples": BrowserItem("Samples", [BrowserItem("kick.wav", loadable=True)]),
-            "plugins": BrowserItem("Plug-Ins", []),
+            "plugins": BrowserItem("Plug-Ins", [
+                BrowserItem("live-mcp", [BrowserItem("LiveMCP Ear", loadable=True, plugin=True)]),
+            ]),
         }
 
     def __getattr__(self, name):
@@ -60,7 +63,9 @@ class Browser(LiveObject):
         if not isinstance(item, BrowserItem) or not item._loadable:
             raise RuntimeError("Item is not loadable")
         track = self._app._song._view._selected_track
-        if item._device == "instrument":
+        if item._plugin:
+            track._devices.append(Device.plugin(item._name))
+        elif item._device == "instrument":
             track._devices.insert(0, Device.instrument(item._name))
         else:
             track._devices.append(Device.effect(item._name))

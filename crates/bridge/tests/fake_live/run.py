@@ -29,7 +29,8 @@ class CInstance(object):
 
 
 def main():
-    script = LiveMCP.create_instance(CInstance())
+    c_instance = CInstance()
+    script = LiveMCP.create_instance(c_instance)
     # Inside Live, Python threads only run during the main thread's ticks, so the
     # script must do everything from update_display() and start no threads.
     if threading.active_count() != 1:
@@ -43,7 +44,9 @@ def main():
     watcher = threading.Thread(target=wait_for_stdin_close)
     watcher.daemon = True
     watcher.start()
+    song = c_instance.song()
     while not stop.is_set():
+        song._tick()
         script.update_display()
         time.sleep(0.01)
     script.disconnect()

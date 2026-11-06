@@ -714,13 +714,18 @@ dependencies = [
 name = "live-mcp-ear"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
+ "live-mcp-analysis",
+ "live-mcp-protocol",
  "nice-plug",
+ "serde_json",
 ]
 
 [[package]]
 name = "live-mcp-protocol"
 version = "0.1.0"
 dependencies = [
+ "live-mcp-analysis",
  "serde",
  "serde_json",
 ]
@@ -731,6 +736,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "live-mcp-analysis",
  "live-mcp-bridge",
  "live-mcp-protocol",
  "rmcp",

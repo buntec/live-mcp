@@ -21,7 +21,7 @@ impl FakeLive {
             return None;
         }
         let state = tempfile::tempdir().expect("tempdir");
-        std::fs::write(state.path().join("config.json"), r#"{"port": 0}"#).expect("write config");
+        std::fs::write(state.path().join("config.json"), r#"{"port": 0, "ear_port": 0}"#).expect("write config");
         let runner = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_live/run.py");
         let child = Command::new("python3")
             .arg("-I")

@@ -4,6 +4,7 @@
 mod browser;
 mod clips;
 mod devices;
+mod ear;
 mod live;
 mod mcp;
 mod session;
@@ -155,7 +156,10 @@ async fn run(cli: Cli) -> Result<()> {
 
 async fn serve(options: Options) -> Result<()> {
     use rmcp::ServiceExt;
-    let server = mcp::LiveServer::new(options).serve(rmcp::transport::stdio()).await?;
+    let state_dir = options.state_dir.clone();
+    let server = mcp::LiveServer::new(options);
+    server.start_ear_hub(&state_dir).await;
+    let server = server.serve(rmcp::transport::stdio()).await?;
     server.waiting().await?;
     Ok(())
 }

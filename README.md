@@ -6,10 +6,9 @@ The only code that runs inside Live is a small, generic Python Remote Script
 (`remote_script/LiveMCP`). It exposes Live's object model over a local,
 token-authenticated JSON-RPC socket. Everything else is Rust.
 
-> **Status: M2 in progress.** The bridge to Live, the command-line client and
-> the MCP server work and have been tested on Live 12.4.16 (macOS). The
-> audio-analysis plugin, LiveMCP Ear, builds and loads in Live, but for now it
-> only passes audio through. It doesn't measure anything yet.
+> **Status: M2.** The bridge to Live, the command-line client, the MCP server,
+> and listening through the LiveMCP Ear plugin all work, and have been tested on
+> Live 12.4.16 (macOS, arm64).
 
 ## Layout
 
@@ -65,6 +64,7 @@ Other clients take the same command and arguments in their MCP server config.
 | `browser`, `load_device` | List or search Live's browser, load an item onto a track |
 | `device_parameters`, `set_parameter` | Read and set device parameters by index or name |
 | `transport` | Play/stop, tempo, position, loop, fire clips and scenes |
+| `listen`, `ears` | Play bars and get per-bar measurements from a LiveMCP Ear plugin |
 | `get`, `set`, `call`, `describe`, `batch` | Generic access to the whole Live Object Model |
 | `status` | Connection and script version check |
 
@@ -82,6 +82,41 @@ cp -R "target/bundled/LiveMCP Ear.vst3" ~/Library/Audio/Plug-Ins/VST3/
 In Live, open Settings → Plug-Ins, turn on **Use VST3 Plug-In System Folders**,
 and click **Rescan**. The plugin appears under Plug-Ins → live-mcp → LiveMCP Ear,
 and `load_device` can load it with the path `["plugins", "live-mcp", "LiveMCP Ear"]`.
+After rebuilding the plugin, restart Live: Live keeps the old binary loaded.
+
+### Listening
+
+Put a LiveMCP Ear wherever you want to listen: on the master track to hear the
+whole mix, or on a single track. `listen` plays `bars` bars from `start_bar` in
+real time and returns, for each bar:
+- loudness (LUFS, ITU-R BS.1770);
+- peak and RMS (dBFS), and crest factor;
+- energy in five bands (dBFS): low <120 Hz, low_mid 120–500 Hz, mid 500 Hz–2 kHz,
+  high_mid 2–6 kHz, high >6 kHz;
+- stereo correlation and width, and clipped samples.
+
+It also returns a summary of the whole section. `ears` shows which tracks have an
+Ear and whether each is connected.
+
+How it works:
+- The plugin measures audio on the audio thread without allocating (about
+  0.07% of one core). It streams per-bar reports to `live-mcp serve`, which
+  listens on 127.0.0.1:19419 and writes the actual port to `~/.live-mcp/ear.json`.
+- The plugin's **Tag** parameter is set by the server through the Live API, and
+  tells the server which track each plugin instance is on. Leave it alone.
+
+### Live's transport, as measured on 12.4
+
+- `start_playing` always starts at the song start.
+- `continue_playing` resumes where playback last *stopped*. A position set while
+  stopped is shown, but ignored.
+- Setting `current_song_time` while playing jumps there.
+- All of these take effect on a later tick: `is_playing` and `current_song_time`
+  read stale until then.
+
+So `listen` and `transport` start playback at a position by starting playback,
+waiting a tick, then jumping. Up to one tick (about 0.1 s) of audio from the song
+start can be heard first.
 
 ## Tests
 

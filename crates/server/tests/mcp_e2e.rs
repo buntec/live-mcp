@@ -2,57 +2,10 @@
 //!
 //! Requires `python3` on PATH; the tests are skipped (with a message) when it is missing.
 
-use live_mcp_bridge::paths::STATE_DIR_ENV;
-use live_mcp_bridge::testkit::FakeLive;
-use rmcp::model::CallToolRequestParams;
-use rmcp::service::RunningService;
-use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
-use rmcp::{RoleClient, ServiceExt};
+mod common;
+
+use common::Harness;
 use serde_json::{Value, json};
-
-struct Harness {
-    client: RunningService<RoleClient, ()>,
-    _fake: FakeLive,
-}
-
-impl Harness {
-    async fn start() -> Option<Self> {
-        let fake = FakeLive::start()?;
-        let state = fake.state_dir();
-        let command = tokio::process::Command::new(env!("CARGO_BIN_EXE_live-mcp")).configure(|cmd| {
-            cmd.arg("serve").env(STATE_DIR_ENV, &state);
-        });
-        let client = ().serve(TokioChildProcess::new(command).expect("spawn live-mcp")).await.expect("initialize");
-        Some(Self { client, _fake: fake })
-    }
-
-    /// Calls a tool; Ok with the parsed JSON result, or Err with the tool's error text.
-    async fn call(&self, name: &str, args: Value) -> Result<Value, String> {
-        let arguments = args.as_object().cloned().expect("arguments must be an object");
-        let result = self
-            .client
-            .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments))
-            .await
-            .expect("tools/call");
-        let text = result.content.first().and_then(|c| c.as_text()).map(|t| t.text.clone()).unwrap_or_default();
-        if result.is_error == Some(true) {
-            Err(text)
-        } else {
-            Ok(serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name} returned non-JSON ({e}): {text}")))
-        }
-    }
-
-    async fn ok(&self, name: &str, args: Value) -> Value {
-        self.call(name, args).await.unwrap_or_else(|e| panic!("{name} failed: {e}"))
-    }
-
-    async fn err(&self, name: &str, args: Value) -> String {
-        match self.call(name, args).await {
-            Err(e) => e,
-            Ok(v) => panic!("{name} unexpectedly succeeded: {v}"),
-        }
-    }
-}
 
 #[tokio::test]
 async fn lists_all_tools_with_object_schemas() {
@@ -69,7 +22,9 @@ async fn lists_all_tools_with_object_schemas() {
             "create_track",
             "describe",
             "device_parameters",
+            "ears",
             "get",
+            "listen",
             "load_device",
             "read_clip",
             "session",
@@ -233,6 +188,13 @@ async fn transport_controls() {
     assert_eq!(state["loop"], json!({"enabled": true, "start": 0.0, "length": 8.0}));
     let state = h.ok("transport", json!({"action": "stop"})).await;
     assert_eq!(state["playing"], false);
+    // Live applies a new position only on the next tick and drops it if playback starts in the
+    // same tick, so the tool must wait for the position before continuing.
+    let state = h.ok("transport", json!({"position": 24, "action": "continue"})).await;
+    assert_eq!((state["playing"].clone(), state["position"].clone()), (json!(true), json!(24.0)));
+    let now = h.ok("get", json!({"target": "live_set current_song_time"})).await;
+    assert_eq!(now, 24.0, "the fake does not advance time, so the position stays where it was set");
+    h.ok("transport", json!({"action": "stop"})).await;
 
     h.ok("write_clip", json!({"track": 0, "slot": 1, "notes": [{"pitch": 60, "start": 0, "duration": 1}]})).await;
     h.ok("transport", json!({"action": "fire_clip", "track": 0, "slot": 1})).await;

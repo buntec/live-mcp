@@ -178,6 +178,9 @@ class Song(LiveObject):
         self._tempo = 120.0
         self._is_playing = False
         self._current_song_time = 0.0
+        self._pending_song_time = None
+        self._resume_time = 0.0  # where continue_playing resumes: the last stop position
+        self._pending_transport = None
         self._loop = False
         self._loop_start = 0.0
         self._loop_length = 16.0
@@ -193,7 +196,37 @@ class Song(LiveObject):
     is_playing = property(lambda self: (guard(), self._is_playing)[1])
     signature_numerator = property(lambda self: (guard(), 4)[1])
     signature_denominator = property(lambda self: (guard(), 4)[1])
-    current_song_time = _prop("current_song_time", True, float)
+    @property
+    def current_song_time(self):
+        guard()
+        return self._current_song_time
+
+    @current_song_time.setter
+    def current_song_time(self, value):
+        # As in Live 12.4: a new position takes effect on the next tick, and starting
+        # playback in the same tick discards it. While stopped it changes the reported
+        # position but not where continue_playing resumes; while playing it jumps.
+        guard()
+        self._pending_song_time = float(value)
+
+    def _tick(self):
+        """Called by the test runner once per tick, before the script runs.
+
+        Transport commands, like position changes, take effect here, as in Live 12.4 where
+        is_playing reads the old value until the next tick.
+        """
+        action, self._pending_transport = self._pending_transport, None
+        if action == "start":  # always from the song start
+            self._is_playing, self._current_song_time = True, 0.0
+        elif action == "continue":  # from the last stop, not from a position set while stopped
+            self._is_playing, self._current_song_time = True, self._resume_time
+        elif action == "stop":
+            self._is_playing, self._resume_time = False, self._current_song_time
+        if action in ("start", "continue"):
+            self._pending_song_time = None  # starting playback discards a position set this tick
+        if self._pending_song_time is not None:
+            self._current_song_time = self._pending_song_time
+            self._pending_song_time = None
     loop = _prop("loop", True, _bool)
     loop_start = _prop("loop_start", True, float)
     loop_length = _prop("loop_length", True, float)
@@ -238,16 +271,15 @@ class Song(LiveObject):
 
     def start_playing(self):
         guard()
-        self._is_playing = True
-        self._current_song_time = 0.0
+        self._pending_transport = "start"
 
     def continue_playing(self):
         guard()
-        self._is_playing = True
+        self._pending_transport = "continue"
 
     def stop_playing(self):
         guard()
-        self._is_playing = False
+        self._pending_transport = "stop"
 
     def stop_all_clips(self, quantized=True):
         guard()

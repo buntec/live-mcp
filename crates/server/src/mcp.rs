@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 use crate::browser::{self, BrowserCache, BrowserParams, LoadDeviceParams};
 use crate::clips::{self, ReadClipParams, WriteClipParams};
 use crate::devices::{self, DeviceParametersParams, SetParameterParams};
+use crate::ear::{self, EarHub, EarsParams, ListenParams};
 use crate::live::{Live, default_true};
 use crate::session::{self, SessionParams};
 use crate::tracks::{self, CreateTrackParams};
@@ -40,6 +41,10 @@ The generic tools (get, set, call, describe, batch) reach the whole Live Object 
 - `batch` runs many ops in one request and one undo step. In a batch, \"@N\" targets the object \
 returned by op N (e.g. a clip created by op 0).
 
+To hear the result, put the LiveMCP Ear plugin on a track (load_device with path \
+[\"plugins\", \"live-mcp\", \"LiveMCP Ear\"]; the master track hears everything) and call `listen`. It plays \
+in real time, so listen to a few bars at a time.
+
 Live answers on its UI ticks (about 10 per second). The first call after a pause waits up to \
 ~100 ms; calls that follow quickly are fast. A call that times out may still have been applied: \
 check the state instead of retrying.";
@@ -48,6 +53,7 @@ check the state instead of retrying.";
 pub struct LiveServer {
     live: Arc<Live>,
     browser_cache: Arc<BrowserCache>,
+    hub: Arc<EarHub>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -135,10 +141,16 @@ pub struct BatchParams {
 
 #[tool_router(router = tool_router)]
 impl LiveServer {
+    /// Starts listening for LiveMCP Ear plugins. Failure is recorded and reported by the tools.
+    pub async fn start_ear_hub(&self, state_dir: &std::path::Path) {
+        self.hub.start(state_dir).await;
+    }
+
     pub fn new(options: Options) -> Self {
         Self {
             live: Arc::new(Live::new(options)),
             browser_cache: Arc::new(BrowserCache::default()),
+            hub: Arc::new(EarHub::default()),
             tool_router: Self::tool_router(),
         }
     }
@@ -209,6 +221,27 @@ impl LiveServer {
     )]
     async fn transport(&self, Parameters(p): Parameters<TransportParams>) -> ToolResult {
         respond(transport::transport(&self.live, p).await)
+    }
+
+    // -------------------------------------------------------------- listening
+
+    #[tool(
+        description = "Listen to the set through a LiveMCP Ear plugin (default: the one on the master track): plays \
+                       `bars` bars from `start_bar` in real time and returns per-bar loudness (LUFS), peak, RMS, \
+                       crest, five frequency bands (low <120 Hz, low_mid 120-500, mid 500-2k, high_mid 2-6k, high \
+                       >6k, dBFS), stereo correlation and width, plus a section summary."
+    )]
+    async fn listen(&self, Parameters(p): Parameters<ListenParams>) -> ToolResult {
+        respond(ear::listen(&self.live, &self.hub, p).await)
+    }
+
+    #[tool(
+        description = "List the LiveMCP Ear plugins in the set: which track each is on, whether it is connected to \
+                       this server, and its latest bar.",
+        annotations(read_only_hint = true)
+    )]
+    async fn ears(&self, Parameters(p): Parameters<EarsParams>) -> ToolResult {
+        respond(ear::ears(&self.live, &self.hub, p).await)
     }
 
     // ---------------------------------------------------------- generic tools

@@ -75,6 +75,22 @@ impl Live {
         self.request("get", json!({ "target": target, "fields": fields })).await
     }
 
+    /// Waits until Live's main thread has completed at least one more tick. Live applies
+    /// transport commands and position changes on a later tick, so reads in the same tick can
+    /// still see the old state.
+    pub async fn wait_tick(&self) -> Result<()> {
+        let ticks = |status: Value| status["ticks"].as_u64().unwrap_or(0);
+        let start = ticks(self.request("status", json!({})).await?);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while ticks(self.request("status", json!({})).await?) <= start {
+            if std::time::Instant::now() >= deadline {
+                bail!("Live's main thread did not tick within 2 s (is a dialog open in Live?)");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+        Ok(())
+    }
+
     /// Number of items in a sequence property, without reading them.
     pub async fn count(&self, target: &Target) -> Result<usize> {
         let page = self.request("get", json!({"target": target, "offset": 0, "limit": 0})).await?;
@@ -198,11 +214,11 @@ impl Track {
         Self { target: Target::path(format!("live_set tracks {index}")), kind: TrackKind::Regular(index) }
     }
 
-    fn return_track(index: usize) -> Self {
+    pub fn return_track(index: usize) -> Self {
         Self { target: Target::path(format!("live_set return_tracks {index}")), kind: TrackKind::Return(index) }
     }
 
-    fn master() -> Self {
+    pub fn master() -> Self {
         Self { target: Target::path("live_set master_track"), kind: TrackKind::Master }
     }
 

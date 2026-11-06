@@ -59,6 +59,14 @@ class Device(LiveObject):
         ])
 
     @classmethod
+    def plugin(cls, name):
+        """A third-party plugin, as Live wraps it: normalised 0–1 parameters."""
+        return cls(name, "PluginDevice", 2, [
+            DeviceParameter("Device On", 1, 0, 1, ["Off", "On"]),
+            DeviceParameter("Tag", 0, 0, 1),
+        ])
+
+    @classmethod
     def effect(cls, name):
         return cls(name, name.replace(" ", ""), 2, [
             DeviceParameter("Device On", 1, 0, 1, ["Off", "On"]),
