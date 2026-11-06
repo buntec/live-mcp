@@ -312,21 +312,21 @@ impl ItemRef {
         let names: Vec<&str> = items(&all).iter().map(|v| field_str(v, "name")).collect();
         let index = match self {
             ItemRef::Index(i) => *i,
-            ItemRef::Name(name) => match name.trim().parse::<usize>() {
-                Ok(i) => i,
-                Err(_) => {
-                    let lower = name.trim().to_lowercase();
-                    let hits: Vec<usize> =
-                        names.iter().enumerate().filter(|(_, n)| n.to_lowercase() == lower).map(|(i, _)| i).collect();
-                    match hits.as_slice() {
-                        [i] => *i,
-                        [] => {
-                            bail!("no {what} named {name:?}; there are {:?}", names.iter().take(60).collect::<Vec<_>>())
-                        }
-                        _ => bail!("several {what}s are named {name:?} (indexes {hits:?}); use an index"),
+            ItemRef::Name(name) => {
+                // A name wins over a number in a string ("808" is a common chain name); a string
+                // that names nothing is read as an index, for clients that send numbers as strings.
+                let lower = name.trim().to_lowercase();
+                let hits: Vec<usize> =
+                    names.iter().enumerate().filter(|(_, n)| n.to_lowercase() == lower).map(|(i, _)| i).collect();
+                match (hits.as_slice(), name.trim().parse::<usize>()) {
+                    ([i], _) => *i,
+                    ([], Ok(i)) => i,
+                    ([], Err(_)) => {
+                        bail!("no {what} named {name:?}; there are {:?}", names.iter().take(60).collect::<Vec<_>>())
                     }
+                    _ => bail!("several {what}s are named {name:?} (indexes {hits:?}); use an index"),
                 }
-            },
+            }
         };
         let name = names
             .get(index)

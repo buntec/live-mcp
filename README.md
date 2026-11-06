@@ -94,7 +94,7 @@ Each client starts its own server, and only the first one gets the Ear port
 | `create_track` | New MIDI, audio or return track |
 | `write_clip`, `read_clip` | MIDI notes in Session slots or on the Arrangement timeline |
 | `browser`, `load_device` | List or search Live's browser, load an item onto a track |
-| `device_parameters`, `set_parameter` | Read and set device parameters by index or name |
+| `device_parameters`, `set_parameter` | Read and set device parameters by index or name, including devices inside Racks |
 | `transport` | Play/stop, tempo, position, loop, fire clips and scenes |
 | `listen`, `ears` | Play bars and get per-bar measurements from a LiveMCP Ear plugin |
 | `analyze_file` | The same measurements for an audio file (e.g. a reference track), plus gated integrated loudness and loudness range |

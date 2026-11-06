@@ -1,27 +1,110 @@
 //! `device_parameters` and `set_parameter`.
 
 use anyhow::{Result, bail};
+use live_mcp_protocol::Target;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::live::{ItemRef, Live, TrackRef, call, field, field_bool, field_f64, field_str, items, set};
+use crate::live::{
+    ItemRef, Live, Track, TrackRef, call, field, field_bool, field_f64, field_str, get_fields, items, set,
+};
+
+/// A device on a track, or inside a Rack on it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum DeviceRef {
+    /// A device on the track: its 0-based index in chain order, or its exact name.
+    One(ItemRef),
+    /// A device inside a Rack: a path that alternates device, chain, device, e.g.
+    /// `["Bass Rack", "Sub", "Operator"]` or `[0, 1, 0]`. Drum Rack pads are chains too.
+    Path(Vec<ItemRef>),
+}
+
+/// A device found by a [`DeviceRef`].
+struct Device {
+    target: Target,
+    /// How tools report the device back: its index, or the path of indexes for a nested device.
+    label: Value,
+    name: String,
+}
+
+impl DeviceRef {
+    async fn resolve(&self, live: &Live, track: &Track) -> Result<Device> {
+        let steps = match self {
+            DeviceRef::One(step) => std::slice::from_ref(step),
+            DeviceRef::Path(steps) => steps.as_slice(),
+        };
+        if steps.len() % 2 == 0 {
+            bail!(
+                "a device path alternates device, chain, device and ends at a device, like \
+                 [\"Bass Rack\", \"Sub\", \"Operator\"]; this one has {} steps",
+                steps.len()
+            );
+        }
+        let mut target = track.target.clone();
+        let mut indexes = Vec::with_capacity(steps.len());
+        let mut name = String::new();
+        for (i, step) in steps.iter().enumerate() {
+            if i % 2 == 0 {
+                let (index, device_name) = step.resolve(live, &target.join("devices"), "device").await?;
+                target = target.join(&format!("devices {index}"));
+                indexes.push(index);
+                name = device_name;
+            } else {
+                if !can_have_chains(live, &target).await? {
+                    bail!("{name} is not a Rack, so it has no chains");
+                }
+                let (index, _) = step.resolve(live, &target.join("chains"), "chain").await?;
+                target = target.join(&format!("chains {index}"));
+                indexes.push(index);
+            }
+        }
+        let label = match self {
+            DeviceRef::One(_) => json!(indexes[0]),
+            DeviceRef::Path(_) => json!(indexes),
+        };
+        Ok(Device { target, label, name })
+    }
+}
+
+async fn can_have_chains(live: &Live, device: &Target) -> Result<bool> {
+    Ok(field_bool(&live.get_fields(device, &["can_have_chains"]).await?, "can_have_chains") == Some(true))
+}
+
+/// A Rack's chains with the names of their devices, so a caller can build a path into them.
+async fn rack_chains(live: &Live, device: &Target) -> Result<Value> {
+    let chains = live.get_fields(&device.join("chains"), &["name"]).await?;
+    let ops = (0..items(&chains).len()).map(|i| get_fields(&device.join(&format!("chains {i} devices")), &["name"]));
+    let devices = live.batch(ops.collect(), false).await?;
+    let out: Vec<Value> = items(&chains)
+        .iter()
+        .zip(devices)
+        .enumerate()
+        .map(|(i, (chain, devices))| {
+            let names: Vec<&str> = items(&devices).iter().map(|d| field_str(d, "name")).collect();
+            json!({"index": i, "name": field_str(chain, "name"), "devices": names})
+        })
+        .collect();
+    Ok(json!(out))
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeviceParametersParams {
     pub track: TrackRef,
-    /// Device index on the track (0-based, in chain order) or exact device name.
-    pub device: ItemRef,
+    /// Device index or exact name, or for a device inside a Rack a path that alternates device, chain,
+    /// device, like ["Bass Rack", "Sub", "Operator"]. `device_parameters` on a Rack lists its chains.
+    pub device: DeviceRef,
     /// Only parameters whose name contains this (case-insensitive).
     pub query: Option<String>,
 }
 
-const PARAM_FIELDS: &[&str] = &["name", "value", "min", "max", "is_quantized", "value_items"];
+const PARAM_FIELDS: &[&str] = &["name", "value", "min", "max", "is_quantized", "value_items", "is_enabled"];
 
 pub async fn device_parameters(live: &Live, params: DeviceParametersParams) -> Result<Value> {
     let track = params.track.resolve(live).await?;
-    let (device_index, device_name) = params.device.resolve(live, &track.target.join("devices"), "device").await?;
-    let list = track.target.join(&format!("devices {device_index} parameters"));
+    let device = params.device.resolve(live, &track).await?;
+    let list = device.target.join("parameters");
     let all = live.get_fields(&list, PARAM_FIELDS).await?;
     let wanted = params.query.as_deref().map(str::to_lowercase);
     let selected: Vec<(usize, &Value)> = items(&all)
@@ -48,6 +131,9 @@ pub async fn device_parameters(live: &Live, params: DeviceParametersParams) -> R
             if let Ok(Value::String(text)) = display {
                 entry.insert("display".into(), json!(text));
             }
+            if field_bool(p, "is_enabled") == Some(false) {
+                entry.insert("enabled".into(), json!(false));
+            }
             if field_bool(p, "is_quantized") == Some(true) {
                 entry.insert("options".into(), field(p, "value_items").cloned().unwrap_or_default());
             } else {
@@ -58,7 +144,10 @@ pub async fn device_parameters(live: &Live, params: DeviceParametersParams) -> R
         })
         .collect();
     let mut result =
-        json!({"track": track.label(), "device": device_index, "device_name": device_name, "parameters": out});
+        json!({"track": track.label(), "device": device.label, "device_name": device.name, "parameters": out});
+    if can_have_chains(live, &device.target).await? {
+        result["chains"] = rack_chains(live, &device.target).await?;
+    }
     if let Some(query) = params.query.as_deref()
         && selected.is_empty()
     {
@@ -81,8 +170,9 @@ pub enum ParamValue {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetParameterParams {
     pub track: TrackRef,
-    /// Device index on the track or exact device name.
-    pub device: ItemRef,
+    /// Device index or exact name, or for a device inside a Rack a path that alternates device, chain,
+    /// device, like ["Bass Rack", "Sub", "Operator"]. `device_parameters` on a Rack lists its chains.
+    pub device: DeviceRef,
     /// Parameter index or exact parameter name (see `device_parameters`).
     pub parameter: ItemRef,
     /// A number within the parameter's min–max, or for a parameter with options, one of the options.
@@ -91,11 +181,18 @@ pub struct SetParameterParams {
 
 pub async fn set_parameter(live: &Live, params: SetParameterParams) -> Result<Value> {
     let track = params.track.resolve(live).await?;
-    let (device_index, _) = params.device.resolve(live, &track.target.join("devices"), "device").await?;
-    let list = track.target.join(&format!("devices {device_index} parameters"));
+    let device = params.device.resolve(live, &track).await?;
+    let list = device.target.join("parameters");
     let (param_index, param_name) = params.parameter.resolve(live, &list, "parameter").await?;
     let param = list.join(&param_index.to_string());
-    let info = live.get_fields(&param, &["min", "max", "is_quantized", "value_items"]).await?;
+    let info = live.get_fields(&param, &["min", "max", "is_quantized", "value_items", "is_enabled"]).await?;
+    if field_bool(&info, "is_enabled") == Some(false) {
+        bail!(
+            "{param_name} on {} is disabled: a Rack macro or a Max for Live device controls it. \
+             Set that control instead.",
+            device.name
+        );
+    }
     let options: Vec<String> = items(field(&info, "value_items").unwrap_or(&Value::Null))
         .iter()
         .filter_map(|v| v.as_str().map(String::from))
@@ -120,7 +217,7 @@ pub async fn set_parameter(live: &Live, params: SetParameterParams) -> Result<Va
         .await?;
     Ok(json!({
         "track": track.label(),
-        "device": device_index,
+        "device": device.label,
         "parameter": param_index,
         "name": param_name,
         "value": results[0]["value"],

@@ -11,13 +11,14 @@ class DeviceParameter(LiveObject):
         self._max = float(maximum)
         self._items = tuple(items or ())
         self._unit = unit
+        self._enabled = True  # Live disables a parameter that a macro is mapped to
 
     name = property(lambda self: (guard(), self._name)[1])
     min = property(lambda self: (guard(), self._min)[1])
     max = property(lambda self: (guard(), self._max)[1])
     is_quantized = property(lambda self: (guard(), bool(self._items))[1])
     value_items = property(lambda self: (guard(), self._items)[1])
-    is_enabled = property(lambda self: (guard(), True)[1])
+    is_enabled = property(lambda self: (guard(), self._enabled)[1])
 
     @property
     def value(self):
@@ -28,6 +29,8 @@ class DeviceParameter(LiveObject):
     def value(self, value):
         guard()
         value = number_arg(value, "DeviceParameter")
+        if not self._enabled:
+            raise RuntimeError("Changes to this parameter are not allowed")
         if not self._min <= value <= self._max:
             raise ValueError("Invalid value")
         self._value = value
@@ -94,3 +97,40 @@ class Device(LiveObject):
             DeviceParameter("Device On", 1, 0, 1, ["Off", "On"]),
             DeviceParameter("Dry/Wet", 0.3, 0, 1, unit=""),
         ])
+
+    @classmethod
+    def instrument_rack(cls, name):
+        """An Instrument Rack whose first macro drives the Sub chain's Operator filter."""
+        operator = cls.instrument("Operator")
+        operator._parameters[1]._enabled = False
+        return RackDevice(name, "InstrumentGroupDevice", 1, [
+            DeviceParameter("Device On", 1, 0, 1, ["Off", "On"]),
+            DeviceParameter("Macro 1", 0, 0, 127),
+        ], [Chain("Sub", [operator]), Chain("Pad", [cls.instrument("Wavetable"), cls.effect("Reverb")])])
+
+
+class Chain(LiveObject):
+    def __init__(self, name, devices):
+        self._name = name
+        self._devices = devices
+
+    @property
+    def name(self):
+        guard()
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        guard()
+        self._name = str(value)
+
+    devices = property(lambda self: (guard(), tuple(self._devices))[1])
+
+
+class RackDevice(Device):
+    def __init__(self, name, class_name, kind, parameters, chains):
+        Device.__init__(self, name, class_name, kind, parameters)
+        self._chains = chains
+
+    can_have_chains = property(lambda self: (guard(), True)[1])
+    chains = property(lambda self: (guard(), tuple(self._chains))[1])

@@ -8,7 +8,7 @@ class BrowserItem(LiveObject):
         self._name = name
         self._children = list(children)
         self._loadable = loadable
-        self._device = device  # "instrument" | "effect" | None
+        self._device = device  # "instrument" | "rack" | "effect" | None
         self._uri = uri or "query:Fake#" + name.replace(" ", "%20")
 
     name = property(lambda self: (guard(), self._name)[1])
@@ -35,6 +35,7 @@ class Browser(LiveObject):
                                          BrowserItem("Bass", [BrowserItem("Sub Bass.adg", loadable=True)])],
                             loadable=True, device="instrument"),
                 _device("Wavetable", "instrument"),
+                _device("Instrument Rack", "rack"),
             ]),
             "audio_effects": BrowserItem("Audio Effects", [
                 BrowserItem("Delay & Loop", [_device("Echo", "effect"), _device("Delay", "effect")]),
@@ -65,6 +66,8 @@ class Browser(LiveObject):
         track = self._app._song._view._selected_track
         if item._plugin:
             track._devices.append(Device.plugin(item._name))
+        elif item._device == "rack":
+            track._devices.insert(0, Device.instrument_rack(item._name))
         elif item._device == "instrument":
             track._devices.insert(0, Device.instrument(item._name))
         else:
