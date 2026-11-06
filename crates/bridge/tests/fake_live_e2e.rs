@@ -2,74 +2,13 @@
 //!
 //! Requires `python3` on PATH; the tests are skipped (with a message) when it is missing.
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use live_mcp_bridge::testkit::FakeLive;
 use live_mcp_bridge::{Bridge, BridgeError, GetOptions, Options, paths, script};
 use live_mcp_protocol::{BatchOp, Target, codes, new_live_object, tuple};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-struct FakeLive {
-    child: Child,
-    state: tempfile::TempDir,
-}
-
-impl FakeLive {
-    fn start() -> Option<Self> {
-        if Command::new("python3").arg("--version").output().is_err() {
-            eprintln!("skipping: python3 not found");
-            return None;
-        }
-        let state = tempfile::tempdir().unwrap();
-        std::fs::write(state.path().join("config.json"), r#"{"port": 0}"#).unwrap();
-        let runner = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_live/run.py");
-        let child = Command::new("python3")
-            .arg("-I")
-            .arg("-B")
-            .arg(runner)
-            .env(paths::STATE_DIR_ENV, state.path())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn python3");
-        let fake = Self { child, state };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while paths::read_endpoint(fake.state.path()).is_none() {
-            assert!(Instant::now() < deadline, "fake Live did not start listening");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        Some(fake)
-    }
-
-    fn options(&self) -> Options {
-        Options { state_dir: self.state.path().to_path_buf(), ..Options::default() }
-    }
-
-    fn state_dir(&self) -> PathBuf {
-        self.state.path().to_path_buf()
-    }
-
-    async fn connect(&self) -> Bridge {
-        Bridge::connect(&self.options()).await.expect("connect")
-    }
-}
-
-impl Drop for FakeLive {
-    fn drop(&mut self) {
-        drop(self.child.stdin.take()); // closing stdin stops the runner cleanly
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let _ = self.child.kill();
-    }
-}
 
 fn path(p: &str) -> Target {
     Target::path(p)
@@ -109,7 +48,8 @@ async fn get_set_call_and_describe() {
     let props = live.get(&path("live_set tracks 1"), GetOptions::props(["name", "mute"])).await.unwrap();
     assert_eq!(props, json!({"name": "Drums", "mute": false}));
 
-    // Relative path from an id.
+    // Relative path from an id (MIDI clips need a MIDI track, as in Live).
+    let id = tracks[0]["$obj"].as_u64().unwrap();
     let slot_target = Target::Ref { id, path: Some("clip_slots 0".into()) };
     live.call(&slot_target, "create_clip", vec![json!(4.0)]).await.unwrap();
     let clip = live
@@ -336,4 +276,37 @@ async fn concurrent_connections_are_serialised_on_the_main_thread() {
     rb.unwrap();
     let tracks = a.get(&path("live_set tracks"), GetOptions::default()).await.unwrap();
     assert_eq!(tracks.as_array().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn batch_ops_can_target_earlier_results() {
+    let Some(fake) = FakeLive::start() else { return };
+    let live = fake.connect().await;
+    let created = Target::batch_result(0);
+    let note = new_live_object("Clip.MidiNoteSpecification", json!({"pitch": 48, "start_time": 0.0, "duration": 1.0}));
+    let ops = vec![
+        BatchOp {
+            method: "call".into(),
+            params: json!({"target": "live_set tracks 0 clip_slots 1", "method": "create_clip", "args": [8.0]}),
+        },
+        BatchOp { method: "set".into(), params: json!({"target": created, "prop": "name", "value": "Bassline"}) },
+        BatchOp {
+            method: "call".into(),
+            params: json!({"target": created, "method": "add_new_notes", "args": [tuple(vec![note])]}),
+        },
+        BatchOp { method: "get".into(), params: json!({"target": created.join("length")}) },
+        BatchOp { method: "get".into(), params: json!({"target": Target::batch_result(1)}) },
+    ];
+    let result = live.batch(&ops, true, false).await.unwrap();
+    let results = result["results"].as_array().unwrap();
+    assert!(results[..4].iter().all(|r| r["ok"] == true), "{results:?}");
+    assert_eq!(results[3]["result"], 8.0);
+    // Op 1 returned a plain value, not a Live object.
+    assert_eq!(results[4]["error"]["code"], codes::INVALID_PARAMS);
+
+    let name = live.get(&path("live_set tracks 0 clip_slots 1 clip name"), GetOptions::default()).await.unwrap();
+    assert_eq!(name, "Bassline");
+
+    let err = live.get(&Target::batch_result(0), GetOptions::default()).await.unwrap_err();
+    assert_eq!(err.code(), Some(codes::INVALID_PARAMS), "result targets only work inside a batch");
 }

@@ -1,0 +1,333 @@
+//! The MCP server: typed tools for common work plus generic access to the Live Object Model.
+
+use std::sync::Arc;
+
+use live_mcp_bridge::{GetOptions, Options, script};
+use live_mcp_protocol::{BatchOp, Target};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+
+use crate::browser::{self, BrowserCache, BrowserParams, LoadDeviceParams};
+use crate::clips::{self, ReadClipParams, WriteClipParams};
+use crate::devices::{self, DeviceParametersParams, SetParameterParams};
+use crate::live::{Live, default_true};
+use crate::session::{self, SessionParams};
+use crate::tracks::{self, CreateTrackParams};
+use crate::transport::{self, TransportParams};
+
+/// Results larger than this are refused, with a hint to narrow the request.
+const MAX_RESULT_CHARS: usize = 200_000;
+
+const INSTRUCTIONS: &str = "\
+Controls Ableton Live through the LiveMCP Remote Script. Start with `session` to see the set.
+
+Typed tools (session, create_track, write_clip, read_clip, browser, load_device, device_parameters, \
+set_parameter, transport) cover common work. Times and lengths are in beats (quarter notes). Tracks \
+are 0-based indexes among the regular tracks, exact names, \"master\", or \"return N\".
+
+The generic tools (get, set, call, describe, batch) reach the whole Live Object Model:
+- A target is a path from `live_set` or `live_app`, like \"live_set tracks 0 clip_slots 1 clip\", or \
+\"#ID\" for an object returned earlier as {\"$obj\": ID}, optionally followed by a relative path \
+(\"#ID devices 0\").
+- `describe` lists an object's properties, methods and nested types. Use it to explore.
+- In values and arguments, {\"$ref\": target} passes a Live object, {\"$tuple\": [...]} a tuple, and \
+{\"$new\": \"Clip.MidiNoteSpecification\", \"kwargs\": {...}} constructs a class from the Live module.
+- `batch` runs many ops in one request and one undo step. In a batch, \"@N\" targets the object \
+returned by op N (e.g. a clip created by op 0).
+
+Live answers on its UI ticks (about 10 per second). The first call after a pause waits up to \
+~100 ms; calls that follow quickly are fast. A call that times out may still have been applied: \
+check the state instead of retrying.";
+
+#[derive(Clone)]
+pub struct LiveServer {
+    live: Arc<Live>,
+    browser_cache: Arc<BrowserCache>,
+    tool_router: ToolRouter<Self>,
+}
+
+type ToolResult = Result<String, String>;
+
+fn respond(result: anyhow::Result<Value>) -> ToolResult {
+    match result {
+        Ok(value) => {
+            let text = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+            if text.len() > MAX_RESULT_CHARS {
+                return Err(format!(
+                    "the result is too large ({} characters); narrow it with props, fields, offset/limit or a \
+                     more specific target",
+                    text.len()
+                ));
+            }
+            Ok(text)
+        }
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
+fn parse_target(text: &str) -> anyhow::Result<Target> {
+    text.parse::<Target>().map_err(anyhow::Error::msg)
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetParams {
+    /// Path from live_set/live_app ("live_set tracks 0"), "#ID", or "#ID relative path".
+    pub target: String,
+    /// Read these properties of the target and return them as an object.
+    pub props: Option<Vec<String>>,
+    /// For each Live object in the result, also read these properties.
+    pub fields: Option<Vec<String>>,
+    /// Page through a list: the result becomes {total, offset, items}.
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetParams {
+    pub target: String,
+    pub prop: String,
+    /// The new value. {"$ref": target} passes a Live object.
+    pub value: Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CallParams {
+    pub target: String,
+    pub method: String,
+    #[serde(default)]
+    pub args: Vec<Value>,
+    pub kwargs: Option<Map<String, Value>>,
+    /// For each Live object in the result, also read these properties.
+    pub fields: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DescribeParams {
+    pub target: String,
+    /// Also read each property's current value.
+    #[serde(default)]
+    pub values: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BatchOpParam {
+    /// "get", "set", "call" or "describe".
+    pub method: String,
+    /// The same parameters as the tool of that name; targets may also be "@N" (op N's result).
+    pub params: Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BatchParams {
+    pub ops: Vec<BatchOpParam>,
+    /// Record the whole batch as one undo step in Live (default true).
+    #[serde(default = "default_true")]
+    pub undo_step: bool,
+    /// Stop at the first failing op (default true).
+    #[serde(default = "default_true")]
+    pub stop_on_error: bool,
+}
+
+#[tool_router(router = tool_router)]
+impl LiveServer {
+    pub fn new(options: Options) -> Self {
+        Self {
+            live: Arc::new(Live::new(options)),
+            browser_cache: Arc::new(BrowserCache::default()),
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    // ------------------------------------------------------------ typed tools
+
+    #[tool(
+        description = "Overview of the Live set: tempo, time signature, transport, loop, tracks (kind, mute/solo/arm, \
+                       devices, Session clips), return tracks, master devices and scenes.",
+        annotations(read_only_hint = true)
+    )]
+    async fn session(&self, Parameters(p): Parameters<SessionParams>) -> ToolResult {
+        respond(session::session(&self.live, p).await)
+    }
+
+    #[tool(description = "Create a MIDI, audio or return track, optionally at an index and with a name.")]
+    async fn create_track(&self, Parameters(p): Parameters<CreateTrackParams>) -> ToolResult {
+        respond(tracks::create_track(&self.live, p).await)
+    }
+
+    #[tool(
+        description = "Write MIDI notes to a clip in a Session slot (created if empty; existing notes replaced unless \
+                       replace=false) or to a new Arrangement clip at arrangement_start. One undo step."
+    )]
+    async fn write_clip(&self, Parameters(p): Parameters<WriteClipParams>) -> ToolResult {
+        respond(clips::write_clip(&self.live, p).await)
+    }
+
+    #[tool(
+        description = "Read a clip: name, length, loop and markers, and its MIDI notes.",
+        annotations(read_only_hint = true)
+    )]
+    async fn read_clip(&self, Parameters(p): Parameters<ReadClipParams>) -> ToolResult {
+        respond(clips::read_clip(&self.live, p).await)
+    }
+
+    #[tool(
+        description = "List or search Live's browser (instruments, effects, drums, sounds, plugins, ...). With no \
+                       path, lists the roots; with a path, lists that folder; with a query, searches item names. \
+                       Pass a result's path to load_device.",
+        annotations(read_only_hint = true)
+    )]
+    async fn browser(&self, Parameters(p): Parameters<BrowserParams>) -> ToolResult {
+        respond(browser::browser(&self.live, &self.browser_cache, p).await)
+    }
+
+    #[tool(description = "Load a browser item (instrument, effect, preset, drum kit) onto a track.")]
+    async fn load_device(&self, Parameters(p): Parameters<LoadDeviceParams>) -> ToolResult {
+        respond(browser::load_device(&self.live, p).await)
+    }
+
+    #[tool(
+        description = "List a device's parameters with values, ranges or options, and display strings.",
+        annotations(read_only_hint = true)
+    )]
+    async fn device_parameters(&self, Parameters(p): Parameters<DeviceParametersParams>) -> ToolResult {
+        respond(devices::device_parameters(&self.live, p).await)
+    }
+
+    #[tool(description = "Set a device parameter by index or name, to a number or one of its options.")]
+    async fn set_parameter(&self, Parameters(p): Parameters<SetParameterParams>) -> ToolResult {
+        respond(devices::set_parameter(&self.live, p).await)
+    }
+
+    #[tool(
+        description = "Transport: play, continue, stop, fire or stop a clip, fire a scene, stop all clips; set tempo, \
+                       position and loop. With no action, reports the transport state."
+    )]
+    async fn transport(&self, Parameters(p): Parameters<TransportParams>) -> ToolResult {
+        respond(transport::transport(&self.live, p).await)
+    }
+
+    // ---------------------------------------------------------- generic tools
+
+    #[tool(
+        description = "Read any Live Object Model target, or some of its properties. Live objects come back as \
+                       {\"$obj\": ID, \"type\": ...}; reuse them as \"#ID\".",
+        annotations(read_only_hint = true)
+    )]
+    async fn get(&self, Parameters(p): Parameters<GetParams>) -> ToolResult {
+        respond(
+            async {
+                let target = parse_target(&p.target)?;
+                let opts = GetOptions {
+                    props: p.props.unwrap_or_default(),
+                    fields: p.fields.unwrap_or_default(),
+                    offset: p.offset,
+                    limit: p.limit,
+                };
+                Ok(self.live.bridge().await?.get(&target, opts).await?)
+            }
+            .await,
+        )
+    }
+
+    #[tool(description = "Set a property of a Live object. Returns the value read back.")]
+    async fn set(&self, Parameters(p): Parameters<SetParams>) -> ToolResult {
+        respond(
+            async {
+                let target = parse_target(&p.target)?;
+                Ok(self.live.bridge().await?.set(&target, &p.prop, p.value).await?)
+            }
+            .await,
+        )
+    }
+
+    #[tool(description = "Call a method of a Live object.")]
+    async fn call(&self, Parameters(p): Parameters<CallParams>) -> ToolResult {
+        respond(
+            async {
+                let mut params = json!({"target": parse_target(&p.target)?, "method": p.method, "args": p.args});
+                if let Some(kwargs) = p.kwargs {
+                    params["kwargs"] = Value::Object(kwargs);
+                }
+                if let Some(fields) = p.fields {
+                    params["fields"] = json!(fields);
+                }
+                self.live.request("call", params).await
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "List a Live object's properties, methods, nested types and observable properties.",
+        annotations(read_only_hint = true)
+    )]
+    async fn describe(&self, Parameters(p): Parameters<DescribeParams>) -> ToolResult {
+        respond(
+            async {
+                let target = parse_target(&p.target)?;
+                Ok(self.live.bridge().await?.describe(&target, p.values).await?)
+            }
+            .await,
+        )
+    }
+
+    #[tool(description = "Run several get/set/call/describe ops in one request and (by default) one undo step. \
+                       \"@N\" targets the object returned by op N.")]
+    async fn batch(&self, Parameters(p): Parameters<BatchParams>) -> ToolResult {
+        respond(
+            async {
+                let mut ops = Vec::with_capacity(p.ops.len());
+                for (index, op) in p.ops.into_iter().enumerate() {
+                    let mut params = op.params;
+                    // Accept the compact text forms ("#12 name", "@0") for targets.
+                    if let Some(Value::String(text)) = params.get("target") {
+                        let target = parse_target(text).map_err(|e| anyhow::anyhow!("op {index}: {e}"))?;
+                        params.insert("target".into(), json!(target));
+                    }
+                    ops.push(BatchOp { method: op.method, params: Value::Object(params) });
+                }
+                Ok(self.live.bridge().await?.batch(&ops, p.undo_step, p.stop_on_error).await?)
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Connection check: Remote Script and Live versions, whether the installed script is current, \
+                       and Live's tick rate.",
+        annotations(read_only_hint = true)
+    )]
+    async fn status(&self) -> ToolResult {
+        respond(
+            async {
+                let bridge = self.live.bridge().await?;
+                let info = bridge.info().await?;
+                let health = bridge.status().await?;
+                let mut out = json!({"live": info, "bridge": health, "script_current": !bridge.script_is_stale()});
+                if bridge.script_is_stale() {
+                    out["warning"] = json!(format!(
+                        "the Remote Script running in Live is not the one this server ships; run `live-mcp install` \
+                     and restart Live (expected script hash {})",
+                        script::source_hash()
+                    ));
+                }
+                Ok(out)
+            }
+            .await,
+        )
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for LiveServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("live-mcp", env!("CARGO_PKG_VERSION")))
+            .with_instructions(INSTRUCTIONS)
+    }
+}

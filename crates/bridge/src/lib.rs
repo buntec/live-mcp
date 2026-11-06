@@ -14,6 +14,8 @@
 
 pub mod paths;
 pub mod script;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

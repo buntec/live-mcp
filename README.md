@@ -6,9 +6,10 @@ The only code that runs inside Live is a small, generic Python Remote Script
 (`remote_script/LiveMCP`). It exposes Live's object model over a local,
 token-authenticated JSON-RPC socket. Everything else is Rust.
 
-> **Status: M0.** The bridge to Live and a command-line client work. So far
-> they've only been tested against a fake Live API, not against a real Live.
-> The MCP server (M1) and the audio-analysis plugin (M2) haven't been written yet.
+> **Status: M1.** The bridge to Live, a command-line client and the MCP server
+> work. The bridge has been tested on Live 12.4.16 (macOS). The MCP tools have
+> been tested against a fake Live API so far. The audio-analysis plugin (M2)
+> hasn't been written yet.
 
 ## Layout
 
@@ -17,7 +18,7 @@ token-authenticated JSON-RPC socket. Everything else is Rust.
 | `remote_script/LiveMCP/__init__.py` | The Remote Script: standard library only, no music logic |
 | `crates/protocol` | Wire types shared by every client |
 | `crates/bridge` | Async client, token and endpoint files, embedded script and installer |
-| `crates/server` | `live-mcp` binary (CLI now, MCP server in M1) |
+| `crates/server` | `live-mcp` binary: the MCP server (`serve`) and CLI commands |
 | `docs/protocol.md` | The bridge protocol spec |
 
 ## Try it
@@ -42,6 +43,27 @@ live-mcp get "#<id> clip_slots 0 clip" --props name,length
 ```
 
 `set` values and `call` arguments are JSON, so strings need quotes: `'"Bass"'`.
+
+### Use it from an MCP client
+
+`live-mcp serve` speaks MCP over stdin/stdout. For Claude Code:
+
+```sh
+claude mcp add live -- /absolute/path/to/target/release/live-mcp serve
+```
+
+Other clients take the same command and arguments in their MCP server config.
+
+| Tools | |
+|---|---|
+| `session` | Overview: tempo, transport, tracks with devices and clips, returns, scenes |
+| `create_track` | New MIDI, audio or return track |
+| `write_clip`, `read_clip` | MIDI notes in Session slots or on the Arrangement timeline |
+| `browser`, `load_device` | List or search Live's browser, load an item onto a track |
+| `device_parameters`, `set_parameter` | Read and set device parameters by index or name |
+| `transport` | Play/stop, tempo, position, loop, fire clips and scenes |
+| `get`, `set`, `call`, `describe`, `batch` | Generic access to the whole Live Object Model |
+| `status` | Connection and script version check |
 
 After `live-mcp install` replaces an older version, **quit and restart Live**.
 Re-selecting the control surface creates a new instance but keeps the old code.

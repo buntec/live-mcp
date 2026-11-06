@@ -10,7 +10,7 @@ Wire protocol v1 (full spec: docs/protocol.md in the live-mcp repository):
     ~/.live-mcp/token;
   * there are no threads. Sockets are non-blocking and serviced from
     update_display(), which Live calls on its main thread at its UI tick rate
-    (about 13 Hz measured on Live 12.4). Inside Live, Python threads only run
+    (about 9.5 Hz measured on Live 12.4). Inside Live, Python threads only run
     while the main thread is executing Python, so a socket thread waits up to
     a tick at every blocking step. Doing all the I/O inside the tick costs at
     most one tick per request, and every Live API call stays on the main thread.
@@ -39,7 +39,7 @@ except ImportError:  # without it, each request just waits for the next tick
 import Live
 from _Framework.ControlSurface import ControlSurface
 
-SCRIPT_VERSION = "0.2.1"
+SCRIPT_VERSION = "0.3.0"
 PROTOCOL_VERSION = 1
 
 HOST = "127.0.0.1"
@@ -215,6 +215,7 @@ class LiveMCP(ControlSurface):
         self._state_dir = _state_dir()
         self._code_hash = _CODE_HASH
         self._registry = collections.OrderedDict()
+        self._batch_results = None  # results so far while a batch runs
         self._server = None
         self._port = None
         self._clients = []
@@ -614,6 +615,7 @@ class LiveMCP(ControlSurface):
         song = self.song()
         undo = bool(params.get("undo_step")) and hasattr(song, "begin_undo_step")
         results = []
+        self._batch_results = results
         if undo:
             song.begin_undo_step()
         try:
@@ -633,6 +635,7 @@ class LiveMCP(ControlSurface):
                 if stop_on_error and not results[-1]["ok"]:
                     break
         finally:
+            self._batch_results = None
             if undo:
                 song.end_undo_step()
         return {"results": results}
@@ -643,7 +646,12 @@ class LiveMCP(ControlSurface):
         if isinstance(target, str):
             return self._walk(None, target)
         if isinstance(target, dict):
-            base = self._lookup(target["id"]) if "id" in target else None
+            if "result" in target:
+                base = self._batch_result_object(target["result"])
+            elif "id" in target:
+                base = self._lookup(target["id"])
+            else:
+                base = None
             path = target.get("path") or ""
             if not isinstance(path, str):
                 raise RpcError(ERR_INVALID_PARAMS, "target path must be a string")
@@ -651,6 +659,21 @@ class LiveMCP(ControlSurface):
                 raise RpcError(ERR_INVALID_PARAMS, "target needs an id or a path")
             return self._walk(base, path)
         raise RpcError(ERR_INVALID_PARAMS, "target must be a path string or {id, path}")
+
+    def _batch_result_object(self, index):
+        """The Live object returned by an earlier op of the running batch."""
+        results = self._batch_results
+        if results is None:
+            raise RpcError(ERR_INVALID_PARAMS, "{\"result\": n} targets only work inside a batch")
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(results):
+            raise RpcError(ERR_INVALID_PARAMS, "no earlier batch op with index %r" % (index,))
+        entry = results[index]
+        value = entry.get("result") if entry.get("ok") else None
+        if isinstance(value, dict) and "value" in value and "$obj" not in value:
+            value = value["value"]  # a `set` result
+        if not (isinstance(value, dict) and "$obj" in value):
+            raise RpcError(ERR_INVALID_PARAMS, "batch op %d did not return a Live object" % index)
+        return self._lookup(value["$obj"])
 
     def _walk(self, base, path):
         tokens = path.split()

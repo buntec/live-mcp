@@ -1,5 +1,14 @@
-//! `live-mcp`: install the LiveMCP Remote Script and talk to it from the terminal.
-//! The MCP server itself (`live-mcp serve`) arrives in M1.
+//! `live-mcp`: the MCP server for Ableton Live (`live-mcp serve`), plus commands to install
+//! the LiveMCP Remote Script and talk to it from the terminal.
+
+mod browser;
+mod clips;
+mod devices;
+mod live;
+mod mcp;
+mod session;
+mod tracks;
+mod transport;
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -28,6 +37,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Run the MCP server on stdin/stdout (this is what an MCP client launches).
+    Serve,
     /// Install the Remote Script into Live's User Library and create the shared token.
     Install {
         /// Live's User Library folder (Settings → Library in Live). Defaults to the standard location.
@@ -101,6 +112,7 @@ async fn run(cli: Cli) -> Result<()> {
     let options =
         Options { port: cli.port, request_timeout: Duration::from_secs_f64(cli.timeout), ..Options::default() };
     match cli.command {
+        Cmd::Serve => serve(options).await,
         Cmd::Install { user_library } => install(&options, user_library),
         Cmd::Status => status(&options).await,
         Cmd::Get { target, props, fields, offset, limit } => {
@@ -139,6 +151,13 @@ async fn run(cli: Cli) -> Result<()> {
             print(&live.batch(&ops, undo_step, !keep_going).await?)
         }
     }
+}
+
+async fn serve(options: Options) -> Result<()> {
+    use rmcp::ServiceExt;
+    let server = mcp::LiveServer::new(options).serve(rmcp::transport::stdio()).await?;
+    server.waiting().await?;
+    Ok(())
 }
 
 fn install(options: &Options, user_library: Option<PathBuf>) -> Result<()> {

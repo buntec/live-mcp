@@ -19,4 +19,4 @@ class LiveObject(object):
         return id(self)
 
 
-from . import Application, Clip, Song  # noqa: E402,F401  (submodules, like the real Live)
+from . import Application, Clip, Device, Song  # noqa: E402,F401  (submodules, like the real Live)

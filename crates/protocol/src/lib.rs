@@ -68,14 +68,21 @@ impl fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
-/// What a request operates on: a path from a root (`live_set tracks 0`), or a
-/// previously returned object id, optionally followed by a relative path.
+/// What a request operates on: a path from a root (`live_set tracks 0`), a
+/// previously returned object id, or (inside a batch) the object returned by an
+/// earlier op. The last two can be followed by a relative path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Target {
     Path(String),
     Ref {
         id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// The Live object returned by op number `result` of the same batch.
+    BatchResult {
+        result: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
@@ -90,6 +97,23 @@ impl Target {
         Target::Ref { id, path: None }
     }
 
+    /// Inside a batch: the object returned by op `index`.
+    pub fn batch_result(index: usize) -> Self {
+        Target::BatchResult { result: index, path: None }
+    }
+
+    /// Appends a relative path, e.g. `clip_slots 0`.
+    pub fn join(&self, rest: &str) -> Self {
+        let join = |base: &str| if base.is_empty() { rest.to_owned() } else { format!("{base} {rest}") };
+        match self {
+            Target::Path(path) => Target::Path(join(path)),
+            Target::Ref { id, path } => Target::Ref { id: *id, path: Some(join(path.as_deref().unwrap_or(""))) },
+            Target::BatchResult { result, path } => {
+                Target::BatchResult { result: *result, path: Some(join(path.as_deref().unwrap_or(""))) }
+            }
+        }
+    }
+
     /// Wrap this target as an argument value (`{"$ref": target}`).
     pub fn as_arg(&self) -> Value {
         json!({ "$ref": self })
@@ -102,26 +126,34 @@ impl fmt::Display for Target {
             Target::Path(path) => f.write_str(path),
             Target::Ref { id, path: None } => write!(f, "#{id}"),
             Target::Ref { id, path: Some(path) } => write!(f, "#{id} {path}"),
+            Target::BatchResult { result, path: None } => write!(f, "@{result}"),
+            Target::BatchResult { result, path: Some(path) } => write!(f, "@{result} {path}"),
         }
     }
 }
 
-/// Parses the compact text form: `live_set tracks 0`, `#123` or `#123 clip_slots 0`.
+/// Parses the compact text form: `live_set tracks 0`, `#123`, `#123 clip_slots 0`,
+/// or `@0 clip_slots 0` (an earlier op's result, inside a batch).
 impl FromStr for Target {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
-        let Some(rest) = s.strip_prefix('#') else {
-            if s.is_empty() {
-                return Err("empty target".into());
-            }
-            return Ok(Target::Path(s.split_whitespace().collect::<Vec<_>>().join(" ")));
+        let (sigil, rest) = match s.chars().next() {
+            Some(c @ ('#' | '@')) => (c, &s[1..]),
+            Some(_) => return Ok(Target::Path(s.split_whitespace().collect::<Vec<_>>().join(" "))),
+            None => return Err("empty target".into()),
         };
         let mut parts = rest.splitn(2, char::is_whitespace);
-        let id = parts.next().unwrap_or_default().parse::<u64>().map_err(|_| format!("invalid object id in {s:?}"))?;
+        let number = parts.next().unwrap_or_default();
         let path = parts.next().map(str::trim).filter(|p| !p.is_empty()).map(String::from);
-        Ok(Target::Ref { id, path })
+        if sigil == '#' {
+            let id = number.parse::<u64>().map_err(|_| format!("invalid object id in {s:?}"))?;
+            Ok(Target::Ref { id, path })
+        } else {
+            let result = number.parse::<usize>().map_err(|_| format!("invalid batch op index in {s:?}"))?;
+            Ok(Target::BatchResult { result, path })
+        }
     }
 }
 
@@ -195,7 +227,12 @@ mod tests {
             "#42 clip_slots 0".parse::<Target>().unwrap(),
             Target::Ref { id: 42, path: Some("clip_slots 0".into()) }
         );
+        assert_eq!(
+            "@1 clip_slots 0".parse::<Target>().unwrap(),
+            Target::BatchResult { result: 1, path: Some("clip_slots 0".into()) }
+        );
         assert!("#x".parse::<Target>().is_err());
+        assert!("@-1".parse::<Target>().is_err());
         assert!("".parse::<Target>().is_err());
     }
 
@@ -206,13 +243,26 @@ mod tests {
         let parsed: Target = serde_json::from_value(json!({"id": 7, "path": "name"})).unwrap();
         assert_eq!(parsed, Target::Ref { id: 7, path: Some("name".into()) });
         assert_eq!(Target::id(7).as_arg(), json!({"$ref": {"id": 7}}));
+        assert_eq!(serde_json::to_value(Target::batch_result(0)).unwrap(), json!({"result": 0}));
+        let parsed: Target = serde_json::from_value(json!({"result": 2, "path": "name"})).unwrap();
+        assert_eq!(parsed, Target::BatchResult { result: 2, path: Some("name".into()) });
     }
 
     #[test]
     fn display_round_trips() {
-        for text in ["live_set tracks 0", "#5", "#5 clip_slots 1 clip"] {
+        for text in ["live_set tracks 0", "#5", "#5 clip_slots 1 clip", "@0", "@2 name"] {
             assert_eq!(text.parse::<Target>().unwrap().to_string(), text);
         }
+    }
+
+    #[test]
+    fn join_appends_paths() {
+        assert_eq!(
+            Target::path("live_set tracks 0").join("clip_slots 1"),
+            Target::path("live_set tracks 0 clip_slots 1")
+        );
+        assert_eq!(Target::id(3).join("name"), Target::Ref { id: 3, path: Some("name".into()) });
+        assert_eq!(Target::batch_result(0).join("a").join("b").to_string(), "@0 a b");
     }
 
     #[test]

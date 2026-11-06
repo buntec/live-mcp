@@ -14,6 +14,7 @@ REPO = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "remote_script"))
 
+import Live  # noqa: E402
 import LiveMCP  # noqa: E402
 from Live.Song import Song  # noqa: E402
 
@@ -21,6 +22,7 @@ from Live.Song import Song  # noqa: E402
 class CInstance(object):
     def __init__(self):
         self._song = Song()
+        Live.Application.get_application()._song = self._song
 
     def song(self):
         return self._song

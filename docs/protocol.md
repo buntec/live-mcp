@@ -87,7 +87,11 @@ Methods that operate on an object take a `target`:
   `song`) and `live_app` (alias `app`). Integer tokens index into the
   preceding sequence, and other tokens are attribute names;
 - `{"id": N}`: an object returned earlier as `{"$obj": N, ...}`;
-- `{"id": N, "path": "clip_slots 0"}`: a path relative to that object.
+- `{"id": N, "path": "clip_slots 0"}`: a path relative to that object;
+- inside a `batch` only, `{"result": K}` or `{"result": K, "path": "..."}`: the Live object
+  returned by op K of the same batch (a `set` result counts as its read-back value). This
+  lets one batch create something and configure it, as a single undo step. Rust clients
+  write it as `@K` in the compact text form.
 
 Attribute and method names must match `[A-Za-z][A-Za-z0-9_]*`, so nothing that
 starts with an underscore is reachable. `set` and `call` require the target to
