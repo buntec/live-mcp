@@ -6,9 +6,10 @@ The only code that runs inside Live is a small, generic Python Remote Script
 (`remote_script/LiveMCP`). It exposes Live's object model over a local,
 token-authenticated JSON-RPC socket. Everything else is Rust.
 
-> **Status: M2.** The bridge to Live, the command-line client, the MCP server,
-> and listening through the LiveMCP Ear plugin all work, and have been tested on
-> Live 12.4.16 (macOS, arm64).
+> **Status: M3.** The bridge to Live, the command-line client, the MCP server,
+> listening through the LiveMCP Ear plugin, reference-file analysis, snapshot
+> comparison and multi-track masking analysis all work, and have been tested on
+> Live 12.4.16 (macOS, arm64). See [Not yet](#not-yet) for what's missing.
 
 ## Layout
 
@@ -170,3 +171,10 @@ The end-to-end tests run the real Remote Script on a fake `Live` module
 (`crates/bridge/tests/fake_live/`, test-only Python). The fake raises if
 anything touches it off the main thread. The tests need `python3` on PATH and
 are skipped without it.
+
+## Not yet
+
+- **Listeners and events.** The bridge can't yet watch a property for changes;
+  `observe` and `events` are planned (see `docs/protocol.md`).
+- **Pan and sends in masking.** Track levels are corrected for the fader only.
+- **Other platforms and versions.** Only tested on macOS (arm64) with Live 12.4.
