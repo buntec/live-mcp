@@ -73,6 +73,11 @@ _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 _NOT_LIVE_OBJECTS = (bool, int, float, complex, str, bytes, bytearray,
                      list, tuple, dict, set, frozenset, type)
 
+# A JSON number literal. Some MCP clients send a number as a string when the
+# tool schema leaves `value` untyped and the number does not survive a
+# parse/print round trip ("1.0", "0.50"). `set` retries such a string as a number.
+_JSON_NUMBER_RE = re.compile(r"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$")
+
 
 def create_instance(c_instance):
     return LiveMCP(c_instance)
@@ -188,6 +193,15 @@ def _is_sequence(value):
     if isinstance(value, (str, bytes, bytearray, dict)):
         return False
     return hasattr(value, "__len__") and hasattr(value, "__iter__")
+
+
+def _number_from_text(value):
+    """The number a JSON number literal string spells, else None."""
+    if not isinstance(value, str) or not _JSON_NUMBER_RE.match(value):
+        return None
+    if "." in value or "e" in value or "E" in value:
+        return float(value)
+    return int(value)
 
 
 def _ok(req_id, result):
@@ -548,7 +562,14 @@ class LiveMCP(ControlSurface):
         prop = _check_name(params.get("prop"))
         if "value" not in params:
             raise RpcError(ERR_INVALID_PARAMS, "value is required")
-        setattr(obj, prop, self._decode(params["value"]))
+        value = self._decode(params["value"])
+        try:
+            setattr(obj, prop, value)
+        except TypeError:  # includes Boost.Python.ArgumentError: Live wanted another type
+            number = _number_from_text(value)
+            if number is None:
+                raise
+            setattr(obj, prop, number)
         return {"value": self._encode(getattr(obj, prop))}
 
     def _m_call(self, params):

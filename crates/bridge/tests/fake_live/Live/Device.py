@@ -1,6 +1,6 @@
 import math
 
-from . import LiveObject, guard
+from . import LiveObject, guard, number_arg
 
 
 class DeviceParameter(LiveObject):
@@ -27,7 +27,7 @@ class DeviceParameter(LiveObject):
     @value.setter
     def value(self, value):
         guard()
-        value = float(value)
+        value = number_arg(value, "DeviceParameter")
         if not self._min <= value <= self._max:
             raise ValueError("Invalid value")
         self._value = value

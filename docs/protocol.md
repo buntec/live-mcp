@@ -129,6 +129,12 @@ Inside `value`, `args` and `kwargs`:
 | `{"$new": "Clip.MidiNoteSpecification", "args": [...], "kwargs": {...}}` | an instance of that class. Only names inside the `Live` module are allowed. |
 | anything else | the plain JSON value |
 
+If Live rejects a `set` value's type (a `TypeError`, such as Boost.Python's
+`ArgumentError`) and the value is a string that is a JSON number literal, such
+as `"1.0"` or `"0.50"`, the script retries it once as that number. Some MCP
+clients send numbers that way when the tool schema leaves `value` untyped. A
+property that takes a string, such as a track name, keeps the string.
+
 ## Methods
 
 | Method | Params | Result |

@@ -1,6 +1,6 @@
 import time
 
-from . import LiveObject, guard
+from . import LiveObject, guard, number_arg
 from .Clip import Clip
 from .Device import Device, MixerDevice
 
@@ -241,6 +241,7 @@ class Song(LiveObject):
     @tempo.setter
     def tempo(self, value):
         guard()
+        value = number_arg(value, "Song")
         if not 20.0 <= value <= 999.0:
             raise ValueError("tempo out of range")
         self._tempo = float(value)

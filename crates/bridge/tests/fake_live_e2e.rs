@@ -83,6 +83,40 @@ async fn get_set_call_and_describe() {
 }
 
 #[tokio::test]
+async fn set_retries_number_strings_only_where_live_wants_a_number() {
+    let Some(fake) = FakeLive::start() else { return };
+    let live = fake.connect().await;
+
+    // Some MCP clients send an untyped 1.0 or 0.50 as a string; Live rejects a str for a float.
+    assert_eq!(live.set(&path("live_set"), "tempo", json!("128.0")).await.unwrap(), 128.0);
+    let volume = path("live_set tracks 0 mixer_device volume");
+    assert_eq!(live.set(&volume, "value", json!("0.50")).await.unwrap(), 0.5);
+    assert_eq!(live.set(&volume, "value", json!("1")).await.unwrap(), 1.0);
+
+    // The same path inside a batch.
+    let ops = vec![BatchOp {
+        method: "set".into(),
+        params: json!({"target": "live_set", "prop": "tempo", "value": "1.25e2"}),
+    }];
+    let result = live.batch(&ops, true, true).await.unwrap();
+    assert_eq!(result["results"][0]["result"]["value"], 125.0);
+
+    // A property that takes a string keeps the string.
+    assert_eq!(live.set(&path("live_set tracks 0"), "name", json!("808")).await.unwrap(), "808");
+
+    // Anything that is not a JSON number literal still fails, with Live's own error.
+    for text in ["fast", "nan", "inf", " 120", "0x7f", "01"] {
+        let err = live.set(&path("live_set"), "tempo", json!(text)).await.unwrap_err();
+        assert_eq!(err.code(), Some(codes::LIVE), "{text:?}");
+        assert!(err.to_string().contains("did not match C++ signature"), "{text:?}: {err}");
+    }
+    // A coerced number is still checked by Live.
+    let err = live.set(&path("live_set"), "tempo", json!("5000.0")).await.unwrap_err();
+    assert!(err.to_string().contains("tempo out of range"), "{err}");
+    assert_eq!(live.get(&path("live_set tempo"), GetOptions::default()).await.unwrap(), 125.0);
+}
+
+#[tokio::test]
 async fn notes_via_constructed_live_objects() {
     let Some(fake) = FakeLive::start() else { return };
     let live = fake.connect().await;

@@ -13,6 +13,19 @@ def guard():
         raise RuntimeError("Live API accessed off the main thread")
 
 
+class ArgumentError(TypeError):
+    """Stands in for Boost.Python.ArgumentError, which Live raises for an argument of the wrong type."""
+
+
+def number_arg(value, owner):
+    """Accept a number, as a Live float property does, or raise the way Live does."""
+    if not isinstance(value, (int, float)):
+        raise ArgumentError(
+            "Python argument types in\n    None.None(%s, %s)\ndid not match C++ signature:\n"
+            "    None(TPyHandle<ATimeableValue>, float)" % (owner, type(value).__name__))
+    return float(value)
+
+
 class LiveObject(object):
     @property
     def _live_ptr(self):
