@@ -28,6 +28,10 @@ class CInstance(object):
 
 def main():
     script = LiveMCP.create_instance(CInstance())
+    # Inside Live, Python threads only run during the main thread's ticks, so the
+    # script must do everything from update_display() and start no threads.
+    if threading.active_count() != 1:
+        raise SystemExit("LiveMCP started a thread: %s" % threading.enumerate())
     stop = threading.Event()
 
     def wait_for_stdin_close():

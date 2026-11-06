@@ -32,10 +32,6 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-/// Extra time the client waits beyond the timeout it asks the script to apply, so the
-/// script's own (more informative) timeout error normally arrives first.
-const CLIENT_GRACE: Duration = Duration::from_secs(2);
-
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
     #[error(
@@ -49,8 +45,8 @@ pub enum BridgeError {
     #[error("the LiveMCP script rejected the connection: {0}")]
     Unauthorized(String),
     /// The request may or may not have been applied. It is never retried automatically.
-    #[error("{method} timed out after {after:?} (started on Live's main thread: {started}); outcome unknown, not retried", started = started.map_or("unknown".to_string(), |s| s.to_string()))]
-    Timeout { method: String, after: Duration, started: Option<bool> },
+    #[error("{method} got no response within {after:?}; it may still be applied, so it is not retried")]
+    Timeout { method: String, after: Duration },
     #[error("{method} failed: {error}")]
     Rpc { method: String, error: RpcError },
     #[error("connection to the LiveMCP script closed")]
@@ -81,7 +77,7 @@ pub struct Options {
     /// `None`: use the port advertised in `bridge.json`, else [`DEFAULT_PORT`].
     pub port: Option<u16>,
     pub connect_timeout: Duration,
-    /// Default time to wait for Live's main thread per request.
+    /// Default time to wait for each response.
     pub request_timeout: Duration,
     pub client_name: String,
 }
@@ -207,18 +203,18 @@ impl Bridge {
         self.request_with_timeout(method, params, self.request_timeout).await
     }
 
-    /// Sends one request. `timeout` is how long the script may wait for Live's main thread.
+    /// Sends one request and waits up to `timeout` for its response. The script answers
+    /// requests in Live's main-thread ticks, so the first request after idle waits up to one tick (~105 ms).
     /// On timeout the outcome is unknown and the request is not retried.
     pub async fn request_with_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         if self.is_closed() {
             return Err(BridgeError::Closed);
         }
-        let mut params = match params {
+        let params = match params {
             Value::Null => json!({}),
             Value::Object(map) => Value::Object(map),
             other => return Err(BridgeError::Protocol(format!("params must be an object, got {other}"))),
         };
-        params.as_object_mut().expect("object").entry("timeout").or_insert(json!(timeout.as_secs_f64()));
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -236,10 +232,10 @@ impl Bridge {
             return Err(e.into());
         }
 
-        match tokio::time::timeout(timeout + CLIENT_GRACE, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Err(_) => {
                 self.pending.lock().expect("pending lock").remove(&id);
-                Err(BridgeError::Timeout { method: method.into(), after: timeout, started: None })
+                Err(BridgeError::Timeout { method: method.into(), after: timeout })
             }
             Ok(Err(_)) => Err(BridgeError::Closed),
             Ok(Ok(response)) => into_result(method, response),
@@ -251,8 +247,7 @@ impl Bridge {
         self.request("info", json!({})).await
     }
 
-    /// Socket-thread health: queue depth, time since the last main-thread tick, current job.
-    /// Answers even when Live's main thread is blocked.
+    /// Tick count and rate, connected clients and buffered requests.
     pub async fn status(&self) -> Result<Value> {
         self.request("status", json!({})).await
     }
@@ -291,24 +286,8 @@ fn into_result(method: &str, response: Response) -> Result<Value> {
     };
     match error.code {
         codes::UNAUTHORIZED => Err(BridgeError::Unauthorized(error.message)),
-        codes::TIMEOUT => Err(BridgeError::Timeout {
-            method: method.into(),
-            after: parse_after(&error.message),
-            started: error.data.as_ref().and_then(|d| d.get("started")).and_then(Value::as_bool),
-        }),
         _ => Err(BridgeError::Rpc { method: method.into(), error }),
     }
-}
-
-/// The script reports "timed out after 2.5s ..."; recover the duration for the error message.
-fn parse_after(message: &str) -> Duration {
-    message
-        .split("after ")
-        .nth(1)
-        .and_then(|rest| rest.split('s').next())
-        .and_then(|secs| secs.parse::<f64>().ok())
-        .map(Duration::from_secs_f64)
-        .unwrap_or_default()
 }
 
 async fn read_loop(read: OwnedReadHalf, pending: Pending, closed: Arc<AtomicBool>) {
@@ -338,25 +317,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_script_timeout_duration() {
-        assert_eq!(parse_after("timed out after 2.5s waiting for Live's main thread"), Duration::from_millis(2500));
-        assert_eq!(parse_after("something else"), Duration::ZERO);
-    }
-
-    #[test]
-    fn timeout_error_carries_started_flag() {
+    fn unauthorized_maps_to_its_own_error() {
         let response = Response {
             id: Some(1),
             result: None,
-            error: Some(RpcError {
-                code: codes::TIMEOUT,
-                message: "timed out after 1s waiting for Live's main thread".into(),
-                data: Some(json!({"method": "call", "started": true})),
-            }),
+            error: Some(RpcError { code: codes::UNAUTHORIZED, message: "invalid token".into(), data: None }),
         };
-        match into_result("call", response) {
-            Err(BridgeError::Timeout { started: Some(true), after, .. }) => assert_eq!(after, Duration::from_secs(1)),
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert!(matches!(into_result("hello", response), Err(BridgeError::Unauthorized(m)) if m == "invalid token"));
     }
 }

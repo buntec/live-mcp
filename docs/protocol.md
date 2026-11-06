@@ -38,23 +38,45 @@ embedded in its binary to detect a stale install.
 
 ## Threading model
 
-The Live API is only safe on Live's main thread. The script queues every Live
-API request and works through the queue in `update_display()`, which Live calls
-on its main thread at its UI refresh rate (assumed to be about 10 Hz; not yet
-measured on real Live). Each tick has a 50 ms time budget. So:
+The Live API is only safe on Live's main thread, and Live only runs Python
+code there during its UI ticks. Measured on Live 12.4.16, `update_display()`
+runs at about 9.5 Hz. Python threads exist inside Live, but a non-main thread
+only gets the interpreter lock while the main thread is executing Python. In
+practice a background socket thread waits up to one tick at *every* blocking
+step: a first version built that way took about 1 s to connect and about
+300 ms per request.
 
-- latency is roughly one tick per request, which is the reason `batch` exists;
-- requests from all connections are serialised;
-- `hello` and `status` run on the socket thread and never touch the Live API,
-  so `status` keeps answering while the main thread is blocked.
+So the script starts **no threads**. Its sockets are non-blocking, and every
+`update_display()` tick it:
 
-Every request accepts `params.timeout` (seconds, default 30, max 600). On
-expiry the script returns `-32002` with `data.started`:
+1. accepts pending connections;
+2. reads whatever bytes have arrived;
+3. answers complete request lines round-robin across clients until the tick's
+   50 ms budget is used (the first request of a tick always runs);
+4. writes as much buffered output as the sockets accept;
+5. if it answered anything, lingers: it waits up to 5 ms (with `select`) for
+   follow-up requests and answers them in the same tick. It repeats this until
+   no request arrives within 5 ms or the 50 ms budget is used.
 
-- `false`: the job never started and never will. It is safe to resend.
-- `true`: the job is running, and its outcome is **unknown**. Clients must not
-  retry automatically, because a retry could duplicate tracks or clips. Check the
-  state instead.
+Consequences:
+
+- The first request after an idle period waits for the next tick: 0–105 ms at
+  Live 12.4's roughly 9.5 Hz. Follow-ups that arrive within 5 ms of a response,
+  pipelined requests and `batch` ops are answered in the same tick. Measured on
+  Live 12.4.16: about 0.1 ms per back-to-back `get`, 1 ms for 50 pipelined gets.
+  `crates/bridge/examples/latency.rs` reproduces these numbers.
+- Lingering costs Live's main thread at most 5 ms idle time per tick, and only
+  in ticks that answered a request. `info.linger` reports whether it is
+  available. Without `select`, each request waits for its own tick.
+- Requests from all connections are serialised, and all of them, including
+  `hello` and `status`, run on the main thread.
+- A long-running call blocks Live's UI, and every other client, until it returns.
+
+Timeouts are purely client-side. A request that times out may still be
+executed later (when Live's main thread gets to it) or may already have run.
+Its outcome is unknown, so clients must not retry automatically: a retry could
+duplicate tracks or clips. Check the state instead. The client discards a late
+response to a request it has given up on.
 
 ## Targets
 
@@ -108,12 +130,12 @@ Inside `value`, `args` and `kwargs`:
 | Method | Params | Result |
 |---|---|---|
 | `hello` | `token`, `protocol`, `client` | `{script_version, protocol, code_hash}` |
-| `status` | | `{queued, ticks, last_tick_age, busy_method, busy_for}` (socket thread) |
+| `status` | | `{ticks, uptime, tick_rate, clients, pending_requests}` |
 | `info` | | script, Python and Live versions, platform |
 | `get` | `target`, `props?`, `fields?`, `offset?`, `limit?` | the encoded target, or `{prop: value}` when `props` is given |
 | `set` | `target`, `prop`, `value` | `{"value": <read back after setting>}` |
 | `call` | `target`, `method`, `args?`, `kwargs?`, `fields?` | the encoded return value |
-| `describe` | `target`, `values?` | `{type, module, properties, methods, observable, values?}` |
+| `describe` | `target`, `values?` | `{type, module, properties, methods, types, observable, values?}`. `types` lists nested classes and enums such as `Track.View` |
 | `batch` | `ops: [{method, params}]`, `stop_on_error?` (default true), `undo_step?` | `{"results": [{"ok": true, "result"} \| {"ok": false, "error"}]}` |
 
 `batch` runs all of its ops in one main-thread job, back to back. With
@@ -132,7 +154,6 @@ Any request can pass `debug: true` to get a Python traceback in `error.data`.
 | -32602 | invalid params: bad path, index or name, or a target that is not a Live object |
 | -32000 | the Live API raised. `data.type` is the exception class |
 | -32001 | unauthorised. The connection is closed |
-| -32002 | main-thread timeout. See `data.started` |
 | -32003 | unknown or expired object id |
 | -32004 | unavailable: too many clients, or the script is shutting down |
 

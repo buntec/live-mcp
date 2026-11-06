@@ -123,6 +123,7 @@ async fn get_set_call_and_describe() {
     let props: Vec<&str> = described["properties"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
     assert!(props.contains(&"name") && props.contains(&"clip_slots"));
     assert_eq!(described["observable"], json!(["name"]));
+    assert_eq!(described["types"], json!(["View"]), "nested classes are not methods");
     assert!(described["methods"].as_array().unwrap().iter().all(|m| !m.as_str().unwrap().contains("listener")));
     assert_eq!(described["values"]["name"], "1-MIDI");
 
@@ -271,34 +272,54 @@ async fn bad_token_is_rejected_and_unauthenticated_requests_close() {
 }
 
 #[tokio::test]
-async fn main_thread_timeout_fails_closed_and_status_still_answers() {
+async fn timed_out_requests_may_still_apply_and_the_connection_recovers() {
     let Some(fake) = FakeLive::start() else { return };
     let live = fake.connect().await;
 
     let slow = live.request_with_timeout(
         "call",
-        json!({"target": "live_set", "method": "slow", "args": [1.5]}),
+        json!({"target": "live_set", "method": "slow", "args": [1.0]}),
         Duration::from_millis(300),
     );
-    match slow.await {
-        Err(BridgeError::Timeout { started: Some(true), .. }) => {}
-        other => panic!("expected a started timeout, got {other:?}"),
-    }
+    assert!(matches!(slow.await, Err(BridgeError::Timeout { .. })));
 
-    // The main thread is still blocked in `slow`, but the socket thread reports it.
-    let status = live.status().await.unwrap();
-    assert_eq!(status["busy_method"], "call");
-
-    // A request queued behind the blocked job times out without ever starting.
-    let queued = live.request_with_timeout("info", json!({}), Duration::from_millis(200)).await;
-    match queued {
-        Err(BridgeError::Timeout { started: Some(false), .. }) => {}
-        other => panic!("expected a not-started timeout, got {other:?}"),
-    }
-
-    // Once the main thread recovers, the connection keeps working.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // The timed-out call still ran to completion: this is why timeouts are never retried.
+    // Its late response must be discarded rather than answer the next request.
+    let calls = live.get(&path("live_set slow_calls"), GetOptions::default()).await.unwrap();
+    assert_eq!(calls, 1);
     assert_eq!(live.info().await.unwrap()["live_version"], "12.3.8");
+}
+
+#[tokio::test]
+async fn sequential_requests_share_ticks_by_lingering() {
+    let Some(fake) = FakeLive::start() else { return };
+    let live = fake.connect().await;
+    assert_eq!(live.info().await.unwrap()["linger"], true);
+    let before = live.status().await.unwrap()["ticks"].as_u64().unwrap();
+    for _ in 0..20 {
+        live.get(&path("live_set tempo"), GetOptions::default()).await.unwrap();
+    }
+    let ticks = live.status().await.unwrap()["ticks"].as_u64().unwrap() - before;
+    // Without lingering every request would wait for its own tick.
+    assert!(ticks < 15, "20 sequential requests took {ticks} ticks");
+}
+
+#[tokio::test]
+async fn pipelined_requests_share_ticks() {
+    let Some(fake) = FakeLive::start() else { return };
+    let live = fake.connect().await;
+    let before = live.status().await.unwrap()["ticks"].as_u64().unwrap();
+
+    let target = path("live_set tracks 0 name");
+    let requests: Vec<_> = (0..50).map(|_| live.get(&target, GetOptions::default())).collect();
+    for result in futures::future::join_all(requests).await {
+        assert_eq!(result.unwrap(), "1-MIDI");
+    }
+
+    let status = live.status().await.unwrap();
+    let ticks = status["ticks"].as_u64().unwrap() - before;
+    assert!(ticks < 25, "50 pipelined requests took {ticks} ticks");
+    assert_eq!(status["clients"], 1);
 }
 
 #[tokio::test]

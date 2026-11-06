@@ -43,6 +43,10 @@ live-mcp get "#<id> clip_slots 0 clip" --props name,length
 
 `set` values and `call` arguments are JSON, so strings need quotes: `'"Bass"'`.
 
+After `live-mcp install` replaces an older version, **quit and restart Live**.
+Re-selecting the control surface creates a new instance but keeps the old code.
+`live-mcp status` reports `script_current: false` until Live has restarted.
+
 ## Tests
 
 ```sh

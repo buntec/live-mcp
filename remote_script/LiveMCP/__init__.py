@@ -8,9 +8,12 @@ Wire protocol v1 (full spec: docs/protocol.md in the live-mcp repository):
   * newline-delimited JSON-RPC 2.0 over TCP, bound to 127.0.0.1 only;
   * the first request on a connection must be `hello` with the token stored in
     ~/.live-mcp/token;
-  * every Live API access runs on Live's main thread, drained from a queue in
-    update_display(); only `hello` and `status` are answered on the socket
-    thread, and neither touches the Live API.
+  * there are no threads. Sockets are non-blocking and serviced from
+    update_display(), which Live calls on its main thread at its UI tick rate
+    (about 13 Hz measured on Live 12.4). Inside Live, Python threads only run
+    while the main thread is executing Python, so a socket thread waits up to
+    a tick at every blocking step. Doing all the I/O inside the tick costs at
+    most one tick per request, and every Live API call stays on the main thread.
 
 Standard library only: Live's embedded interpreter cannot install packages.
 """
@@ -25,28 +28,29 @@ import os
 import re
 import socket
 import sys
-import threading
 import time
 import traceback
 
 try:
-    import queue
-except ImportError:  # pragma: no cover - Python 2 is not supported, but fail clearly
-    raise ImportError("LiveMCP requires Ableton Live 11 or newer (Python 3)")
+    import select
+except ImportError:  # without it, each request just waits for the next tick
+    select = None
 
 import Live
 from _Framework.ControlSurface import ControlSurface
 
-SCRIPT_VERSION = "0.1.0"
+SCRIPT_VERSION = "0.2.1"
 PROTOCOL_VERSION = 1
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 19418
 MAX_LINE_BYTES = 8 * 1024 * 1024
+MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 MAX_CLIENTS = 8
+RECV_CHUNK = 256 * 1024
 TICK_BUDGET_SECONDS = 0.05
-DEFAULT_TIMEOUT_SECONDS = 30.0
-MAX_TIMEOUT_SECONDS = 600.0
+# How long to wait for a follow-up request after answering one, within the tick budget.
+LINGER_SECONDS = 0.005
 MAX_REGISTRY = 50000
 
 ERR_PARSE = -32700
@@ -55,11 +59,10 @@ ERR_METHOD_NOT_FOUND = -32601
 ERR_INVALID_PARAMS = -32602
 ERR_LIVE = -32000
 ERR_UNAUTHORIZED = -32001
-ERR_TIMEOUT = -32002
 ERR_STALE_REF = -32003
 ERR_UNAVAILABLE = -32004
 
-MAIN_THREAD_METHODS = ("info", "get", "set", "call", "describe", "batch")
+LIVE_API_METHODS = ("info", "get", "set", "call", "describe", "batch")
 
 # Attribute and method names must look like plain identifiers. Rejecting a
 # leading underscore keeps reflection from reaching Python internals such as
@@ -89,18 +92,31 @@ class RpcError(Exception):
         return error
 
 
-class _Job(object):
-    """One request waiting for, or running on, Live's main thread."""
+class _Client(object):
+    """One connection: byte buffers in and out, plus its auth state."""
 
-    __slots__ = ("method", "params", "done", "result", "error", "state")
+    __slots__ = ("sock", "inbuf", "outbuf", "authed", "eof", "closing")
 
-    def __init__(self, method, params):
-        self.method = method
-        self.params = params
-        self.done = threading.Event()
-        self.result = None
-        self.error = None
-        self.state = "queued"  # queued -> running -> done, or queued -> abandoned
+    def __init__(self, sock):
+        self.sock = sock
+        self.inbuf = bytearray()
+        self.outbuf = bytearray()
+        self.authed = False
+        self.eof = False      # peer closed its side; finish buffered requests, then drop
+        self.closing = False  # we decided to close; flush the output, then drop
+
+    def next_line(self):
+        while True:
+            end = self.inbuf.find(b"\n")
+            if end < 0:
+                return None
+            line = bytes(self.inbuf[:end]).strip()
+            del self.inbuf[:end + 1]
+            if line:
+                return line
+
+    def has_line(self):
+        return b"\n" in self.inbuf
 
 
 def _state_dir():
@@ -145,6 +161,13 @@ def _source_hash():
         return "unknown"
 
 
+# Hash the file once, when the module is imported, so it describes the code that is
+# actually running. Re-selecting the control surface in Live creates a new instance
+# but does not re-import the module, so a hash computed later could describe a newer
+# file on disk than the code in memory.
+_CODE_HASH = _source_hash()
+
+
 def _check_name(name):
     if not isinstance(name, str) or not _NAME_RE.match(name):
         raise RpcError(ERR_INVALID_PARAMS, "invalid attribute name: %r" % (name,))
@@ -167,17 +190,6 @@ def _is_sequence(value):
     return hasattr(value, "__len__") and hasattr(value, "__iter__")
 
 
-def _timeout_from(params):
-    raw = params.get("timeout", DEFAULT_TIMEOUT_SECONDS)
-    try:
-        timeout = float(raw)
-    except (TypeError, ValueError):
-        raise RpcError(ERR_INVALID_PARAMS, "timeout must be a number of seconds")
-    if not (timeout > 0):
-        raise RpcError(ERR_INVALID_PARAMS, "timeout must be positive")
-    return min(timeout, MAX_TIMEOUT_SECONDS)
-
-
 def _ok(req_id, result):
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
@@ -187,24 +199,27 @@ def _err(req_id, code, message, data=None):
             "error": RpcError(code, message, data).to_dict()}
 
 
+def _dumps(payload):
+    try:
+        text = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        text = json.dumps(_err(payload.get("id"), ERR_LIVE,
+                               "result is not JSON-serialisable: %s" % exc))
+    return (text + "\n").encode("utf-8")
+
+
 class LiveMCP(ControlSurface):
 
     def __init__(self, c_instance):
         ControlSurface.__init__(self, c_instance)
         self._state_dir = _state_dir()
-        self._code_hash = _source_hash()
-        self._jobs = queue.Queue()
-        self._job_lock = threading.Lock()
-        self._registry = collections.OrderedDict()  # main thread only
-        self._running = True
+        self._code_hash = _CODE_HASH
+        self._registry = collections.OrderedDict()
         self._server = None
         self._port = None
-        self._conns = set()
-        self._conns_lock = threading.Lock()
-        self._last_tick = time.time()
+        self._clients = []
+        self._started = time.time()
         self._ticks = 0
-        self._busy_method = None
-        self._busy_since = None
         try:
             _ensure_token(self._state_dir)
             self._start_server()
@@ -218,33 +233,31 @@ class LiveMCP(ControlSurface):
     # ----------------------------------------------------------------- lifecycle
 
     def disconnect(self):
-        self._running = False
+        for client in list(self._clients):
+            self._drop(client)
         if self._server is not None:
             try:
                 self._server.close()
             except Exception:
                 pass
-        with self._conns_lock:
-            conns = list(self._conns)
-        for conn in conns:
-            try:
-                conn.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-        self._fail_queued_jobs()
+            self._server = None
         self._remove_endpoint()
         ControlSurface.disconnect(self)
 
     def update_display(self):
         ControlSurface.update_display(self)
-        self._last_tick = time.time()
         self._ticks += 1
-        self._drain_jobs()
+        if self._server is None:
+            return
+        try:
+            self._service()
+        except Exception as exc:
+            self._log("service error: %s\n%s" % (exc, traceback.format_exc()))
 
     def _log(self, message):
         self.log_message("LiveMCP: " + message)
 
-    # -------------------------------------------------------------- socket side
+    # ---------------------------------------------------------------- sockets
 
     def _start_server(self):
         config = _read_json(os.path.join(self._state_dir, "config.json")) or {}
@@ -255,13 +268,10 @@ class LiveMCP(ControlSurface):
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((HOST, port))
         server.listen(MAX_CLIENTS)
-        server.settimeout(1.0)
+        server.setblocking(False)
         self._server = server
         self._port = server.getsockname()[1]
         self._write_endpoint()
-        thread = threading.Thread(target=self._accept_loop, name="LiveMCP-accept")
-        thread.daemon = True
-        thread.start()
 
     def _endpoint_path(self):
         return os.path.join(self._state_dir, "bridge.json")
@@ -289,98 +299,171 @@ class LiveMCP(ControlSurface):
             except OSError:
                 pass
 
-    def _accept_loop(self):
-        while self._running:
+    def _service(self):
+        """One tick: accept, read, answer complete requests within budget, write.
+
+        After answering, linger briefly for follow-up requests: a client that
+        sends its next request as soon as it has a response would otherwise
+        wait a whole tick (~100 ms) per request.
+        """
+        deadline = time.time() + TICK_BUDGET_SECONDS
+        self._accept_pending()
+        for client in list(self._clients):
+            self._read(client)
+        answered = self._answer(deadline)
+        self._flush_all()
+        linger_until = min(time.time() + LINGER_SECONDS, deadline)
+        while answered and select is not None:
+            remaining = linger_until - time.time()
+            socks = [c.sock for c in self._clients if not (c.closing or c.eof)]
+            if remaining <= 0 or not socks:
+                break
+            try:
+                readable = select.select(socks, [], [], remaining)[0]
+            except (OSError, ValueError):
+                break
+            if not readable:
+                break
+            for client in list(self._clients):
+                if client.sock in readable:
+                    self._read(client)
+            answered = self._answer(deadline)
+            self._flush_all()
+            linger_until = min(time.time() + LINGER_SECONDS, deadline)
+        for client in list(self._clients):
+            done_reading = client.eof and not client.has_line()
+            if (client.closing or done_reading) and not client.outbuf:
+                self._drop(client)
+
+    def _answer(self, deadline):
+        """Answer buffered requests round-robin, one per client per pass, so one
+        busy client cannot starve the others. Returns how many were answered."""
+        answered = 0
+        while True:
+            progressed = False
+            for client in list(self._clients):
+                if client.closing:
+                    continue
+                line = client.next_line()
+                if line is None:
+                    continue
+                progressed = True
+                answered += 1
+                self._handle(client, line)
+                if time.time() >= deadline:
+                    return answered
+            if not progressed:
+                return answered
+
+    def _flush_all(self):
+        for client in list(self._clients):
+            self._flush(client)
+
+    def _accept_pending(self):
+        while True:
             try:
                 conn, _addr = self._server.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                if not self._running:
-                    break
-                time.sleep(0.2)
-                continue
-            with self._conns_lock:
-                full = len(self._conns) >= MAX_CLIENTS
-                if not full:
-                    self._conns.add(conn)
-            if full:
-                self._send(conn, _err(None, ERR_UNAVAILABLE, "too many clients"))
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError as exc:
+                self._log("accept failed: %s" % exc)
+                return
+            conn.setblocking(False)
+            if len(self._clients) >= MAX_CLIENTS:
+                try:
+                    conn.send(_dumps(_err(None, ERR_UNAVAILABLE, "too many clients")))
+                except OSError:
+                    pass
                 conn.close()
                 continue
-            thread = threading.Thread(target=self._serve_client, args=(conn,),
-                                      name="LiveMCP-client")
-            thread.daemon = True
-            thread.start()
-
-    def _serve_client(self, conn):
-        try:
-            conn.settimeout(None)
-            reader = conn.makefile("rb")
-            authed = False
-            while self._running:
-                line = reader.readline(MAX_LINE_BYTES + 1)
-                if not line:
-                    break
-                if len(line) > MAX_LINE_BYTES:
-                    self._send(conn, _err(None, ERR_INVALID_REQUEST, "request line too long"))
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                response, authed, close = self._handle_line(line, authed)
-                if response is not None:
-                    self._send(conn, response)
-                if close:
-                    break
-        except Exception as exc:
-            if self._running:
-                self._log("client error: %s" % exc)
-        finally:
-            with self._conns_lock:
-                self._conns.discard(conn)
             try:
-                conn.close()
-            except Exception:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
                 pass
+            self._clients.append(_Client(conn))
 
-    def _send(self, conn, payload):
+    def _read(self, client):
+        while not client.eof and len(client.inbuf) < MAX_LINE_BYTES:
+            try:
+                data = client.sock.recv(RECV_CHUNK)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                self._drop(client)
+                return
+            if not data:
+                client.eof = True
+                break
+            client.inbuf += data
+        if len(client.inbuf) >= MAX_LINE_BYTES and not client.has_line():
+            client.inbuf = bytearray()
+            self._queue(client, _err(None, ERR_INVALID_REQUEST, "request line too long"))
+            client.closing = True
+
+    def _flush(self, client):
+        while client.outbuf:
+            try:
+                sent = client.sock.send(client.outbuf)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                self._drop(client)
+                return
+            del client.outbuf[:sent]
+
+    def _queue(self, client, payload):
+        client.outbuf += _dumps(payload)
+        if len(client.outbuf) > MAX_OUTPUT_BYTES:
+            self._log("dropping a client that is not reading its responses")
+            self._drop(client)
+
+    def _drop(self, client):
+        if client in self._clients:
+            self._clients.remove(client)
         try:
-            data = json.dumps(payload, separators=(",", ":"), allow_nan=False)
-        except (TypeError, ValueError) as exc:
-            data = json.dumps(_err(payload.get("id"), ERR_LIVE,
-                                   "result is not JSON-serialisable: %s" % exc))
-        conn.sendall((data + "\n").encode("utf-8"))
+            client.sock.close()
+        except Exception:
+            pass
 
-    def _handle_line(self, line, authed):
-        """Returns (response, authed, close_connection)."""
+    # --------------------------------------------------------------- requests
+
+    def _handle(self, client, line):
         try:
             request = json.loads(line.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
-            return _err(None, ERR_PARSE, "parse error: %s" % exc), authed, False
+            self._queue(client, _err(None, ERR_PARSE, "parse error: %s" % exc))
+            return
         if not isinstance(request, dict) or not isinstance(request.get("method"), str):
             req_id = request.get("id") if isinstance(request, dict) else None
-            return _err(req_id, ERR_INVALID_REQUEST, "invalid request"), authed, False
+            self._queue(client, _err(req_id, ERR_INVALID_REQUEST, "invalid request"))
+            return
         req_id = request.get("id")
         method = request["method"]
         params = request.get("params")
         if params is None:
             params = {}
-        if not isinstance(params, dict):
-            return _err(req_id, ERR_INVALID_PARAMS, "params must be an object"), authed, False
         try:
+            if not isinstance(params, dict):
+                raise RpcError(ERR_INVALID_PARAMS, "params must be an object")
             if method == "hello":
-                return _ok(req_id, self._hello(params)), True, False
-            if not authed:
+                result = self._hello(params)
+                client.authed = True
+            elif not client.authed:
                 raise RpcError(ERR_UNAUTHORIZED, "send hello with a valid token first")
-            if method == "status":
-                return _ok(req_id, self._status()), authed, False
-            if method not in MAIN_THREAD_METHODS:
+            elif method == "status":
+                result = self._status()
+            elif method in LIVE_API_METHODS:
+                result = self._execute(method, params, False)
+            else:
                 raise RpcError(ERR_METHOD_NOT_FOUND, "unknown method: %s" % method)
-            return _ok(req_id, self._submit(method, params)), authed, False
+            self._queue(client, _ok(req_id, result))
         except RpcError as exc:
-            close = exc.code == ERR_UNAUTHORIZED
-            return {"jsonrpc": "2.0", "id": req_id, "error": exc.to_dict()}, authed, close
+            self._queue(client, {"jsonrpc": "2.0", "id": req_id, "error": exc.to_dict()})
+            if exc.code == ERR_UNAUTHORIZED:
+                client.closing = True
+        except Exception as exc:
+            self._queue(client, {"jsonrpc": "2.0", "id": req_id,
+                                 "error": self._live_error(exc, params)})
 
     def _hello(self, params):
         token = params.get("token")
@@ -398,79 +481,16 @@ class LiveMCP(ControlSurface):
         }
 
     def _status(self):
-        """Socket-thread health check. Never touches the Live API."""
-        now = time.time()
-        busy_since = self._busy_since
+        uptime = time.time() - self._started
         return {
-            "queued": self._jobs.qsize(),
             "ticks": self._ticks,
-            "last_tick_age": round(now - self._last_tick, 3),
-            "busy_method": self._busy_method,
-            "busy_for": round(now - busy_since, 3) if busy_since else None,
+            "uptime": round(uptime, 3),
+            "tick_rate": round(self._ticks / uptime, 2) if uptime > 0 else None,
+            "clients": len(self._clients),
+            "pending_requests": sum(c.inbuf.count(b"\n") for c in self._clients),
         }
 
-    def _submit(self, method, params):
-        """Queue a job for the main thread and wait for it."""
-        timeout = _timeout_from(params)
-        job = _Job(method, params)
-        self._jobs.put(job)
-        job.done.wait(timeout)
-        with self._job_lock:
-            if job.state == "queued":
-                job.state = "abandoned"
-            state = job.state
-        if state == "done":
-            if job.error is not None:
-                raise RpcError(job.error["code"], job.error["message"], job.error.get("data"))
-            return job.result
-        # Fail closed: a started job may still complete, so its outcome is unknown.
-        started = state == "running"
-        raise RpcError(ERR_TIMEOUT,
-                       "timed out after %.3gs waiting for Live's main thread" % timeout,
-                       {"method": method, "started": started})
-
-    def _fail_queued_jobs(self):
-        while True:
-            try:
-                job = self._jobs.get_nowait()
-            except queue.Empty:
-                return
-            with self._job_lock:
-                if job.state != "queued":
-                    continue
-                job.state = "done"
-            job.error = RpcError(ERR_UNAVAILABLE, "LiveMCP script is shutting down").to_dict()
-            job.done.set()
-
-    # ---------------------------------------------------------- main-thread side
-
-    def _drain_jobs(self):
-        deadline = time.time() + TICK_BUDGET_SECONDS
-        while self._running:
-            try:
-                job = self._jobs.get_nowait()
-            except queue.Empty:
-                return
-            with self._job_lock:
-                if job.state != "queued":
-                    continue
-                job.state = "running"
-            self._busy_method = job.method
-            self._busy_since = time.time()
-            try:
-                job.result = self._execute(job.method, job.params, False)
-            except RpcError as exc:
-                job.error = exc.to_dict()
-            except Exception as exc:
-                job.error = self._live_error(exc, job.params)
-            finally:
-                self._busy_method = None
-                self._busy_since = None
-                with self._job_lock:
-                    job.state = "done"
-                job.done.set()
-            if time.time() >= deadline:
-                return
+    # ---------------------------------------------------------------- Live API
 
     def _live_error(self, exc, params):
         data = {"type": type(exc).__name__}
@@ -500,6 +520,7 @@ class LiveMCP(ControlSurface):
             "code_hash": self._code_hash,
             "python_version": sys.version.split()[0],
             "platform": sys.platform,
+            "linger": select is not None,
         }
         try:
             app = Live.Application.get_application()
@@ -547,7 +568,7 @@ class LiveMCP(ControlSurface):
         obj = self._resolve(params.get("target"))
         cls = type(obj)
         include_values = bool(params.get("values"))
-        properties, methods, observable = [], [], []
+        properties, methods, types, observable = [], [], [], []
         values = {}
         for name in dir(obj):
             if name.startswith("_"):
@@ -565,7 +586,9 @@ class LiveMCP(ControlSurface):
                 if include_values:
                     values[name] = {"$error": str(exc)}
                 continue
-            if callable(value) and not isinstance(getattr(cls, name, None), property):
+            if isinstance(value, type):  # nested classes and enums, e.g. Track.View
+                types.append(name)
+            elif callable(value) and not isinstance(getattr(cls, name, None), property):
                 methods.append(name)
             else:
                 properties.append(name)
@@ -576,6 +599,7 @@ class LiveMCP(ControlSurface):
             "module": getattr(cls, "__module__", None),
             "properties": properties,
             "methods": methods,
+            "types": types,
             "observable": observable,
         }
         if include_values:

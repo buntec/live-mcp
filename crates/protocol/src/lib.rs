@@ -24,8 +24,6 @@ pub mod codes {
     /// The Live API raised an exception.
     pub const LIVE: i64 = -32000;
     pub const UNAUTHORIZED: i64 = -32001;
-    /// Live's main thread did not finish the request in time; see `data.started`.
-    pub const TIMEOUT: i64 = -32002;
     /// An `{"id": ...}` reference is unknown or has been evicted.
     pub const STALE_REF: i64 = -32003;
     pub const UNAVAILABLE: i64 = -32004;

@@ -26,6 +26,9 @@ class ClipSlot(LiveObject):
 
 
 class Track(LiveObject):
+    class View(LiveObject):
+        """Nested class, like Live's Track.View."""
+
     def __init__(self, name):
         self._name = name
         self._mute = False
@@ -75,6 +78,7 @@ class Song(LiveObject):
         self._tempo = 120.0
         self.undo_steps_begun = 0
         self.undo_steps_ended = 0
+        self.slow_calls = 0
 
     @property
     def tracks(self):
@@ -118,3 +122,4 @@ class Song(LiveObject):
         """Blocks the main thread, to test timeouts."""
         guard()
         time.sleep(seconds)
+        self.slow_calls += 1

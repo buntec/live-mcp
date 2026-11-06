@@ -160,8 +160,8 @@ fn install(options: &Options, user_library: Option<PathBuf>) -> Result<()> {
     if report.status != InstallStatus::Unchanged {
         println!(
             "\nNext: in Live, open Settings → Link, Tempo & MIDI and choose \"{}\" as a Control Surface\n\
-             (Input/Output: None). If it was already selected, restart Live or re-select it so the new\n\
-             version loads. Then run `live-mcp status`.",
+             (Input/Output: None). If it was already selected, quit and restart Live: re-selecting it\n\
+             does not reload the code. Then run `live-mcp status`.",
             script::FOLDER
         );
     }
@@ -183,8 +183,7 @@ async fn status(options: &Options) -> Result<()> {
     if stale {
         eprintln!(
             "warning: the running Remote Script differs from the one in this binary. Run `live-mcp install`, \
-             then restart Live or re-select the {} control surface.",
-            script::FOLDER
+             then quit and restart Live (re-selecting the control surface does not reload the code).",
         );
     }
     Ok(())
