@@ -182,6 +182,53 @@ async fn device_parameters_and_setting_them() {
 }
 
 #[tokio::test]
+async fn parameters_of_devices_inside_racks() {
+    let Some(h) = Harness::start().await else { return };
+    h.ok("load_device", json!({"track": 1, "path": ["instruments", "Instrument Rack"]})).await;
+    let rack = h.ok("device_parameters", json!({"track": 1, "device": "Instrument Rack"})).await;
+    assert_eq!(rack["parameters"][1]["name"], "Macro 1");
+    assert_eq!(
+        rack["chains"],
+        json!([
+            {"index": 0, "name": "Sub", "devices": ["Operator"]},
+            {"index": 1, "name": "Pad", "devices": ["Wavetable", "Reverb"]}
+        ])
+    );
+    let plain = h.ok("device_parameters", json!({"track": 0, "device": 0})).await;
+    assert!(plain.get("chains").is_none(), "only Racks list chains");
+
+    let reverb = h.ok("device_parameters", json!({"track": 1, "device": ["Instrument Rack", "pad", 1]})).await;
+    assert_eq!((reverb["device"].clone(), reverb["device_name"].clone()), (json!([0, 1, 1]), json!("Reverb")));
+    let set = h
+        .ok("set_parameter", json!({"track": 1, "device": [0, "Pad", "Reverb"], "parameter": "Dry/Wet", "value": 0.6}))
+        .await;
+    assert_eq!((set["device"].clone(), set["display"].clone()), (json!([0, 1, 1]), json!("0.60")));
+    let now = h.ok("get", json!({"target": "live_set tracks 1 devices 0 chains 1 devices 1 parameters 1 value"})).await;
+    assert_eq!(now, 0.6);
+
+    let e = h.err("device_parameters", json!({"track": 1, "device": [0, "Pad"]})).await;
+    assert!(e.contains("ends at a device"), "{e}");
+    let e = h.err("device_parameters", json!({"track": 0, "device": ["Drift", 0, 0]})).await;
+    assert!(e.contains("Drift is not a Rack"), "{e}");
+    let e = h.err("device_parameters", json!({"track": 1, "device": [0, "Lead", 0]})).await;
+    assert!(e.contains("Sub") && e.contains("Pad"), "lists the chains: {e}");
+}
+
+#[tokio::test]
+async fn disabled_parameters_are_marked_and_refused() {
+    let Some(h) = Harness::start().await else { return };
+    h.ok("load_device", json!({"track": 1, "path": ["instruments", "Instrument Rack"]})).await;
+    let operator = h.ok("device_parameters", json!({"track": 1, "device": [0, "Sub", "Operator"]})).await;
+    assert_eq!(operator["parameters"][1]["enabled"], false, "a macro controls the filter");
+    assert!(operator["parameters"][2].get("enabled").is_none(), "enabled parameters are not marked");
+    let e = h
+        .err("set_parameter", json!({"track": 1, "device": [0, 0, 0], "parameter": "Filter Freq", "value": 0.2}))
+        .await;
+    assert!(e.contains("Filter Freq on Operator is disabled") && e.contains("macro"), "{e}");
+    h.ok("set_parameter", json!({"track": 1, "device": [0, 0, 0], "parameter": "Osc 1 Shape", "value": "Saw"})).await;
+}
+
+#[tokio::test]
 async fn transport_controls() {
     let Some(h) = Harness::start().await else { return };
     let state =

@@ -209,14 +209,18 @@ impl LiveServer {
     }
 
     #[tool(
-        description = "List a device's parameters with values, ranges or options, and display strings.",
+        description = "List a device's parameters with values, ranges or options, and display strings; for a Rack, also its \
+                       chains and their devices.",
         annotations(read_only_hint = true)
     )]
     async fn device_parameters(&self, Parameters(p): Parameters<DeviceParametersParams>) -> ToolResult {
         respond(devices::device_parameters(&self.live, p).await)
     }
 
-    #[tool(description = "Set a device parameter by index or name, to a number or one of its options.")]
+    #[tool(
+        description = "Set a device parameter by index or name, to a number or one of its options. Works on devices \
+                       inside Racks too."
+    )]
     async fn set_parameter(&self, Parameters(p): Parameters<SetParameterParams>) -> ToolResult {
         respond(devices::set_parameter(&self.live, p).await)
     }
