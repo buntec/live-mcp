@@ -6,10 +6,11 @@ The only code that runs inside Live is a small, generic Python Remote Script
 (`remote_script/LiveMCP`). It exposes Live's object model over a local,
 token-authenticated JSON-RPC socket. Everything else is Rust.
 
-> **Status: M3.** The bridge to Live, the command-line client, the MCP server,
-> listening through the LiveMCP Ear plugin, reference-file analysis, snapshot
-> comparison and multi-track masking analysis all work, and have been tested on
-> Live 12.4.16 (macOS, arm64). See [Not yet](#not-yet) for what's missing.
+> **Status: early, but working.** The bridge to Live, the command-line client,
+> the MCP server, listening through the LiveMCP Ear plugin, reference-file
+> analysis, snapshot comparison and multi-track masking analysis all work, and
+> have been tested on Live 12.4.16 (macOS, arm64). See [Not yet](#not-yet) for
+> what's missing.
 
 ## Layout
 
@@ -157,6 +158,23 @@ So `listen` and `transport` start playback at a position by starting playback,
 waiting a tick, then jumping. Up to one tick (about 0.1 s) of audio from the song
 start can be heard first.
 
+## Security
+
+live-mcp gives whatever drives it full control of Live:
+- Anything that holds the token in `~/.live-mcp/token` (mode 0600) can use the
+  whole Live Object Model through the Remote Script: create, change and delete
+  tracks, clips and devices, and call any public Live API method. Every MCP
+  client you connect `live-mcp serve` to has that access. Live's undo history
+  is the safety net, so save your set before handing it to an agent.
+- `analyze_file` reads any audio file your user account can read.
+- The Remote Script (127.0.0.1:19418) and the Ear listener (127.0.0.1:19419)
+  accept connections from this machine only. On a machine shared with other
+  users, a process that holds one of those ports while Live or the server isn't
+  running would receive the token from a client that connects to it.
+
+To report a vulnerability, use **Report a vulnerability** on the repository's
+Security tab rather than a public issue.
+
 ## Tests
 
 ```sh
@@ -178,3 +196,11 @@ are skipped without it.
   `observe` and `events` are planned (see `docs/protocol.md`).
 - **Pan and sends in masking.** Track levels are corrected for the fader only.
 - **Other platforms and versions.** Only tested on macOS (arm64) with Live 12.4.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+live-mcp is an independent project, not affiliated with or endorsed by Ableton
+AG. Ableton and Live are trademarks of Ableton AG. VST is a registered
+trademark of Steinberg Media Technologies GmbH.

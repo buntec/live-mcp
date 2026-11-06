@@ -96,7 +96,7 @@ impl EarHub {
         let Ok(Some(first)) = lines.next_line().await else { return };
         let id = match serde_json::from_str::<EarMessage>(&first) {
             Ok(EarMessage::Hello { token: given, protocol, instance, plugin_version, sample_rate })
-                if given == token && protocol == EAR_PROTOCOL_VERSION =>
+                if tokens_match(&given, token) && protocol == EAR_PROTOCOL_VERSION =>
             {
                 let mut instances = self.instances.lock().expect("hub lock");
                 let entry = instances.entry(instance).or_insert_with(|| Instance {
@@ -621,9 +621,23 @@ pub(crate) fn summary(reports: &[&BarReport]) -> Value {
     })
 }
 
+/// Compares tokens in time that doesn't depend on where they differ (the length is public).
+fn tokens_match(given: &str, expected: &str) -> bool {
+    let (given, expected) = (given.as_bytes(), expected.as_bytes());
+    given.len() == expected.len() && given.iter().zip(expected).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokens_match_only_when_equal() {
+        assert!(tokens_match("abc123", "abc123"));
+        assert!(!tokens_match("abc124", "abc123"));
+        assert!(!tokens_match("abc12", "abc123"));
+        assert!(!tokens_match("", "abc123"));
+    }
 
     #[test]
     fn parses_live_volume_displays() {

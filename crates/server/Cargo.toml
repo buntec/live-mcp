@@ -1,6 +1,6 @@
 [package]
 name = "live-mcp-server"
-description = "live-mcp command-line tool (the MCP server arrives in M1)"
+description = "live-mcp: MCP server and command-line tool for Ableton Live"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
