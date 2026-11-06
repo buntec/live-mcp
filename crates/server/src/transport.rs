@@ -89,7 +89,20 @@ pub async fn transport(live: &Live, params: TransportParams) -> Result<Value> {
     }
     ops.push(get_props(&song, &["is_playing", "tempo", "current_song_time", "loop", "loop_start", "loop_length"]));
     let results = live.batch(ops, false).await?;
-    let state = results.last().cloned().unwrap_or_default();
+    let mut state = results.last().cloned().unwrap_or_default();
+    // Live applies some of these (e.g. current_song_time) on its next tick, so a read in the
+    // same batch can still see the old value. The sets succeeded, so report what was set.
+    for (key, value) in [
+        ("tempo", params.tempo.map(|v| json!(v))),
+        ("current_song_time", params.position.map(|v| json!(v))),
+        ("loop", params.loop_enabled.map(|v| json!(v))),
+        ("loop_start", params.loop_start.map(|v| json!(v))),
+        ("loop_length", params.loop_length.map(|v| json!(v))),
+    ] {
+        if let Some(value) = value {
+            state[key] = value;
+        }
+    }
     let mut out = json!({
         "playing": state["is_playing"],
         "tempo": state["tempo"],

@@ -13,7 +13,9 @@ class BrowserItem(LiveObject):
     name = property(lambda self: (guard(), self._name)[1])
     uri = property(lambda self: (guard(), self._uri)[1])
     children = property(lambda self: (guard(), tuple(self._children))[1])
-    is_folder = property(lambda self: (guard(), bool(self._children))[1])
+    # As in Live 12.4: a device that holds presets (Instruments → Operator → Bass ...)
+    # has children but is not a folder.
+    is_folder = property(lambda self: (guard(), bool(self._children) and self._device is None)[1])
     is_loadable = property(lambda self: (guard(), self._loadable)[1])
     is_device = property(lambda self: (guard(), self._device is not None)[1])
 

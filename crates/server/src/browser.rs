@@ -228,7 +228,9 @@ async fn build_index(live: &Live, root: &'static str) -> Result<RootIndex> {
                     let mut child_path = path.clone();
                     child_path.push(field_str(child, "name").to_owned());
                     let entry = entry_from(child, child_path.clone());
-                    if entry.folder
+                    // Devices are not folders but hold their presets as children
+                    // (instruments → Analog → Bass → ...).
+                    if (entry.folder || entry.device)
                         && let Some(id) = obj_id(child)
                     {
                         next.push((Target::id(id), child_path));

@@ -208,6 +208,10 @@ async fn device_parameters_and_setting_them() {
 
     let filtered = h.ok("device_parameters", json!({"track": 0, "device": 0, "query": "osc"})).await;
     assert_eq!(filtered["parameters"].as_array().unwrap().len(), 1);
+    assert!(filtered.get("all_names").is_none());
+    let none = h.ok("device_parameters", json!({"track": 0, "device": 0, "query": "cutoff"})).await;
+    assert_eq!(none["parameters"], json!([]));
+    assert_eq!(none["all_names"], json!(["Device On", "Filter Freq", "Osc 1 Shape"]));
 
     let set = h.ok("set_parameter", json!({"track": 0, "device": 0, "parameter": "Filter Freq", "value": 0.8})).await;
     assert_eq!(set["display"], "0.80 kHz");

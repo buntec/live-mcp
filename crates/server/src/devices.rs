@@ -57,7 +57,18 @@ pub async fn device_parameters(live: &Live, params: DeviceParametersParams) -> R
             Value::Object(entry)
         })
         .collect();
-    Ok(json!({"track": track.label(), "device": device_index, "device_name": device_name, "parameters": out}))
+    let mut result =
+        json!({"track": track.label(), "device": device_index, "device_name": device_name, "parameters": out});
+    if let Some(query) = params.query.as_deref()
+        && selected.is_empty()
+    {
+        // Devices name parameters their own way (Drift's filter cutoff is "LP Freq"), so say what exists.
+        let names: Vec<&str> = items(&all).iter().map(|p| field_str(p, "name")).collect();
+        result["note"] =
+            json!(format!("no parameter name contains {query:?}; the device's parameters are listed in all_names"));
+        result["all_names"] = json!(names);
+    }
+    Ok(result)
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

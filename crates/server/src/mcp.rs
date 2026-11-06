@@ -234,7 +234,8 @@ impl LiveServer {
         )
     }
 
-    #[tool(description = "Set a property of a Live object. Returns the value read back.")]
+    #[tool(description = "Set a property of a Live object. Returns the value read back; some properties (e.g. \
+                       current_song_time, is_playing) only change on Live's next tick, so the read-back can be stale.")]
     async fn set(&self, Parameters(p): Parameters<SetParams>) -> ToolResult {
         respond(
             async {
