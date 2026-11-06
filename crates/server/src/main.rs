@@ -7,6 +7,7 @@ mod clips;
 mod devices;
 mod ear;
 mod live;
+mod masking;
 mod mcp;
 mod reference;
 mod session;

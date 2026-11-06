@@ -235,7 +235,9 @@ impl LiveServer {
         description = "Listen to the set through a LiveMCP Ear plugin (default: the one on the master track): plays \
                        `bars` bars from `start_bar` in real time and returns per-bar loudness (LUFS), peak, RMS, \
                        crest, five frequency bands (low <120 Hz, low_mid 120-500, mid 500-2k, high_mid 2-6k, high \
-                       >6k, dBFS), stereo correlation and width, plus a section summary."
+                       >6k, dBFS), stereo correlation and width, plus a section summary. With `tracks` (a list, \
+                       or [\"all\"]) it listens through several Ears at once and reports which tracks share each \
+                       frequency band (masking)."
     )]
     async fn listen(&self, Parameters(p): Parameters<ListenParams>) -> ToolResult {
         respond(ear::listen(&self.live, &self.hub, &self.snapshots, p).await)

@@ -16,11 +16,19 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-/// A bar of a 220 Hz sine at amplitude 0.25, as the real analyzer would report it.
-fn synthetic_bar(bar: i64) -> BarReport {
+/// What the default fake plugin hears: a 220 Hz sine at amplitude 0.25 (−12 dBFS).
+const TONE_220: &[(f64, f64)] = &[(220.0, -12.04)];
+
+/// One bar of the sum of sines (Hz, dBFS), as the real analyzer would report it.
+fn synthetic_bar(bar: i64, partials: &[(f64, f64)]) -> BarReport {
     let sr = 48_000.0;
     let mut analyzer = BarAnalyzer::new(sr as f32);
-    let samples: Vec<f32> = (0..96_000).map(|i| (0.25 * (2.0 * PI * 220.0 * i as f64 / sr).sin()) as f32).collect();
+    let samples: Vec<f32> = (0..96_000)
+        .map(|i| {
+            partials.iter().map(|(f, db)| 10f64.powf(db / 20.0) * (2.0 * PI * f * i as f64 / sr).sin()).sum::<f64>()
+                as f32
+        })
+        .collect();
     let mut out = None;
     let start = (bar - 1) as f64 * 4.0;
     let t = Transport { playing: true, beat: Some(start), tempo: Some(120.0), time_signature: Some((4, 4)) };
@@ -36,7 +44,13 @@ async fn send(socket: &mut TcpStream, message: &EarMessage) {
 
 /// Plays the plugin's part: reads its Tag parameter and the transport from the fake Live (as a
 /// host would pass them), sends heartbeats, and reports eight bars whenever playback starts.
-async fn fake_plugin(state: PathBuf, live: Bridge, tag_param: &'static str) {
+async fn fake_plugin(
+    state: PathBuf,
+    live: Bridge,
+    tag_param: &'static str,
+    instance: u64,
+    partials: &'static [(f64, f64)],
+) {
     let token = std::fs::read_to_string(state.join("token")).unwrap().trim().to_owned();
     let endpoint: EarEndpoint =
         serde_json::from_str(&std::fs::read_to_string(state.join("ear.json")).unwrap()).unwrap();
@@ -44,7 +58,7 @@ async fn fake_plugin(state: PathBuf, live: Bridge, tag_param: &'static str) {
     let hello = EarMessage::Hello {
         token,
         protocol: EAR_PROTOCOL_VERSION,
-        instance: 99,
+        instance,
         plugin_version: "test".into(),
         sample_rate: 48_000.0,
     };
@@ -66,7 +80,7 @@ async fn fake_plugin(state: PathBuf, live: Bridge, tag_param: &'static str) {
         {
             let first = (start / 4.0).floor() as i64 + 1;
             for bar in first..first + 8 {
-                send(&mut socket, &EarMessage::Bar { tag, report: synthetic_bar(bar) }).await;
+                send(&mut socket, &EarMessage::Bar { tag, report: synthetic_bar(bar, partials) }).await;
             }
         }
         reported = from;
@@ -95,6 +109,8 @@ async fn listen_through_an_ear_on_the_master_track() {
         h.state_dir(),
         h.fake.connect().await,
         "live_set master_track devices 0 parameters 1 value",
+        99,
+        TONE_220,
     ));
     let ears = h.ok("ears", json!({})).await;
     assert_eq!(ears["ears"][0]["connected"], true, "{ears}");
@@ -138,4 +154,59 @@ async fn listen_through_an_ear_on_the_master_track() {
     let e = h.err("listen", json!({"bars": 100})).await;
     assert!(e.contains("at most 60"), "{e}");
     plugin.abort();
+}
+
+#[tokio::test]
+async fn listens_to_several_tracks_and_finds_shared_bands() {
+    let Some(h) = Harness::start().await else { return };
+    const BASS: &[(f64, f64)] = &[(70.0, -12.0), (220.0, -26.0)];
+    const KICK: &[(f64, f64)] = &[(55.0, -13.0), (3000.0, -30.0)];
+    const BOTH: &[(f64, f64)] = &[(70.0, -12.0), (220.0, -26.0), (55.0, -13.0), (3000.0, -30.0)];
+    let ear = json!(["plugins", "live-mcp", "LiveMCP Ear"]);
+    for track in [json!(0), json!(1), json!("master")] {
+        h.ok("load_device", json!({"track": track, "path": ear})).await;
+    }
+    // Track 0 has Drift first, so its Ear is device 1.
+    let mut plugins = Vec::new();
+    for (param, instance, partials) in [
+        ("live_set tracks 0 devices 1 parameters 1 value", 1, BASS),
+        ("live_set tracks 1 devices 0 parameters 1 value", 2, KICK),
+        ("live_set master_track devices 0 parameters 1 value", 3, BOTH),
+    ] {
+        plugins.push(tokio::spawn(fake_plugin(h.state_dir(), h.fake.connect().await, param, instance, partials)));
+    }
+
+    let heard = h.ok("listen", json!({"tracks": ["all"], "start_bar": 1, "bars": 2})).await;
+    let tracks = heard["tracks"].as_array().unwrap();
+    let names: Vec<&str> = tracks.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["1-MIDI", "2-Audio", "Main"], "{heard}");
+    assert!(tracks.iter().all(|t| t["volume"] == "0.0 dB" && t["bars"].as_array().unwrap().len() == 2), "{heard}");
+    let snapshots: Vec<&str> = tracks.iter().map(|t| t["snapshot"].as_str().unwrap()).collect();
+    assert_eq!(snapshots.len(), 3, "one snapshot per track");
+    let contested: Vec<&str> =
+        heard["masking"]["contested"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+    assert_eq!(contested.len(), 1, "{contested:?}");
+    assert!(
+        contested[0].starts_with("low (<120 Hz):")
+            && contested[0].contains("1-MIDI")
+            && contested[0].contains("2-Audio")
+    );
+    let low = &heard["masking"]["bands"][0]["tracks"];
+    assert!(low.as_array().unwrap().iter().all(|t| t["name"] != "Main"), "the master Ear is not a voice: {low}");
+
+    // Pull the kick's fader down 20 dB: the Ear hears it unchanged, but in the mix the bass now
+    // carries the low band alone.
+    h.ok("set", json!({"target": "live_set tracks 1 mixer_device volume", "prop": "value", "value": 0.085})).await;
+    let heard = h.ok("listen", json!({"tracks": [0, 1], "start_bar": 3, "bars": 1})).await;
+    assert_eq!(heard["tracks"][1]["volume"], "-20.0 dB");
+    assert_eq!(heard["masking"]["contested"], json!([]), "{}", heard["masking"]);
+
+    // A single-track list still gets the multi-track shape, without a masking analysis.
+    let heard = h.ok("listen", json!({"tracks": ["master"], "start_bar": 1, "bars": 1})).await;
+    assert!(heard.get("masking").is_none() && heard["masking_note"].is_string());
+    let e = h.err("listen", json!({"tracks": [0, "Nope"]})).await;
+    assert!(e.contains("no track named"), "{e}");
+    for plugin in plugins {
+        plugin.abort();
+    }
 }

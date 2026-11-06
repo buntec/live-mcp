@@ -1,3 +1,5 @@
+import math
+
 from . import LiveObject, guard
 
 
@@ -35,6 +37,26 @@ class DeviceParameter(LiveObject):
         if self._items:
             return self._items[int(value)]
         return "%.2f%s" % (value, self._unit)
+
+
+class VolumeParameter(DeviceParameter):
+    """A mixer volume fader: 0.85 is 0 dB, as in Live."""
+
+    def __init__(self):
+        DeviceParameter.__init__(self, "Track Volume", 0.85, 0.0, 1.0)
+
+    def str_for_value(self, value):
+        guard()
+        if value <= 0.0:
+            return "-inf dB"
+        return "%.1f dB" % (20.0 * math.log10(value / 0.85))
+
+
+class MixerDevice(LiveObject):
+    def __init__(self):
+        self._volume = VolumeParameter()
+
+    volume = property(lambda self: (guard(), self._volume)[1])
 
 
 class Device(LiveObject):

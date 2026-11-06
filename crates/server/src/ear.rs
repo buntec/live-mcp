@@ -18,7 +18,10 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
-use crate::live::{Live, Track, TrackRef, call, default_true, field_f64, field_str, get_fields, get_props, items, set};
+use crate::live::{
+    Live, Track, TrackRef, call, default_true, field_bool, field_f64, field_str, get_fields, get_props, items, set,
+};
+use crate::masking;
 use crate::snapshots::{Kind, SnapshotStore};
 
 /// The plugin's name in Live's browser and device chain.
@@ -338,6 +341,10 @@ pub async fn ears(live: &Live, hub: &EarHub, _params: EarsParams) -> Result<Valu
 pub struct ListenParams {
     /// Track whose LiveMCP Ear to listen through (default "master"). The plugin must be on it.
     pub track: Option<TrackRef>,
+    /// Listen through several Ears in one playback: a list of tracks, or ["all"] for every
+    /// connected Ear. Adds a masking analysis: which tracks share each frequency band.
+    /// Replaces `track`.
+    pub tracks: Option<Vec<TrackRef>>,
     /// First bar (1-based, as Live shows it). Default: the bar at the current song position.
     pub start_bar: Option<i64>,
     /// Number of bars, default 4. Listening happens in real time, so at most 60 seconds.
@@ -348,12 +355,8 @@ pub struct ListenParams {
     pub play: bool,
 }
 
-pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: ListenParams) -> Result<Value> {
-    if let Err(e) = hub.listening() {
-        bail!("not listening for {EAR_NAME} plugins: {e}");
-    }
-    let track = params.track.unwrap_or_else(|| TrackRef::Name("master".into())).resolve(live).await?;
-    let bindings = bind(live, hub).await?;
+/// The connected Ear on `track`, or an error that says what is wrong.
+fn ear_on(bindings: &[Binding], track: &Track) -> Result<Instance> {
     let Some(binding) = bindings.iter().find(|b| b.track.target == track.target) else {
         bail!(
             "there is no {EAR_NAME} on track {}; add one with load_device (path {EAR_BROWSER_PATH:?}). Ears in the \
@@ -362,21 +365,61 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
             bindings.iter().map(|b| b.track.label()).collect::<Vec<_>>()
         );
     };
-    let Some(instance) = &binding.instance else {
-        bail!(
+    binding.instance.clone().ok_or_else(|| {
+        anyhow::anyhow!(
             "the {EAR_NAME} on track {} is not connected to this server. If Live loaded it before this server \
              started, it reconnects within a few seconds; otherwise rebuild/reinstall the plugin",
             track.label()
-        );
-    };
+        )
+    })
+}
+
+/// The best report per wanted bar that an instance sent since `mark`.
+fn collect(hub: &EarHub, instance: u64, mark: Instant, wanted: &std::ops::Range<i64>) -> BTreeMap<i64, BarReport> {
+    let mut heard: BTreeMap<i64, BarReport> = BTreeMap::new();
+    for report in hub.bars_since(instance, mark) {
+        if wanted.contains(&report.bar) && heard.get(&report.bar).is_none_or(|old| report.coverage >= old.coverage) {
+            heard.insert(report.bar, report);
+        }
+    }
+    heard
+}
+
+pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: ListenParams) -> Result<Value> {
+    if let Err(e) = hub.listening() {
+        bail!("not listening for {EAR_NAME} plugins: {e}");
+    }
+    let bindings = bind(live, hub).await?;
+    let multi = params.tracks.is_some();
+    let mut targets: Vec<(Track, Instance)> = Vec::new();
+    match &params.tracks {
+        None => {
+            let track = params.track.clone().unwrap_or_else(|| TrackRef::Name("master".into())).resolve(live).await?;
+            let instance = ear_on(&bindings, &track)?;
+            targets.push((track, instance));
+        }
+        Some(list) if list.iter().any(|t| matches!(t, TrackRef::Name(n) if n.trim().eq_ignore_ascii_case("all"))) => {
+            targets.extend(bindings.iter().filter_map(|b| Some((b.track.clone(), b.instance.clone()?))));
+            if targets.is_empty() {
+                bail!("no connected {EAR_NAME} in the set; add them with load_device (path {EAR_BROWSER_PATH:?})");
+            }
+        }
+        Some(list) => {
+            if list.is_empty() {
+                bail!("tracks is empty; give tracks, or [\"all\"]");
+            }
+            for track in list {
+                let track = track.resolve(live).await?;
+                let instance = ear_on(&bindings, &track)?;
+                targets.push((track, instance));
+            }
+        }
+    }
 
     let song = Target::path("live_set");
     let state = live
         .batch(
-            vec![get_props(
-                &song,
-                &["tempo", "signature_numerator", "signature_denominator", "is_playing", "current_song_time"],
-            )],
+            vec![get_props(&song, &["tempo", "signature_numerator", "signature_denominator", "current_song_time"])],
             false,
         )
         .await?
@@ -401,17 +444,9 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
     }
     let wanted = start_bar..start_bar + bars;
     let deadline = Instant::now() + Duration::from_secs_f64(seconds + if params.play { 1.5 } else { seconds.max(2.0) });
-    let heard = loop {
-        let mut heard: BTreeMap<i64, BarReport> = BTreeMap::new();
-        for report in hub.bars_since(instance.id, mark) {
-            if wanted.contains(&report.bar) {
-                let better = heard.get(&report.bar).is_none_or(|old| report.coverage >= old.coverage);
-                if better {
-                    heard.insert(report.bar, report);
-                }
-            }
-        }
-        let complete = heard.len() as i64 == bars && heard.values().all(|r| r.coverage >= 0.95);
+    let heard: Vec<BTreeMap<i64, BarReport>> = loop {
+        let heard: Vec<_> = targets.iter().map(|(_, i)| collect(hub, i.id, mark, &wanted)).collect();
+        let complete = heard.iter().all(|h| h.len() as i64 == bars && h.values().all(|r| r.coverage >= 0.95));
         if complete || Instant::now() >= deadline {
             break heard;
         }
@@ -420,28 +455,110 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
     if params.play {
         live.batch(vec![call(&song, "stop_playing", vec![])], false).await?;
     }
+    let range = format!("{}–{}", start_bar, start_bar + bars - 1);
+    let missing_hint = if params.play {
+        "some bars were not heard; the plugin may be after a muted device, or playback did not reach them"
+    } else {
+        "some bars were not heard: was the song playing through them?"
+    };
 
-    let missing: Vec<i64> = wanted.clone().filter(|b| !heard.contains_key(b)).collect();
-    let reports: Vec<&BarReport> = heard.values().collect();
-    let mut out = json!({
-        "track": track.label(),
-        "tempo": tempo,
-        "bars": reports.iter().map(|r| compact_bar(r)).collect::<Vec<_>>(),
-    });
-    if !reports.is_empty() {
-        out["summary"] = summary(&reports);
-        let label = format!("listen on {} bars {}–{} at {tempo} BPM", track.label(), start_bar, start_bar + bars - 1);
-        out["snapshot"] = json!(store.add(Kind::Listen, label, "bar", heard.values().copied().collect()));
-    }
-    if !missing.is_empty() {
-        out["missing_bars"] = json!(missing);
-        out["hint"] = json!(if params.play {
-            "some bars were not heard; the plugin may be after a muted device, or playback did not reach them"
-        } else {
-            "some bars were not heard: was the song playing through them?"
+    if !multi {
+        let (track, _) = &targets[0];
+        let heard = &heard[0];
+        let missing: Vec<i64> = wanted.clone().filter(|b| !heard.contains_key(b)).collect();
+        let reports: Vec<&BarReport> = heard.values().collect();
+        let mut out = json!({
+            "track": track.label(),
+            "tempo": tempo,
+            "bars": reports.iter().map(|r| compact_bar(r)).collect::<Vec<_>>(),
         });
+        if !reports.is_empty() {
+            out["summary"] = summary(&reports);
+            let label = format!("listen on {} bars {range} at {tempo} BPM", track.label());
+            out["snapshot"] = json!(store.add(Kind::Listen, label, "bar", heard.values().copied().collect()));
+        }
+        if !missing.is_empty() {
+            out["missing_bars"] = json!(missing);
+            out["hint"] = json!(missing_hint);
+        }
+        return Ok(out);
+    }
+
+    // Several tracks: names, mute state and fader gain (the Ear hears the signal before the fader).
+    let mut ops = Vec::new();
+    for (track, _) in &targets {
+        ops.push(get_fields(&track.target, &["name", "mute"]));
+        ops.push(get_fields(&track.target.join("mixer_device volume"), &["value"]));
+    }
+    let info = live.batch_lenient(ops).await?;
+    let volumes: Vec<Option<f64>> =
+        info.iter().skip(1).step_by(2).map(|v| v.as_ref().ok().and_then(|v| field_f64(v, "value"))).collect();
+    let ops = targets
+        .iter()
+        .zip(&volumes)
+        .map(|((track, _), value)| {
+            call(&track.target.join("mixer_device volume"), "str_for_value", vec![json!(value.unwrap_or(0.85))])
+        })
+        .collect();
+    let displays = live.batch_lenient(ops).await?;
+
+    let mut entries = Vec::new();
+    let mut hearings = Vec::new();
+    let mut missing_any = Vec::new();
+    for (k, (track, _)) in targets.iter().enumerate() {
+        let props = info[2 * k].as_ref().ok().cloned().unwrap_or_default();
+        let name = field_str(&props, "name").to_owned();
+        let muted = field_bool(&props, "mute") == Some(true);
+        let display = displays[k].as_ref().ok().and_then(|v| v.as_str()).unwrap_or("0 dB").to_owned();
+        let gain_db = parse_db(&display);
+        let reports: Vec<&BarReport> = heard[k].values().collect();
+        let mut entry = json!({"track": track.label(), "name": name, "volume": display});
+        if muted {
+            entry["muted"] = json!(true);
+        }
+        if !reports.is_empty() {
+            entry["summary"] = summary(&reports);
+            let label = format!("listen on {} ({name}) bars {range} at {tempo} BPM", track.label());
+            entry["snapshot"] = json!(store.add(Kind::Listen, label, "bar", heard[k].values().copied().collect()));
+            entry["bars"] = json!(reports.iter().map(|r| compact_bar(r)).collect::<Vec<_>>());
+        }
+        let missing: Vec<i64> = wanted.clone().filter(|b| !heard[k].contains_key(b)).collect();
+        if !missing.is_empty() {
+            missing_any.push(json!({"track": track.label(), "bars": missing}));
+        }
+        entries.push(entry);
+        // The master Ear hears the sum of everything; it is not one of the voices.
+        if track.kind != crate::live::TrackKind::Master {
+            hearings.push((track.label(), name, gain_db, muted, k));
+        }
+    }
+    let heard_bars: Vec<Vec<BarReport>> = heard.iter().map(|h| h.values().copied().collect()).collect();
+    let voices: Vec<masking::Heard<'_>> = hearings
+        .into_iter()
+        .map(|(label, name, gain_db, muted, k)| masking::Heard { label, name, gain_db, muted, bars: &heard_bars[k] })
+        .collect();
+
+    let mut out = json!({"tempo": tempo, "bars": range, "tracks": entries});
+    if voices.len() >= 2 {
+        out["masking"] = masking::analyze(&voices);
+    } else {
+        out["masking_note"] =
+            json!("put Ears on two or more tracks (not just master) to see which tracks share each band");
+    }
+    if !missing_any.is_empty() {
+        out["missing"] = json!(missing_any);
+        out["hint"] = json!(missing_hint);
     }
     Ok(out)
+}
+
+/// "-6.0 dB" → Some(-6.0); "-inf dB" → None (silent).
+fn parse_db(display: &str) -> Option<f64> {
+    let number = display.trim().trim_end_matches("dB").trim();
+    if number.eq_ignore_ascii_case("-inf") {
+        return None;
+    }
+    Some(number.parse::<f64>().unwrap_or(0.0))
 }
 
 pub(crate) fn round1(x: f32) -> f64 {
@@ -502,4 +619,17 @@ pub(crate) fn summary(reports: &[&BarReport]) -> Value {
         "min_correlation": reports.iter().map(|r| round2(r.stats.correlation)).fold(f64::MAX, f64::min),
         "clipped": reports.iter().map(|r| r.stats.clipped_samples as u64).sum::<u64>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_live_volume_displays() {
+        assert_eq!(parse_db("0.0 dB"), Some(0.0));
+        assert_eq!(parse_db("-6.0 dB"), Some(-6.0));
+        assert_eq!(parse_db("6.0 dB"), Some(6.0));
+        assert_eq!(parse_db("-inf dB"), None);
+    }
 }

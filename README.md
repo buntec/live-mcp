@@ -109,6 +109,17 @@ for given bar ranges ("my bars 9–16" against "the reference's bars 33–40"):
 - plain-language notes on the differences that matter;
 - bar-by-bar differences when both selections have the same length.
 
+`listen` with `tracks` (a list, or `["all"]`) listens through several Ears in
+one playback. It returns each track's bars (each kept as its own snapshot), plus a
+**masking analysis**:
+- each track's share of every frequency band;
+- the bands that two or more tracks each carry at least a quarter of (−6 dB),
+  such as bass and kick both in the low band.
+
+An Ear at the end of a track's device chain hears the signal before the fader,
+so levels are corrected by each track's volume, and muted tracks are left out.
+Pan and sends are not yet taken into account.
+
 How it works:
 - The plugin measures audio on the audio thread without allocating (about
   0.07% of one core). It streams per-bar reports to `live-mcp serve`, which

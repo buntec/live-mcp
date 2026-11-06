@@ -2,7 +2,7 @@ import time
 
 from . import LiveObject, guard
 from .Clip import Clip
-from .Device import Device
+from .Device import Device, MixerDevice
 
 
 def _prop(name, writable=False, check=None):
@@ -84,6 +84,7 @@ class Track(LiveObject):
         self._devices = []
         self._clip_slots = [ClipSlot(self) for _ in range(slots)] if kind == "track" else []
         self._arrangement_clips = []
+        self._mixer_device = MixerDevice()
 
     name = _prop("name", True, _str)
     mute = _prop("mute", True, _bool)
@@ -107,6 +108,7 @@ class Track(LiveObject):
     has_audio_input = property(lambda self: (guard(), not self._is_midi and self._kind == "track")[1])
     is_foldable = property(lambda self: (guard(), False)[1])
     devices = property(lambda self: (guard(), tuple(self._devices))[1])
+    mixer_device = property(lambda self: (guard(), self._mixer_device)[1])
     clip_slots = property(lambda self: (guard(), tuple(self._clip_slots))[1])
     arrangement_clips = property(lambda self: (guard(), tuple(self._arrangement_clips))[1])
 
