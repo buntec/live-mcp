@@ -55,7 +55,7 @@ impl DeviceRef {
                 if !can_have_chains(live, &target).await? {
                     bail!("{name} is not a Rack, so it has no chains");
                 }
-                let (index, _) = step.resolve(live, &target.join("chains"), &format!("chain in {name}")).await?;
+                let (index, _) = step.resolve(live, &target.join("chains"), "chain").await?;
                 target = target.join(&format!("chains {index}"));
                 indexes.push(index);
             }

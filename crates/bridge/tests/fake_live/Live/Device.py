@@ -114,7 +114,16 @@ class Chain(LiveObject):
         self._name = name
         self._devices = devices
 
-    name = property(lambda self: (guard(), self._name)[1])
+    @property
+    def name(self):
+        guard()
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        guard()
+        self._name = str(value)
+
     devices = property(lambda self: (guard(), tuple(self._devices))[1])
 
 

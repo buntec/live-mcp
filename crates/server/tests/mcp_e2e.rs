@@ -210,8 +210,14 @@ async fn parameters_of_devices_inside_racks() {
     assert!(e.contains("ends at a device"), "{e}");
     let e = h.err("device_parameters", json!({"track": 0, "device": ["Drift", 0, 0]})).await;
     assert!(e.contains("Drift is not a Rack"), "{e}");
+    // A chain named like a number is found by its name, as Live's own "808" Rack chains are.
+    h.ok("set", json!({"target": "live_set tracks 1 devices 0 chains 1", "prop": "name", "value": "808"})).await;
+    let by_name = h.ok("device_parameters", json!({"track": 1, "device": [0, "808", 0]})).await;
+    assert_eq!(by_name["device_name"], "Wavetable");
+    let by_index = h.ok("device_parameters", json!({"track": 1, "device": [0, "0", 0]})).await;
+    assert_eq!(by_index["device_name"], "Operator", "a string that names nothing is an index");
     let e = h.err("device_parameters", json!({"track": 1, "device": [0, "Lead", 0]})).await;
-    assert!(e.contains("Sub") && e.contains("Pad"), "lists the chains: {e}");
+    assert!(e.contains("no chain named") && e.contains("Sub"), "lists the chains: {e}");
 }
 
 #[tokio::test]
