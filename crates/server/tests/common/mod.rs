@@ -61,3 +61,44 @@ impl Harness {
         self.fake.state_dir()
     }
 }
+
+/// Writes a 16-bit PCM WAV file.
+pub fn write_wav(path: &std::path::Path, sample_rate: u32, channels: &[Vec<f32>]) {
+    let frames = channels[0].len();
+    let n = channels.len() as u16;
+    let data_len = (frames * channels.len() * 2) as u32;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&(sample_rate * n as u32 * 2).to_le_bytes());
+    out.extend_from_slice(&(n * 2).to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for i in 0..frames {
+        for channel in channels {
+            out.extend_from_slice(&((channel[i].clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
+        }
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+/// A sine segment: (seconds, frequency in Hz, level in dBFS; below −200 means silence).
+pub fn tone_sequence(sample_rate: u32, segments: &[(f64, f64, f64)]) -> Vec<f32> {
+    let sr = sample_rate as f64;
+    let mut out = Vec::new();
+    for &(seconds, freq, dbfs) in segments {
+        let amplitude = if dbfs < -200.0 { 0.0 } else { 10f64.powf(dbfs / 20.0) };
+        let start = out.len();
+        for k in 0..(seconds * sr).round() as usize {
+            let t = (start + k) as f64 / sr;
+            out.push((amplitude * (2.0 * std::f64::consts::PI * freq * t).sin()) as f32);
+        }
+    }
+    out
+}

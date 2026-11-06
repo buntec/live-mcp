@@ -441,16 +441,16 @@ pub async fn listen(live: &Live, hub: &EarHub, params: ListenParams) -> Result<V
     Ok(out)
 }
 
-fn round1(x: f32) -> f64 {
+pub(crate) fn round1(x: f32) -> f64 {
     (x as f64 * 10.0).round() / 10.0
 }
 
-fn round2(x: f32) -> f64 {
+pub(crate) fn round2(x: f32) -> f64 {
     (x as f64 * 100.0).round() / 100.0
 }
 
 /// A bar as tools report it: dB values to 0.1, correlation and width to 0.01.
-fn compact_bar(r: &BarReport) -> Value {
+pub(crate) fn compact_bar(r: &BarReport) -> Value {
     let s = &r.stats;
     let mut bands = Map::new();
     for (name, db) in BAND_NAMES.iter().zip(s.bands_dbfs) {
@@ -476,7 +476,7 @@ fn compact_bar(r: &BarReport) -> Value {
 }
 
 /// Section-wide figures: energy averages for loudness and bands, maximum peak.
-fn summary(reports: &[&BarReport]) -> Value {
+pub(crate) fn summary(reports: &[&BarReport]) -> Value {
     let energy_mean = |values: &mut dyn Iterator<Item = f32>| -> f64 {
         let (sum, n) = values.fold((0.0f64, 0usize), |(s, n), db| (s + 10f64.powf(db as f64 / 10.0), n + 1));
         if n == 0 || sum <= 0.0 { -120.0 } else { (10.0 * (sum / n as f64).log10() * 10.0).round() / 10.0 }

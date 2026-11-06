@@ -16,6 +16,7 @@ async fn lists_all_tools_with_object_schemas() {
     assert_eq!(
         names,
         [
+            "analyze_file",
             "batch",
             "browser",
             "call",

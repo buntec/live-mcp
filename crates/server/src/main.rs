@@ -1,12 +1,14 @@
 //! `live-mcp`: the MCP server for Ableton Live (`live-mcp serve`), plus commands to install
 //! the LiveMCP Remote Script and talk to it from the terminal.
 
+mod audio_file;
 mod browser;
 mod clips;
 mod devices;
 mod ear;
 mod live;
 mod mcp;
+mod reference;
 mod session;
 mod tracks;
 mod transport;

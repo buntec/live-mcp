@@ -17,6 +17,7 @@ use crate::clips::{self, ReadClipParams, WriteClipParams};
 use crate::devices::{self, DeviceParametersParams, SetParameterParams};
 use crate::ear::{self, EarHub, EarsParams, ListenParams};
 use crate::live::{Live, default_true};
+use crate::reference::{self, AnalyzeFileParams};
 use crate::session::{self, SessionParams};
 use crate::tracks::{self, CreateTrackParams};
 use crate::transport::{self, TransportParams};
@@ -233,6 +234,16 @@ impl LiveServer {
     )]
     async fn listen(&self, Parameters(p): Parameters<ListenParams>) -> ToolResult {
         respond(ear::listen(&self.live, &self.hub, p).await)
+    }
+
+    #[tool(
+        description = "Analyse an audio file (e.g. a reference track; WAV, AIFF, FLAC, MP3, AAC/M4A, Ogg): the same \
+                       per-bar measurements as `listen` (give bpm for musical bars, otherwise 2-second sections), \
+                       plus whole-file gated integrated loudness, loudness range and peak. Much faster than real time.",
+        annotations(read_only_hint = true)
+    )]
+    async fn analyze_file(&self, Parameters(p): Parameters<AnalyzeFileParams>) -> ToolResult {
+        respond(reference::analyze_file(p).await)
     }
 
     #[tool(

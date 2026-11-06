@@ -65,6 +65,7 @@ Other clients take the same command and arguments in their MCP server config.
 | `device_parameters`, `set_parameter` | Read and set device parameters by index or name |
 | `transport` | Play/stop, tempo, position, loop, fire clips and scenes |
 | `listen`, `ears` | Play bars and get per-bar measurements from a LiveMCP Ear plugin |
+| `analyze_file` | The same measurements for an audio file (e.g. a reference track), plus gated integrated loudness and loudness range |
 | `get`, `set`, `call`, `describe`, `batch` | Generic access to the whole Live Object Model |
 | `status` | Connection and script version check |
 
