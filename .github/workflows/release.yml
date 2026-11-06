@@ -27,6 +27,7 @@ jobs:
     name: macOS (universal)
     runs-on: macos-latest
     environment: release
+    timeout-minutes: 240 # notarization can be slow (see scripts/macos-release.sh)
     permissions:
       contents: write # create the draft release
     steps:

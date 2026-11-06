@@ -49,8 +49,12 @@ notarize() {
     dir=$(mktemp -d)
     zip="$dir/$(basename "$1").zip"
     ditto -c -k --keepParent "$1" "$zip"
+    # Usually minutes, but Apple sometimes takes over an hour, especially for a new team.
     result=$(xcrun notarytool submit "$zip" --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" \
-        --issuer "$NOTARY_ISSUER" --wait --timeout 30m --output-format json)
+        --issuer "$NOTARY_ISSUER" --wait --timeout 3h --output-format json) || {
+        echo "Notarization of $1 failed or timed out: $result" >&2
+        exit 1
+    }
     id=$(python3 -I -c 'import json, sys; print(json.load(sys.stdin)["id"])' <<<"$result")
     status=$(python3 -I -c 'import json, sys; print(json.load(sys.stdin)["status"])' <<<"$result")
     echo "Notarization of $1: $status ($id)"
