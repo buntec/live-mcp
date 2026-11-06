@@ -58,6 +58,14 @@ jobs:
           security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" \
             -T /usr/bin/codesign
           rm "$RUNNER_TEMP/certificate.p12"
+          # The certificate's issuer, in case the runner image lacks it. Pinned by fingerprint.
+          curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          fingerprint=$(openssl x509 -inform der -in "$RUNNER_TEMP/DeveloperIDG2CA.cer" -noout -fingerprint -sha256)
+          if [[ "$fingerprint" != *F1:6C:D3:C5:4C:7F:83:CE:A4:BF:1A:3E:6A:08:19:C8:AA:A8:E4:A1:52:8F:D1:44:71:5F:35:06:43:D2:DF:3A ]]; then
+            echo "::error::unexpected Developer ID G2 CA certificate: $fingerprint"
+            exit 1
+          fi
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
           identity=$(security find-identity -v -p codesigning "$keychain" \
