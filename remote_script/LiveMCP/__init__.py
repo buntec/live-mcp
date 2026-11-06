@@ -1,0 +1,769 @@
+"""LiveMCP Remote Script: a generic JSON-RPC bridge to Ableton Live's object model.
+
+This is the only Python in live-mcp, and it is deliberately dumb. It knows
+nothing about tracks, clips or devices. It resolves object paths, reads and
+writes properties and calls methods. All domain logic lives in the Rust client.
+
+Wire protocol v1 (full spec: docs/protocol.md in the live-mcp repository):
+  * newline-delimited JSON-RPC 2.0 over TCP, bound to 127.0.0.1 only;
+  * the first request on a connection must be `hello` with the token stored in
+    ~/.live-mcp/token;
+  * every Live API access runs on Live's main thread, drained from a queue in
+    update_display(); only `hello` and `status` are answered on the socket
+    thread, and neither touches the Live API.
+
+Standard library only: Live's embedded interpreter cannot install packages.
+"""
+
+import binascii
+import collections
+import hashlib
+import hmac
+import json
+import math
+import os
+import re
+import socket
+import sys
+import threading
+import time
+import traceback
+
+try:
+    import queue
+except ImportError:  # pragma: no cover - Python 2 is not supported, but fail clearly
+    raise ImportError("LiveMCP requires Ableton Live 11 or newer (Python 3)")
+
+import Live
+from _Framework.ControlSurface import ControlSurface
+
+SCRIPT_VERSION = "0.1.0"
+PROTOCOL_VERSION = 1
+
+HOST = "127.0.0.1"
+DEFAULT_PORT = 19418
+MAX_LINE_BYTES = 8 * 1024 * 1024
+MAX_CLIENTS = 8
+TICK_BUDGET_SECONDS = 0.05
+DEFAULT_TIMEOUT_SECONDS = 30.0
+MAX_TIMEOUT_SECONDS = 600.0
+MAX_REGISTRY = 50000
+
+ERR_PARSE = -32700
+ERR_INVALID_REQUEST = -32600
+ERR_METHOD_NOT_FOUND = -32601
+ERR_INVALID_PARAMS = -32602
+ERR_LIVE = -32000
+ERR_UNAUTHORIZED = -32001
+ERR_TIMEOUT = -32002
+ERR_STALE_REF = -32003
+ERR_UNAVAILABLE = -32004
+
+MAIN_THREAD_METHODS = ("info", "get", "set", "call", "describe", "batch")
+
+# Attribute and method names must look like plain identifiers. Rejecting a
+# leading underscore keeps reflection from reaching Python internals such as
+# __class__ or __globals__, so `call` stays limited to the public Live API.
+_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+# `set` and `call` only target Live objects, never plain Python values.
+_NOT_LIVE_OBJECTS = (bool, int, float, complex, str, bytes, bytearray,
+                     list, tuple, dict, set, frozenset, type)
+
+
+def create_instance(c_instance):
+    return LiveMCP(c_instance)
+
+
+class RpcError(Exception):
+    def __init__(self, code, message, data=None):
+        Exception.__init__(self, message)
+        self.code = code
+        self.message = message
+        self.data = data
+
+    def to_dict(self):
+        error = {"code": self.code, "message": self.message}
+        if self.data is not None:
+            error["data"] = self.data
+        return error
+
+
+class _Job(object):
+    """One request waiting for, or running on, Live's main thread."""
+
+    __slots__ = ("method", "params", "done", "result", "error", "state")
+
+    def __init__(self, method, params):
+        self.method = method
+        self.params = params
+        self.done = threading.Event()
+        self.result = None
+        self.error = None
+        self.state = "queued"  # queued -> running -> done, or queued -> abandoned
+
+
+def _state_dir():
+    # The environment override exists for tests; Live itself never sets it.
+    return os.environ.get("LIVE_MCP_STATE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".live-mcp")
+
+
+def _read_json(path):
+    try:
+        with open(path, "r") as handle:
+            return json.load(handle)
+    except (IOError, OSError, ValueError):
+        return None
+
+
+def _ensure_token(state_dir):
+    """Return the shared token, creating it (mode 0600) if it does not exist."""
+    path = os.path.join(state_dir, "token")
+    try:
+        with open(path, "r") as handle:
+            token = handle.read().strip()
+        if token:
+            return token
+    except (IOError, OSError):
+        pass
+    if not os.path.isdir(state_dir):
+        os.makedirs(state_dir)
+    token = binascii.hexlify(os.urandom(32)).decode("ascii")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(token + "\n")
+    return token
+
+
+def _source_hash():
+    """sha256 of this file, so the client can detect a stale installed script."""
+    try:
+        with open(__file__, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except (IOError, OSError, NameError):
+        return "unknown"
+
+
+def _check_name(name):
+    if not isinstance(name, str) or not _NAME_RE.match(name):
+        raise RpcError(ERR_INVALID_PARAMS, "invalid attribute name: %r" % (name,))
+    return name
+
+
+def _name_list(value, what):
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise RpcError(ERR_INVALID_PARAMS, "%s must be a list of names" % what)
+    return [_check_name(name) for name in value]
+
+
+def _is_sequence(value):
+    if isinstance(value, (list, tuple)):
+        return True
+    if isinstance(value, (str, bytes, bytearray, dict)):
+        return False
+    return hasattr(value, "__len__") and hasattr(value, "__iter__")
+
+
+def _timeout_from(params):
+    raw = params.get("timeout", DEFAULT_TIMEOUT_SECONDS)
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        raise RpcError(ERR_INVALID_PARAMS, "timeout must be a number of seconds")
+    if not (timeout > 0):
+        raise RpcError(ERR_INVALID_PARAMS, "timeout must be positive")
+    return min(timeout, MAX_TIMEOUT_SECONDS)
+
+
+def _ok(req_id, result):
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+def _err(req_id, code, message, data=None):
+    return {"jsonrpc": "2.0", "id": req_id,
+            "error": RpcError(code, message, data).to_dict()}
+
+
+class LiveMCP(ControlSurface):
+
+    def __init__(self, c_instance):
+        ControlSurface.__init__(self, c_instance)
+        self._state_dir = _state_dir()
+        self._code_hash = _source_hash()
+        self._jobs = queue.Queue()
+        self._job_lock = threading.Lock()
+        self._registry = collections.OrderedDict()  # main thread only
+        self._running = True
+        self._server = None
+        self._port = None
+        self._conns = set()
+        self._conns_lock = threading.Lock()
+        self._last_tick = time.time()
+        self._ticks = 0
+        self._busy_method = None
+        self._busy_since = None
+        try:
+            _ensure_token(self._state_dir)
+            self._start_server()
+            self._log("listening on %s:%d (script %s, protocol %d)"
+                      % (HOST, self._port, SCRIPT_VERSION, PROTOCOL_VERSION))
+            self.show_message("LiveMCP: listening on port %d" % self._port)
+        except Exception as exc:
+            self._log("startup failed: %s\n%s" % (exc, traceback.format_exc()))
+            self.show_message("LiveMCP: startup failed - %s" % exc)
+
+    # ----------------------------------------------------------------- lifecycle
+
+    def disconnect(self):
+        self._running = False
+        if self._server is not None:
+            try:
+                self._server.close()
+            except Exception:
+                pass
+        with self._conns_lock:
+            conns = list(self._conns)
+        for conn in conns:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+        self._fail_queued_jobs()
+        self._remove_endpoint()
+        ControlSurface.disconnect(self)
+
+    def update_display(self):
+        ControlSurface.update_display(self)
+        self._last_tick = time.time()
+        self._ticks += 1
+        self._drain_jobs()
+
+    def _log(self, message):
+        self.log_message("LiveMCP: " + message)
+
+    # -------------------------------------------------------------- socket side
+
+    def _start_server(self):
+        config = _read_json(os.path.join(self._state_dir, "config.json")) or {}
+        port = int(config.get("port", DEFAULT_PORT))
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if not sys.platform.startswith("win"):
+            # On Windows SO_REUSEADDR would let another process steal the port.
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((HOST, port))
+        server.listen(MAX_CLIENTS)
+        server.settimeout(1.0)
+        self._server = server
+        self._port = server.getsockname()[1]
+        self._write_endpoint()
+        thread = threading.Thread(target=self._accept_loop, name="LiveMCP-accept")
+        thread.daemon = True
+        thread.start()
+
+    def _endpoint_path(self):
+        return os.path.join(self._state_dir, "bridge.json")
+
+    def _write_endpoint(self):
+        endpoint = {
+            "port": self._port,
+            "pid": os.getpid(),
+            "script_version": SCRIPT_VERSION,
+            "protocol": PROTOCOL_VERSION,
+            "code_hash": self._code_hash,
+        }
+        path = self._endpoint_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w") as handle:
+            json.dump(endpoint, handle)
+        os.replace(tmp, path)
+
+    def _remove_endpoint(self):
+        path = self._endpoint_path()
+        current = _read_json(path) or {}
+        if current.get("pid") == os.getpid() and current.get("port") == self._port:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _accept_loop(self):
+        while self._running:
+            try:
+                conn, _addr = self._server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if not self._running:
+                    break
+                time.sleep(0.2)
+                continue
+            with self._conns_lock:
+                full = len(self._conns) >= MAX_CLIENTS
+                if not full:
+                    self._conns.add(conn)
+            if full:
+                self._send(conn, _err(None, ERR_UNAVAILABLE, "too many clients"))
+                conn.close()
+                continue
+            thread = threading.Thread(target=self._serve_client, args=(conn,),
+                                      name="LiveMCP-client")
+            thread.daemon = True
+            thread.start()
+
+    def _serve_client(self, conn):
+        try:
+            conn.settimeout(None)
+            reader = conn.makefile("rb")
+            authed = False
+            while self._running:
+                line = reader.readline(MAX_LINE_BYTES + 1)
+                if not line:
+                    break
+                if len(line) > MAX_LINE_BYTES:
+                    self._send(conn, _err(None, ERR_INVALID_REQUEST, "request line too long"))
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                response, authed, close = self._handle_line(line, authed)
+                if response is not None:
+                    self._send(conn, response)
+                if close:
+                    break
+        except Exception as exc:
+            if self._running:
+                self._log("client error: %s" % exc)
+        finally:
+            with self._conns_lock:
+                self._conns.discard(conn)
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _send(self, conn, payload):
+        try:
+            data = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            data = json.dumps(_err(payload.get("id"), ERR_LIVE,
+                                   "result is not JSON-serialisable: %s" % exc))
+        conn.sendall((data + "\n").encode("utf-8"))
+
+    def _handle_line(self, line, authed):
+        """Returns (response, authed, close_connection)."""
+        try:
+            request = json.loads(line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            return _err(None, ERR_PARSE, "parse error: %s" % exc), authed, False
+        if not isinstance(request, dict) or not isinstance(request.get("method"), str):
+            req_id = request.get("id") if isinstance(request, dict) else None
+            return _err(req_id, ERR_INVALID_REQUEST, "invalid request"), authed, False
+        req_id = request.get("id")
+        method = request["method"]
+        params = request.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return _err(req_id, ERR_INVALID_PARAMS, "params must be an object"), authed, False
+        try:
+            if method == "hello":
+                return _ok(req_id, self._hello(params)), True, False
+            if not authed:
+                raise RpcError(ERR_UNAUTHORIZED, "send hello with a valid token first")
+            if method == "status":
+                return _ok(req_id, self._status()), authed, False
+            if method not in MAIN_THREAD_METHODS:
+                raise RpcError(ERR_METHOD_NOT_FOUND, "unknown method: %s" % method)
+            return _ok(req_id, self._submit(method, params)), authed, False
+        except RpcError as exc:
+            close = exc.code == ERR_UNAUTHORIZED
+            return {"jsonrpc": "2.0", "id": req_id, "error": exc.to_dict()}, authed, close
+
+    def _hello(self, params):
+        token = params.get("token")
+        expected = _ensure_token(self._state_dir)  # re-read so rotation works
+        if not isinstance(token, str) or not hmac.compare_digest(
+                token.encode("utf-8"), expected.encode("utf-8")):
+            raise RpcError(ERR_UNAUTHORIZED, "invalid token")
+        if params.get("protocol") != PROTOCOL_VERSION:
+            raise RpcError(ERR_INVALID_REQUEST, "protocol version mismatch",
+                           {"script": PROTOCOL_VERSION, "client": params.get("protocol")})
+        return {
+            "script_version": SCRIPT_VERSION,
+            "protocol": PROTOCOL_VERSION,
+            "code_hash": self._code_hash,
+        }
+
+    def _status(self):
+        """Socket-thread health check. Never touches the Live API."""
+        now = time.time()
+        busy_since = self._busy_since
+        return {
+            "queued": self._jobs.qsize(),
+            "ticks": self._ticks,
+            "last_tick_age": round(now - self._last_tick, 3),
+            "busy_method": self._busy_method,
+            "busy_for": round(now - busy_since, 3) if busy_since else None,
+        }
+
+    def _submit(self, method, params):
+        """Queue a job for the main thread and wait for it."""
+        timeout = _timeout_from(params)
+        job = _Job(method, params)
+        self._jobs.put(job)
+        job.done.wait(timeout)
+        with self._job_lock:
+            if job.state == "queued":
+                job.state = "abandoned"
+            state = job.state
+        if state == "done":
+            if job.error is not None:
+                raise RpcError(job.error["code"], job.error["message"], job.error.get("data"))
+            return job.result
+        # Fail closed: a started job may still complete, so its outcome is unknown.
+        started = state == "running"
+        raise RpcError(ERR_TIMEOUT,
+                       "timed out after %.3gs waiting for Live's main thread" % timeout,
+                       {"method": method, "started": started})
+
+    def _fail_queued_jobs(self):
+        while True:
+            try:
+                job = self._jobs.get_nowait()
+            except queue.Empty:
+                return
+            with self._job_lock:
+                if job.state != "queued":
+                    continue
+                job.state = "done"
+            job.error = RpcError(ERR_UNAVAILABLE, "LiveMCP script is shutting down").to_dict()
+            job.done.set()
+
+    # ---------------------------------------------------------- main-thread side
+
+    def _drain_jobs(self):
+        deadline = time.time() + TICK_BUDGET_SECONDS
+        while self._running:
+            try:
+                job = self._jobs.get_nowait()
+            except queue.Empty:
+                return
+            with self._job_lock:
+                if job.state != "queued":
+                    continue
+                job.state = "running"
+            self._busy_method = job.method
+            self._busy_since = time.time()
+            try:
+                job.result = self._execute(job.method, job.params, False)
+            except RpcError as exc:
+                job.error = exc.to_dict()
+            except Exception as exc:
+                job.error = self._live_error(exc, job.params)
+            finally:
+                self._busy_method = None
+                self._busy_since = None
+                with self._job_lock:
+                    job.state = "done"
+                job.done.set()
+            if time.time() >= deadline:
+                return
+
+    def _live_error(self, exc, params):
+        data = {"type": type(exc).__name__}
+        if params.get("debug"):
+            data["traceback"] = traceback.format_exc()
+        return RpcError(ERR_LIVE, str(exc) or type(exc).__name__, data).to_dict()
+
+    def _execute(self, method, params, in_batch):
+        if method == "info":
+            return self._m_info()
+        if method == "get":
+            return self._m_get(params)
+        if method == "set":
+            return self._m_set(params)
+        if method == "call":
+            return self._m_call(params)
+        if method == "describe":
+            return self._m_describe(params)
+        if method == "batch" and not in_batch:
+            return self._m_batch(params)
+        raise RpcError(ERR_METHOD_NOT_FOUND, "unknown method: %s" % method)
+
+    def _m_info(self):
+        info = {
+            "script_version": SCRIPT_VERSION,
+            "protocol": PROTOCOL_VERSION,
+            "code_hash": self._code_hash,
+            "python_version": sys.version.split()[0],
+            "platform": sys.platform,
+        }
+        try:
+            app = Live.Application.get_application()
+            info["live_version"] = "%d.%d.%d" % (app.get_major_version(),
+                                                 app.get_minor_version(),
+                                                 app.get_bugfix_version())
+        except Exception as exc:
+            info["live_version"] = None
+            info["live_version_error"] = str(exc)
+        return info
+
+    def _m_get(self, params):
+        obj = self._resolve(params.get("target"))
+        fields = _name_list(params.get("fields"), "fields")
+        props = _name_list(params.get("props"), "props")
+        if props is not None:
+            return dict((name, self._encode(self._read_attr(obj, name), fields))
+                        for name in props)
+        return self._encode(obj, fields, params.get("offset"), params.get("limit"))
+
+    def _m_set(self, params):
+        obj = self._resolve(params.get("target"))
+        self._require_live_object(obj, "set")
+        prop = _check_name(params.get("prop"))
+        if "value" not in params:
+            raise RpcError(ERR_INVALID_PARAMS, "value is required")
+        setattr(obj, prop, self._decode(params["value"]))
+        return {"value": self._encode(getattr(obj, prop))}
+
+    def _m_call(self, params):
+        obj = self._resolve(params.get("target"))
+        self._require_live_object(obj, "call")
+        name = _check_name(params.get("method"))
+        fn = self._read_attr(obj, name)
+        if not callable(fn):
+            raise RpcError(ERR_INVALID_PARAMS, "%s is not a method" % name)
+        args = params.get("args") or []
+        kwargs = params.get("kwargs") or {}
+        if not isinstance(args, list) or not isinstance(kwargs, dict):
+            raise RpcError(ERR_INVALID_PARAMS, "args must be a list and kwargs an object")
+        result = fn(*self._decode(args), **self._decode(kwargs))
+        return self._encode(result, _name_list(params.get("fields"), "fields"))
+
+    def _m_describe(self, params):
+        obj = self._resolve(params.get("target"))
+        cls = type(obj)
+        include_values = bool(params.get("values"))
+        properties, methods, observable = [], [], []
+        values = {}
+        for name in dir(obj):
+            if name.startswith("_"):
+                continue
+            if name.startswith("add_") and name.endswith("_listener"):
+                observable.append(name[len("add_"):-len("_listener")])
+                continue
+            if name.endswith("_has_listener") or (
+                    name.startswith("remove_") and name.endswith("_listener")):
+                continue
+            try:
+                value = getattr(obj, name)
+            except Exception as exc:
+                properties.append(name)
+                if include_values:
+                    values[name] = {"$error": str(exc)}
+                continue
+            if callable(value) and not isinstance(getattr(cls, name, None), property):
+                methods.append(name)
+            else:
+                properties.append(name)
+                if include_values:
+                    values[name] = self._encode(value)
+        result = {
+            "type": cls.__name__,
+            "module": getattr(cls, "__module__", None),
+            "properties": properties,
+            "methods": methods,
+            "observable": observable,
+        }
+        if include_values:
+            result["values"] = values
+        return result
+
+    def _m_batch(self, params):
+        ops = params.get("ops")
+        if not isinstance(ops, list):
+            raise RpcError(ERR_INVALID_PARAMS, "ops must be a list")
+        stop_on_error = params.get("stop_on_error", True)
+        song = self.song()
+        undo = bool(params.get("undo_step")) and hasattr(song, "begin_undo_step")
+        results = []
+        if undo:
+            song.begin_undo_step()
+        try:
+            for op in ops:
+                try:
+                    if not isinstance(op, dict) or not isinstance(op.get("method"), str):
+                        raise RpcError(ERR_INVALID_REQUEST, "each op needs a method")
+                    op_params = op.get("params") or {}
+                    if not isinstance(op_params, dict):
+                        raise RpcError(ERR_INVALID_PARAMS, "op params must be an object")
+                    value = self._execute(op["method"], op_params, True)
+                    results.append({"ok": True, "result": value})
+                except RpcError as exc:
+                    results.append({"ok": False, "error": exc.to_dict()})
+                except Exception as exc:
+                    results.append({"ok": False, "error": self._live_error(exc, params)})
+                if stop_on_error and not results[-1]["ok"]:
+                    break
+        finally:
+            if undo:
+                song.end_undo_step()
+        return {"results": results}
+
+    # --------------------------------------------------------- object plumbing
+
+    def _resolve(self, target):
+        if isinstance(target, str):
+            return self._walk(None, target)
+        if isinstance(target, dict):
+            base = self._lookup(target["id"]) if "id" in target else None
+            path = target.get("path") or ""
+            if not isinstance(path, str):
+                raise RpcError(ERR_INVALID_PARAMS, "target path must be a string")
+            if base is None and not path:
+                raise RpcError(ERR_INVALID_PARAMS, "target needs an id or a path")
+            return self._walk(base, path)
+        raise RpcError(ERR_INVALID_PARAMS, "target must be a path string or {id, path}")
+
+    def _walk(self, base, path):
+        tokens = path.split()
+        obj = base
+        if obj is None:
+            root = tokens.pop(0) if tokens else ""
+            if root in ("live_set", "song"):
+                obj = self.song()
+            elif root in ("live_app", "app"):
+                obj = Live.Application.get_application()
+            else:
+                raise RpcError(ERR_INVALID_PARAMS,
+                               "path must start with live_set or live_app, got %r" % root)
+        for token in tokens:
+            if token.isdigit():
+                obj = self._index(obj, int(token), path)
+            else:
+                obj = self._read_attr(obj, token)
+        return obj
+
+    def _index(self, seq, index, path):
+        try:
+            return seq[index]
+        except IndexError:
+            raise RpcError(ERR_INVALID_PARAMS, "index %d out of range in %r" % (index, path))
+        except TypeError:
+            if not _is_sequence(seq):
+                raise RpcError(ERR_INVALID_PARAMS, "cannot index into %s in %r"
+                               % (type(seq).__name__, path))
+            items = list(seq)
+            if index >= len(items):
+                raise RpcError(ERR_INVALID_PARAMS, "index %d out of range in %r" % (index, path))
+            return items[index]
+
+    def _read_attr(self, obj, name):
+        _check_name(name)
+        try:
+            return getattr(obj, name)
+        except AttributeError:
+            raise RpcError(ERR_INVALID_PARAMS, "%s has no attribute %r"
+                           % (type(obj).__name__, name))
+
+    def _require_live_object(self, obj, action):
+        if obj is None or isinstance(obj, _NOT_LIVE_OBJECTS) or callable(obj):
+            raise RpcError(ERR_INVALID_PARAMS, "%s targets must be Live objects, got %s"
+                           % (action, type(obj).__name__))
+
+    def _remember(self, obj):
+        ptr = getattr(obj, "_live_ptr", None)
+        oid = int(ptr) if isinstance(ptr, int) and not isinstance(ptr, bool) else id(obj)
+        registry = self._registry
+        if oid in registry:
+            registry.move_to_end(oid)
+        registry[oid] = obj
+        while len(registry) > MAX_REGISTRY:
+            registry.popitem(last=False)
+        return oid
+
+    def _lookup(self, oid):
+        try:
+            return self._registry[int(oid)]
+        except (KeyError, TypeError, ValueError):
+            raise RpcError(ERR_STALE_REF, "unknown or expired object id %r; resolve it "
+                           "again by path" % (oid,))
+
+    def _encode(self, value, fields=None, offset=None, limit=None, depth=0):
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, int):  # includes Live's enums, which subclass int
+            return int(value)
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value).decode("utf-8", "replace")
+        if depth > 8:
+            return {"$repr": repr(value)[:200]}
+        if isinstance(value, dict):
+            return dict((str(k), self._encode(v, None, depth=depth + 1))
+                        for k, v in value.items())
+        if _is_sequence(value):
+            items = list(value)
+            if offset is None and limit is None:
+                return [self._encode(v, fields, depth=depth + 1) for v in items]
+            start = max(int(offset or 0), 0)
+            end = len(items) if limit is None else start + max(int(limit), 0)
+            return {"total": len(items), "offset": start,
+                    "items": [self._encode(v, fields, depth=depth + 1)
+                              for v in items[start:end]]}
+        if callable(value):
+            return {"$callable": getattr(value, "__name__", repr(value)[:100])}
+        out = {"$obj": self._remember(value), "type": type(value).__name__}
+        if fields:
+            values = {}
+            for name in fields:
+                try:
+                    values[name] = self._encode(getattr(value, name), depth=depth + 1)
+                except Exception as exc:
+                    values[name] = {"$error": str(exc) or type(exc).__name__}
+            out["fields"] = values
+        return out
+
+    def _decode(self, value):
+        if isinstance(value, list):
+            return [self._decode(v) for v in value]
+        if isinstance(value, dict):
+            if len(value) == 1 and "$ref" in value:
+                return self._resolve(value["$ref"])
+            if len(value) == 1 and "$tuple" in value:
+                items = value["$tuple"]
+                if not isinstance(items, list):
+                    raise RpcError(ERR_INVALID_PARAMS, "$tuple must wrap a list")
+                return tuple(self._decode(v) for v in items)
+            if "$new" in value:
+                return self._construct(value)
+            return dict((k, self._decode(v)) for k, v in value.items())
+        return value
+
+    def _construct(self, spec):
+        """{"$new": "Clip.MidiNoteSpecification", "args": [...], "kwargs": {...}}
+
+        Only names inside the `Live` module can be constructed.
+        """
+        name = spec.get("$new")
+        if not isinstance(name, str):
+            raise RpcError(ERR_INVALID_PARAMS, "$new must name a class in the Live module")
+        parts = name.split(".")
+        if parts and parts[0] == "Live":
+            parts = parts[1:]
+        cls = Live
+        for part in parts:
+            cls = self._read_attr(cls, part)
+        if not callable(cls):
+            raise RpcError(ERR_INVALID_PARAMS, "%s is not constructible" % name)
+        args = spec.get("args") or []
+        kwargs = spec.get("kwargs") or {}
+        if not isinstance(args, list) or not isinstance(kwargs, dict):
+            raise RpcError(ERR_INVALID_PARAMS, "$new args must be a list and kwargs an object")
+        return cls(*self._decode(args), **self._decode(kwargs))
