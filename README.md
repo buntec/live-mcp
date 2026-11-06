@@ -146,6 +146,10 @@ start can be heard first.
 cargo test
 ```
 
+`just check` runs everything to check before committing: formatting, clippy,
+a syntax check of the Remote Script, and the tests. Run `just` to list the
+other recipes (build, install, bundle the Ear, run the CLI).
+
 The end-to-end tests run the real Remote Script on a fake `Live` module
 (`crates/bridge/tests/fake_live/`, test-only Python). The fake raises if
 anything touches it off the main thread. The tests need `python3` on PATH and
