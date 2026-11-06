@@ -1,0 +1,3 @@
+# Bundle names for `cargo xtask bundle`.
+[live-mcp-ear]
+name = "LiveMCP Ear"

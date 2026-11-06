@@ -1,0 +1,14 @@
+[package]
+name = "live-mcp-ear"
+description = "Audio-analysis plugin for live-mcp: listens at its place in Live's signal chain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nice-plug = { version = "0.4.2", default-features = false, features = ["vst3"] }

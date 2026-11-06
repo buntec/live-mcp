@@ -6,10 +6,10 @@ The only code that runs inside Live is a small, generic Python Remote Script
 (`remote_script/LiveMCP`). It exposes Live's object model over a local,
 token-authenticated JSON-RPC socket. Everything else is Rust.
 
-> **Status: M1.** The bridge to Live, a command-line client and the MCP server
-> work. The bridge has been tested on Live 12.4.16 (macOS). The MCP tools have
-> been tested against a fake Live API so far. The audio-analysis plugin (M2)
-> hasn't been written yet.
+> **Status: M2 in progress.** The bridge to Live, the command-line client and
+> the MCP server work and have been tested on Live 12.4.16 (macOS). The
+> audio-analysis plugin, LiveMCP Ear, builds and loads in Live, but for now it
+> only passes audio through. It doesn't measure anything yet.
 
 ## Layout
 
@@ -19,6 +19,9 @@ token-authenticated JSON-RPC socket. Everything else is Rust.
 | `crates/protocol` | Wire types shared by every client |
 | `crates/bridge` | Async client, token and endpoint files, embedded script and installer |
 | `crates/server` | `live-mcp` binary: the MCP server (`serve`) and CLI commands |
+| `crates/ear` | LiveMCP Ear, the VST3 analysis plugin ([nice-plug](https://codeberg.org/RustAudio/nice-plug)) |
+| `crates/analysis` | Audio measurements, independent of any plugin framework |
+| `xtask` | `cargo xtask bundle`, which builds plugin bundles |
 | `docs/protocol.md` | The bridge protocol spec |
 
 ## Try it
@@ -68,6 +71,17 @@ Other clients take the same command and arguments in their MCP server config.
 After `live-mcp install` replaces an older version, **quit and restart Live**.
 Re-selecting the control surface creates a new instance but keeps the old code.
 `live-mcp status` reports `script_current: false` until Live has restarted.
+
+## The plugin
+
+```sh
+cargo xtask bundle live-mcp-ear --release      # → target/bundled/LiveMCP Ear.vst3
+cp -R "target/bundled/LiveMCP Ear.vst3" ~/Library/Audio/Plug-Ins/VST3/
+```
+
+In Live, open Settings → Plug-Ins, turn on **Use VST3 Plug-In System Folders**,
+and click **Rescan**. The plugin appears under Plug-Ins → live-mcp → LiveMCP Ear,
+and `load_device` can load it with the path `["plugins", "live-mcp", "LiveMCP Ear"]`.
 
 ## Tests
 
