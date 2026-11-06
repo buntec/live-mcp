@@ -25,31 +25,63 @@ token-authenticated JSON-RPC socket. Everything else is Rust.
 | `crates/ear` | LiveMCP Ear, the VST3 analysis plugin ([nice-plug](https://codeberg.org/RustAudio/nice-plug)) |
 | `crates/analysis` | Audio measurements, independent of any plugin framework |
 | `xtask` | `cargo xtask bundle`, which builds plugin bundles |
+| `scripts/macos-release.sh` | Builds the signed, notarized universal macOS release |
 | `docs/protocol.md` | The bridge protocol spec |
 
-## Try it
+## Install
 
-Requires Ableton Live 12. Live 11 may work, but it hasn't been tested.
-
-```sh
-just build                                   # the live-mcp binary, with the LiveMCP Ear plugin inside
-./target/release/live-mcp install            # or: install --user-library "/path/to/User Library"
-```
-
-Without [just](https://github.com/casey/just), build the plugin first and point
-the build at it:
+Requires Ableton Live 12 on macOS (Apple Silicon or Intel). Live 11 may work,
+but it hasn't been tested.
 
 ```sh
-cargo xtask bundle live-mcp-ear --release
-LIVE_MCP_EAR_BUNDLE="target/bundled/LiveMCP Ear.vst3" cargo build --release
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/buntec/live-mcp/releases/latest/download/live-mcp-macos-universal.tar.gz \
+  | tar -xz -C ~/.local/bin
+~/.local/bin/live-mcp install       # or: install --user-library "/path/to/User Library"
 ```
 
-A plain `cargo build` works too, but the binary won't include the plugin.
+The binary is signed and notarized by Apple. You can also download the archive
+from the [Releases](https://github.com/buntec/live-mcp/releases) page and put
+`live-mcp` wherever you like.
 
-`install` puts the Remote Script in Live's User Library and the LiveMCP Ear in
-`~/Library/Audio/Plug-Ins/VST3` (`--vst3-dir` to change it). In Live, open
-Settings → Link, Tempo & MIDI and pick **LiveMCP** as a Control Surface, with
-Input and Output set to None. Then:
+`install` puts the Remote Script in Live's User Library and the LiveMCP Ear
+plugin in `~/Library/Audio/Plug-Ins/VST3` (`--vst3-dir` to change it). Then, in
+Live:
+1. If Live is running, quit and restart it.
+2. Open Settings → Link, Tempo & MIDI and pick **LiveMCP** as a Control Surface,
+   with Input and Output set to None.
+
+To update, run the same commands again and restart Live.
+
+### Connect an MCP client
+
+`live-mcp serve` speaks MCP over stdin/stdout. For Claude Code:
+
+```sh
+claude mcp add live -- ~/.local/bin/live-mcp serve
+```
+
+For Codex CLI:
+
+```sh
+codex mcp add live -- ~/.local/bin/live-mcp serve
+```
+
+or, in `~/.codex/config.toml` (with your home folder in the path):
+
+```toml
+[mcp_servers.live]
+command = "/Users/you/.local/bin/live-mcp"
+args = ["serve"]
+```
+
+Other clients take the same command and arguments in their MCP server config.
+Each client starts its own server, and only the first one gets the Ear port
+(127.0.0.1:19419), so `listen` and `ears` work in one client at a time.
+
+### Use it from the terminal
+
+With `~/.local/bin` on your `PATH`:
 
 ```sh
 live-mcp status
@@ -62,33 +94,27 @@ live-mcp get "#<id> clip_slots 0 clip" --props name,length
 
 `set` values and `call` arguments are JSON, so strings need quotes: `'"Bass"'`.
 
-### Use it from an MCP client
-
-`live-mcp serve` speaks MCP over stdin/stdout. For Claude Code:
+### Build from source
 
 ```sh
-claude mcp add live -- /absolute/path/to/target/release/live-mcp serve
+just build                                   # the live-mcp binary, with the LiveMCP Ear plugin inside
+./target/release/live-mcp install
 ```
 
-For Codex CLI:
+Without [just](https://github.com/casey/just), build the plugin first and point
+the build at it:
 
 ```sh
-codex mcp add live -- /absolute/path/to/target/release/live-mcp serve
+cargo xtask bundle live-mcp-ear --release
+LIVE_MCP_EAR_BUNDLE="target/bundled/LiveMCP Ear.vst3" cargo build --release
 ```
 
-or, in `~/.codex/config.toml`:
+A plain `cargo build` works too, but the binary won't include the plugin. Use
+the absolute path of `target/release/live-mcp` in your MCP client's config.
 
-```toml
-[mcp_servers.live]
-command = "/absolute/path/to/target/release/live-mcp"
-args = ["serve"]
-```
+### Tools
 
-Other clients take the same command and arguments in their MCP server config.
-Each client starts its own server, and only the first one gets the Ear port
-(127.0.0.1:19419), so `listen` and `ears` work in one client at a time.
-
-| Tools | |
+| Tool | What it does |
 |---|---|
 | `session` | Overview: tempo, transport, tracks with devices and clips, returns, scenes |
 | `create_track` | New MIDI, audio or return track |
@@ -109,7 +135,7 @@ Re-selecting the control surface creates a new instance but keeps the old code.
 
 ## The plugin
 
-`live-mcp install` installs the LiveMCP Ear (see [Try it](#try-it)). If Live
+`live-mcp install` installs the LiveMCP Ear (see [Install](#install)). If Live
 doesn't list it, open Settings → Plug-Ins, turn on **Use VST3 Plug-In System
 Folders**, and click **Rescan**. The plugin appears under Plug-Ins → live-mcp → LiveMCP Ear,
 and `load_device` can load it with the path `["plugins", "live-mcp", "LiveMCP Ear"]`.

@@ -102,7 +102,7 @@ diff -r "$bundle" "$scratch/VST3/LiveMCP Ear.vst3"
 codesign --verify --strict "$scratch/VST3/LiveMCP Ear.vst3"
 rm -rf "$scratch"
 
-archive="live-mcp-$version-macos-universal.tar.gz"
+archive="live-mcp-macos-universal.tar.gz"
 tar -czf "$out/$archive" -C "$stage" live-mcp
 (cd "$out" && shasum -a 256 "$archive" >"$archive.sha256")
 rm -rf "$stage"
