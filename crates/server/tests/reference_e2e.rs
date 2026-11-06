@@ -63,3 +63,57 @@ async fn analyses_a_wav_file_in_bars_and_sections() {
     let e = h.err("analyze_file", json!({"path": path.display().to_string(), "bpm": 5})).await;
     assert!(e.contains("bpm"), "{e}");
 }
+
+#[tokio::test]
+async fn compares_a_mix_against_a_reference() {
+    let Some(h) = Harness::start().await else { return };
+    let dir = h.state_dir();
+    let mix = |low_mid_db: f64, overall_db: f64| -> Vec<f32> {
+        let parts = [(80.0, -18.0), (300.0, low_mid_db), (1500.0, -20.0), (5000.0, -26.0)];
+        let gain = 10f64.powf(overall_db / 20.0);
+        let n = 48_000 * 8; // four bars at 120 BPM
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / 48_000.0;
+                let sum: f64 = parts
+                    .iter()
+                    .map(|(f, db)| 10f64.powf(db / 20.0) * (2.0 * std::f64::consts::PI * f * t).sin())
+                    .sum();
+                (gain * sum) as f32
+            })
+            .collect()
+    };
+    let reference = dir.join("reference.wav");
+    let muddy = dir.join("muddy.wav");
+    write_wav(&reference, 48_000, &[mix(-24.0, 0.0), mix(-24.0, 0.0)]);
+    // 9 dB more 300 Hz, and 4 dB quieter overall.
+    write_wav(&muddy, 48_000, &[mix(-15.0, -4.0), mix(-15.0, -4.0)]);
+
+    let r = h.ok("analyze_file", json!({"path": reference.display().to_string(), "bpm": 120})).await;
+    let m = h.ok("analyze_file", json!({"path": muddy.display().to_string(), "bpm": 120})).await;
+    let (rid, mid) = (r["snapshot"].as_str().unwrap().to_owned(), m["snapshot"].as_str().unwrap().to_owned());
+    assert_ne!(rid, mid);
+
+    let c = h.ok("compare", json!({"a": mid, "b": rid, "a_bars": [2, 3], "b_bars": [2, 3]})).await;
+    let notes: Vec<&str> = c["notes"].as_array().unwrap().iter().map(|n| n.as_str().unwrap()).collect();
+    assert!(notes.iter().any(|n| n.contains("more low_mid (120–500 Hz)")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("quieter")), "{notes:?}");
+    // After matching levels, the 9 dB boost shows in low_mid alone.
+    let tone = c["tonal_balance_db"].as_array().unwrap();
+    assert!((tone[1]["delta"].as_f64().unwrap() - 9.0).abs() < 1.0, "{tone:?}");
+    for i in [0, 2, 3, 4] {
+        assert!(tone[i]["delta"].as_f64().unwrap().abs() < 1.0, "band {i}: {tone:?}");
+    }
+    let tonal_notes = notes.iter().filter(|n| n.contains("with levels matched")).count();
+    assert_eq!(tonal_notes, 1, "{notes:?}");
+    assert_eq!(c["a"]["bars"], "2–3");
+    assert_eq!(c["per_bar"].as_array().unwrap().len(), 2, "equal-length selections pair up");
+
+    let listed = h.ok("snapshots", json!({})).await;
+    let labels: Vec<&str> =
+        listed["snapshots"].as_array().unwrap().iter().map(|s| s["label"].as_str().unwrap()).collect();
+    assert_eq!(labels, ["reference.wav at 120 BPM", "muddy.wav at 120 BPM"]);
+
+    let e = h.err("compare", json!({"a": "s99", "b": rid})).await;
+    assert!(e.contains("no snapshot"), "{e}");
+}

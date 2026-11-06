@@ -20,6 +20,7 @@ async fn lists_all_tools_with_object_schemas() {
             "batch",
             "browser",
             "call",
+            "compare",
             "create_track",
             "describe",
             "device_parameters",
@@ -31,6 +32,7 @@ async fn lists_all_tools_with_object_schemas() {
             "session",
             "set",
             "set_parameter",
+            "snapshots",
             "status",
             "transport",
             "write_clip"

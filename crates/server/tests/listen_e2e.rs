@@ -112,6 +112,11 @@ async fn listen_through_an_ear_on_the_master_track() {
     assert_eq!(bar["correlation"], 1.0);
     assert!(bar.get("coverage").is_none(), "full bars carry no coverage field");
     assert_eq!(heard["summary"]["peak"], -12.0);
+    // Each listen is kept as a snapshot; a snapshot compared with itself shows no differences.
+    let snapshot = heard["snapshot"].as_str().unwrap().to_owned();
+    let same = h.ok("compare", json!({"a": snapshot, "b": snapshot})).await;
+    assert_eq!(same["loudness_lufs"]["delta"], 0.0);
+    assert!(same["notes"][0].as_str().unwrap().contains("no large differences"), "{same}");
     assert!(heard.get("missing_bars").is_none());
 
     // Straight after a listen that stopped playback, Live still reports is_playing for a tick;

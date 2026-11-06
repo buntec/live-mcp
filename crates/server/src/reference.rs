@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 use crate::audio_file::{self, Decoded};
 use crate::ear::{compact_bar, round1, round2};
 use crate::live::default_true;
+use crate::snapshots::{Kind, SnapshotStore};
 
 /// Results larger than this many bars are summarised instead of listed.
 const MAX_LISTED_BARS: usize = 400;
@@ -37,7 +38,7 @@ pub struct AnalyzeFileParams {
     pub bars: bool,
 }
 
-pub async fn analyze_file(params: AnalyzeFileParams) -> Result<Value> {
+pub async fn analyze_file(store: &SnapshotStore, params: AnalyzeFileParams) -> Result<Value> {
     let path = expand_home(&params.path)?;
     let decoded = tokio::task::spawn_blocking({
         let path = path.clone();
@@ -100,6 +101,9 @@ pub async fn analyze_file(params: AnalyzeFileParams) -> Result<Value> {
                 json!(format!("only the first {MAX_LISTED_BARS} of {} {unit}s are listed", analysis.bars.len()));
         }
     }
+    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let label = if unit == "bar" { format!("{name} at {tempo} BPM") } else { name };
+    out["snapshot"] = json!(store.add(Kind::File, label, unit, analysis.bars));
     Ok(out)
 }
 

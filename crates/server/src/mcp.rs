@@ -19,6 +19,7 @@ use crate::ear::{self, EarHub, EarsParams, ListenParams};
 use crate::live::{Live, default_true};
 use crate::reference::{self, AnalyzeFileParams};
 use crate::session::{self, SessionParams};
+use crate::snapshots::{self, CompareParams, SnapshotStore, SnapshotsParams};
 use crate::tracks::{self, CreateTrackParams};
 use crate::transport::{self, TransportParams};
 
@@ -44,7 +45,9 @@ returned by op N (e.g. a clip created by op 0).
 
 To hear the result, put the LiveMCP Ear plugin on a track (load_device with path \
 [\"plugins\", \"live-mcp\", \"LiveMCP Ear\"]; the master track hears everything) and call `listen`. It plays \
-in real time, so listen to a few bars at a time.
+in real time, so listen to a few bars at a time. `analyze_file` measures an audio file (such as a \
+reference track) the same way. Both return a snapshot id; `compare` reports how two snapshots differ, \
+e.g. a section before and after an edit, or your mix against a reference.
 
 Live answers on its UI ticks (about 10 per second). The first call after a pause waits up to \
 ~100 ms; calls that follow quickly are fast. A call that times out may still have been applied: \
@@ -55,6 +58,7 @@ pub struct LiveServer {
     live: Arc<Live>,
     browser_cache: Arc<BrowserCache>,
     hub: Arc<EarHub>,
+    snapshots: Arc<SnapshotStore>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -152,6 +156,7 @@ impl LiveServer {
             live: Arc::new(Live::new(options)),
             browser_cache: Arc::new(BrowserCache::default()),
             hub: Arc::new(EarHub::default()),
+            snapshots: Arc::new(SnapshotStore::default()),
             tool_router: Self::tool_router(),
         }
     }
@@ -233,7 +238,7 @@ impl LiveServer {
                        >6k, dBFS), stereo correlation and width, plus a section summary."
     )]
     async fn listen(&self, Parameters(p): Parameters<ListenParams>) -> ToolResult {
-        respond(ear::listen(&self.live, &self.hub, p).await)
+        respond(ear::listen(&self.live, &self.hub, &self.snapshots, p).await)
     }
 
     #[tool(
@@ -243,7 +248,26 @@ impl LiveServer {
         annotations(read_only_hint = true)
     )]
     async fn analyze_file(&self, Parameters(p): Parameters<AnalyzeFileParams>) -> ToolResult {
-        respond(reference::analyze_file(p).await)
+        respond(reference::analyze_file(&self.snapshots, p).await)
+    }
+
+    #[tool(
+        description = "Compare two snapshots (from listen or analyze_file), optionally limited to bar ranges: \
+                       loudness, peak, crest (dynamics), width, correlation, and tonal balance relative to each \
+                       one's overall level, as a − b, with notes on the differences that matter. Equal-length \
+                       selections are also compared bar by bar (e.g. before/after an edit).",
+        annotations(read_only_hint = true)
+    )]
+    async fn compare(&self, Parameters(p): Parameters<CompareParams>) -> ToolResult {
+        respond(snapshots::compare(&self.snapshots, p))
+    }
+
+    #[tool(
+        description = "List this session's snapshots: what each listen or analyze_file captured.",
+        annotations(read_only_hint = true)
+    )]
+    async fn snapshots(&self, Parameters(_p): Parameters<SnapshotsParams>) -> ToolResult {
+        respond(Ok(snapshots::list(&self.snapshots)))
     }
 
     #[tool(

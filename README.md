@@ -66,6 +66,7 @@ Other clients take the same command and arguments in their MCP server config.
 | `transport` | Play/stop, tempo, position, loop, fire clips and scenes |
 | `listen`, `ears` | Play bars and get per-bar measurements from a LiveMCP Ear plugin |
 | `analyze_file` | The same measurements for an audio file (e.g. a reference track), plus gated integrated loudness and loudness range |
+| `compare`, `snapshots` | How two results differ (before/after an edit, or your mix against a reference) |
 | `get`, `set`, `call`, `describe`, `batch` | Generic access to the whole Live Object Model |
 | `status` | Connection and script version check |
 
@@ -98,6 +99,15 @@ real time and returns, for each bar:
 
 It also returns a summary of the whole section. `ears` shows which tracks have an
 Ear and whether each is connected.
+
+Every `listen` and `analyze_file` result is kept for the server session as a
+snapshot (`s1`, `s2`, …). `compare` reports how two of them differ, optionally
+for given bar ranges ("my bars 9–16" against "the reference's bars 33–40"):
+- loudness, peak, crest (dynamics), width and correlation;
+- **tonal balance with levels matched** on the median band, so a change in one
+  band shows only in that band;
+- plain-language notes on the differences that matter;
+- bar-by-bar differences when both selections have the same length.
 
 How it works:
 - The plugin measures audio on the audio thread without allocating (about

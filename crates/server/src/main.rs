@@ -10,6 +10,7 @@ mod live;
 mod mcp;
 mod reference;
 mod session;
+mod snapshots;
 mod tracks;
 mod transport;
 

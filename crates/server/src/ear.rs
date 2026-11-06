@@ -19,6 +19,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
 use crate::live::{Live, Track, TrackRef, call, default_true, field_f64, field_str, get_fields, get_props, items, set};
+use crate::snapshots::{Kind, SnapshotStore};
 
 /// The plugin's name in Live's browser and device chain.
 pub const EAR_NAME: &str = "LiveMCP Ear";
@@ -347,7 +348,7 @@ pub struct ListenParams {
     pub play: bool,
 }
 
-pub async fn listen(live: &Live, hub: &EarHub, params: ListenParams) -> Result<Value> {
+pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: ListenParams) -> Result<Value> {
     if let Err(e) = hub.listening() {
         bail!("not listening for {EAR_NAME} plugins: {e}");
     }
@@ -429,6 +430,8 @@ pub async fn listen(live: &Live, hub: &EarHub, params: ListenParams) -> Result<V
     });
     if !reports.is_empty() {
         out["summary"] = summary(&reports);
+        let label = format!("listen on {} bars {}–{} at {tempo} BPM", track.label(), start_bar, start_bar + bars - 1);
+        out["snapshot"] = json!(store.add(Kind::Listen, label, "bar", heard.values().copied().collect()));
     }
     if !missing.is_empty() {
         out["missing_bars"] = json!(missing);
@@ -442,11 +445,11 @@ pub async fn listen(live: &Live, hub: &EarHub, params: ListenParams) -> Result<V
 }
 
 pub(crate) fn round1(x: f32) -> f64 {
-    (x as f64 * 10.0).round() / 10.0
+    (x as f64 * 10.0).round() / 10.0 + 0.0 // + 0.0 turns −0.0 into 0.0
 }
 
 pub(crate) fn round2(x: f32) -> f64 {
-    (x as f64 * 100.0).round() / 100.0
+    (x as f64 * 100.0).round() / 100.0 + 0.0
 }
 
 /// A bar as tools report it: dB values to 0.1, correlation and width to 0.01.
