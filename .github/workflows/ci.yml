@@ -50,7 +50,7 @@ jobs:
       - run: cargo check --workspace --all-targets --locked
 
   bundle:
-    name: Bundle LiveMCP Ear (macOS)
+    name: Build with the Ear embedded (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -58,8 +58,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask bundle live-mcp-ear --release
       - run: cargo build --release --locked --bin live-mcp
-      # A tarball keeps the executable bits and the bundle's layout, which artifact zips lose.
-      - run: tar -czf live-mcp-macos-arm64.tar.gz -C target "bundled/LiveMCP Ear.vst3" release/live-mcp
+        env:
+          LIVE_MCP_EAR_BUNDLE: target/bundled/LiveMCP Ear.vst3
+      - name: Install into scratch folders and verify the plugin
+        run: |
+          scratch="$RUNNER_TEMP/install"
+          mkdir -p "$scratch/User Library"
+          ./target/release/live-mcp install --user-library "$scratch/User Library" --vst3-dir "$scratch/VST3"
+          test -f "$scratch/User Library/Remote Scripts/LiveMCP/__init__.py"
+          diff -r "target/bundled/LiveMCP Ear.vst3" "$scratch/VST3/LiveMCP Ear.vst3"
+          codesign --verify --strict --verbose "$scratch/VST3/LiveMCP Ear.vst3"
+          ./target/release/live-mcp install --user-library "$scratch/User Library" --vst3-dir "$scratch/VST3" \
+            | grep -q "Already up to date: .*LiveMCP Ear.vst3"
+      # A tarball keeps the executable bit, which artifact zips lose.
+      - run: tar -czf live-mcp-macos-arm64.tar.gz -C target/release live-mcp
       - uses: actions/upload-artifact@v7
         with:
           name: live-mcp-macos-arm64

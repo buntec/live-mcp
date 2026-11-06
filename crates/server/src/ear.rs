@@ -326,8 +326,10 @@ pub async fn ears(live: &Live, hub: &EarHub, _params: EarsParams) -> Result<Valu
         Err(e) => out["error"] = json!(e),
     }
     if bindings.is_empty() {
-        out["hint"] =
-            json!(format!("no {EAR_NAME} in the set; add one with load_device and path {EAR_BROWSER_PATH:?}"));
+        out["hint"] = json!(format!(
+            "no {EAR_NAME} in the set; add one with load_device and path {EAR_BROWSER_PATH:?}. If Live's \
+                 browser doesn't have it, the user needs to run `live-mcp install` and restart Live"
+        ));
     } else if bindings.iter().any(|b| b.instance.is_none()) {
         out["hint"] = json!(
             "a device that is not connected may be from an older plugin build, or it may report to another \

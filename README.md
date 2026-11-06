@@ -21,7 +21,7 @@ token-authenticated JSON-RPC socket. Everything else is Rust.
 | `remote_script/LiveMCP/__init__.py` | The Remote Script: standard library only, no music logic |
 | `crates/protocol` | Wire types shared by every client |
 | `crates/bridge` | Async client, token and endpoint files, embedded script and installer |
-| `crates/server` | `live-mcp` binary: the MCP server (`serve`) and CLI commands |
+| `crates/server` | `live-mcp` binary: the MCP server (`serve`) and CLI commands; embeds the Ear plugin when built with `just build` |
 | `crates/ear` | LiveMCP Ear, the VST3 analysis plugin ([nice-plug](https://codeberg.org/RustAudio/nice-plug)) |
 | `crates/analysis` | Audio measurements, independent of any plugin framework |
 | `xtask` | `cargo xtask bundle`, which builds plugin bundles |
@@ -32,12 +32,24 @@ token-authenticated JSON-RPC socket. Everything else is Rust.
 Requires Ableton Live 12. Live 11 may work, but it hasn't been tested.
 
 ```sh
-cargo build --release
+just build                                   # the live-mcp binary, with the LiveMCP Ear plugin inside
 ./target/release/live-mcp install            # or: install --user-library "/path/to/User Library"
 ```
 
-In Live, open Settings → Link, Tempo & MIDI and pick **LiveMCP** as a Control
-Surface, with Input and Output set to None. Then:
+Without [just](https://github.com/casey/just), build the plugin first and point
+the build at it:
+
+```sh
+cargo xtask bundle live-mcp-ear --release
+LIVE_MCP_EAR_BUNDLE="target/bundled/LiveMCP Ear.vst3" cargo build --release
+```
+
+A plain `cargo build` works too, but the binary won't include the plugin.
+
+`install` puts the Remote Script in Live's User Library and the LiveMCP Ear in
+`~/Library/Audio/Plug-Ins/VST3` (`--vst3-dir` to change it). In Live, open
+Settings → Link, Tempo & MIDI and pick **LiveMCP** as a Control Surface, with
+Input and Output set to None. Then:
 
 ```sh
 live-mcp status
@@ -92,19 +104,16 @@ Each client starts its own server, and only the first one gets the Ear port
 
 After `live-mcp install` replaces an older version, **quit and restart Live**.
 Re-selecting the control surface creates a new instance but keeps the old code.
-`live-mcp status` reports `script_current: false` until Live has restarted.
+`live-mcp status` reports `script_current: false` until Live has restarted, and
+`ear_plugin` says whether the installed plugin matches the one in the binary.
 
 ## The plugin
 
-```sh
-cargo xtask bundle live-mcp-ear --release      # → target/bundled/LiveMCP Ear.vst3
-cp -R "target/bundled/LiveMCP Ear.vst3" ~/Library/Audio/Plug-Ins/VST3/
-```
-
-In Live, open Settings → Plug-Ins, turn on **Use VST3 Plug-In System Folders**,
-and click **Rescan**. The plugin appears under Plug-Ins → live-mcp → LiveMCP Ear,
+`live-mcp install` installs the LiveMCP Ear (see [Try it](#try-it)). If Live
+doesn't list it, open Settings → Plug-Ins, turn on **Use VST3 Plug-In System
+Folders**, and click **Rescan**. The plugin appears under Plug-Ins → live-mcp → LiveMCP Ear,
 and `load_device` can load it with the path `["plugins", "live-mcp", "LiveMCP Ear"]`.
-After rebuilding the plugin, restart Live: Live keeps the old binary loaded.
+After installing a new version of the plugin, restart Live: Live keeps the old binary loaded.
 
 ### Listening
 

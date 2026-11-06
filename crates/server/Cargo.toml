@@ -30,4 +30,5 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "i
 [dev-dependencies]
 live-mcp-bridge = { path = "../bridge", features = ["testkit"] }
 rmcp = { version = "3.9", features = ["client", "transport-child-process"] }
+tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "process"] }

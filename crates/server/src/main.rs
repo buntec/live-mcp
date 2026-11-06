@@ -6,6 +6,7 @@ mod browser;
 mod clips;
 mod devices;
 mod ear;
+mod ear_install;
 mod live;
 mod masking;
 mod mcp;
@@ -44,11 +45,15 @@ struct Cli {
 enum Cmd {
     /// Run the MCP server on stdin/stdout (this is what an MCP client launches).
     Serve,
-    /// Install the Remote Script into Live's User Library and create the shared token.
+    /// Install the Remote Script into Live's User Library and the LiveMCP Ear plugin into the
+    /// VST3 folder, and create the shared token.
     Install {
         /// Live's User Library folder (Settings → Library in Live). Defaults to the standard location.
         #[arg(long)]
         user_library: Option<PathBuf>,
+        /// Folder to install the LiveMCP Ear plugin into. Defaults to ~/Library/Audio/Plug-Ins/VST3.
+        #[arg(long)]
+        vst3_dir: Option<PathBuf>,
     },
     /// Check the connection: handshake, script freshness, Live version, main-thread health.
     Status,
@@ -118,7 +123,7 @@ async fn run(cli: Cli) -> Result<()> {
         Options { port: cli.port, request_timeout: Duration::from_secs_f64(cli.timeout), ..Options::default() };
     match cli.command {
         Cmd::Serve => serve(options).await,
-        Cmd::Install { user_library } => install(&options, user_library),
+        Cmd::Install { user_library, vst3_dir } => install(&options, user_library, vst3_dir),
         Cmd::Status => status(&options).await,
         Cmd::Get { target, props, fields, offset, limit } => {
             let live = connect(&options).await?;
@@ -168,12 +173,23 @@ async fn serve(options: Options) -> Result<()> {
     Ok(())
 }
 
-fn install(options: &Options, user_library: Option<PathBuf>) -> Result<()> {
+fn install(options: &Options, user_library: Option<PathBuf>, vst3_dir: Option<PathBuf>) -> Result<()> {
     let library = match user_library {
         Some(path) => path,
         None => script::default_user_library()
             .context("no default User Library location on this platform; pass --user-library")?,
     };
+    // Resolve both destinations before writing anything.
+    let ear_target = match ear_install::EMBEDDED {
+        Some(bundle) => {
+            let dir = vst3_dir.or_else(ear_install::default_vst3_dir).context(
+                "no default VST3 folder on this platform; pass --vst3-dir to install the LiveMCP Ear plugin",
+            )?;
+            Some((bundle, dir))
+        }
+        None => None,
+    };
+
     let report = script::install(&library)?;
     paths::ensure_token(&options.state_dir)
         .with_context(|| format!("creating the token in {}", options.state_dir.display()))?;
@@ -184,7 +200,27 @@ fn install(options: &Options, user_library: Option<PathBuf>) -> Result<()> {
             println!("Updated {} (previous version saved as {})", report.path.display(), backup.display())
         }
     }
-    if report.status != InstallStatus::Unchanged {
+    let script_changed = report.status != InstallStatus::Unchanged;
+
+    let mut ear_changed = false;
+    match ear_target {
+        Some((bundle, dir)) => {
+            let ear = ear_install::install(&bundle, &dir)
+                .with_context(|| format!("installing the LiveMCP Ear plugin into {}", dir.display()))?;
+            match ear.status {
+                ear_install::InstallStatus::Created => println!("Installed {}", ear.path.display()),
+                ear_install::InstallStatus::Unchanged => println!("Already up to date: {}", ear.path.display()),
+                ear_install::InstallStatus::Updated => println!("Updated {}", ear.path.display()),
+            }
+            ear_changed = ear.status != ear_install::InstallStatus::Unchanged;
+        }
+        None => println!(
+            "This build doesn't include the LiveMCP Ear plugin, so `listen` won't have anything to hear\n\
+             through. Build with `just build` to include it (see the README)."
+        ),
+    }
+
+    if script_changed {
         println!(
             "\nNext: in Live, open Settings → Link, Tempo & MIDI and choose \"{}\" as a Control Surface\n\
              (Input/Output: None). If it was already selected, quit and restart Live: re-selecting it\n\
@@ -192,7 +228,27 @@ fn install(options: &Options, user_library: Option<PathBuf>) -> Result<()> {
             script::FOLDER
         );
     }
+    if ear_changed {
+        println!(
+            "\nLiveMCP Ear: restart Live if it is running, since Live keeps a loaded plugin's old code.\n\
+             If Live doesn't list it under Plug-Ins → live-mcp, open Settings → Plug-Ins, turn on\n\
+             \"Use VST3 Plug-In System Folders\" and click Rescan."
+        );
+    }
     Ok(())
+}
+
+/// Whether the installed LiveMCP Ear matches the one in this binary.
+fn ear_plugin_state() -> &'static str {
+    let Some(bundle) = ear_install::EMBEDDED else { return "not included in this build" };
+    let Some(dir) = ear_install::default_vst3_dir() else { return "unknown (no default VST3 folder)" };
+    let path = dir.join(bundle.name);
+    match ear_install::is_current(&bundle, &path) {
+        Ok(true) => "current",
+        Ok(false) if path.exists() => "outdated",
+        Ok(false) => "not installed",
+        Err(_) => "unreadable",
+    }
 }
 
 async fn status(options: &Options) -> Result<()> {
@@ -200,10 +256,12 @@ async fn status(options: &Options) -> Result<()> {
     let info = live.info().await?;
     let health = live.status().await?;
     let stale = live.script_is_stale();
+    let ear = ear_plugin_state();
     print(&json!({
         "address": live.addr(),
         "script": serde_json::to_value(live.hello())?,
         "script_current": !stale,
+        "ear_plugin": ear,
         "live": info,
         "main_thread": health,
     }))?;
@@ -212,6 +270,9 @@ async fn status(options: &Options) -> Result<()> {
             "warning: the running Remote Script differs from the one in this binary. Run `live-mcp install`, \
              then quit and restart Live (re-selecting the control surface does not reload the code).",
         );
+    }
+    if matches!(ear, "outdated" | "not installed") {
+        eprintln!("warning: the LiveMCP Ear plugin is {ear}. Run `live-mcp install`, then restart Live.");
     }
     Ok(())
 }
