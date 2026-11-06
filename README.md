@@ -54,7 +54,23 @@ live-mcp get "#<id> clip_slots 0 clip" --props name,length
 claude mcp add live -- /absolute/path/to/target/release/live-mcp serve
 ```
 
+For Codex CLI:
+
+```sh
+codex mcp add live -- /absolute/path/to/target/release/live-mcp serve
+```
+
+or, in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.live]
+command = "/absolute/path/to/target/release/live-mcp"
+args = ["serve"]
+```
+
 Other clients take the same command and arguments in their MCP server config.
+Each client starts its own server, and only the first one gets the Ear port
+(127.0.0.1:19419), so `listen` and `ears` work in one client at a time.
 
 | Tools | |
 |---|---|
