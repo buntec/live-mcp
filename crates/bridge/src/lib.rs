@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use live_mcp_protocol::{
-    BatchOp, DEFAULT_PORT, HelloParams, HelloResult, PROTOCOL_VERSION, Request, Response, RpcError, Target, codes,
+    BatchOp, DEFAULT_PORT, Events, EventsPage, HelloParams, HelloResult, PROTOCOL_VERSION, Request, Response, RpcError,
+    Target, codes,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -141,6 +142,17 @@ pub struct Bridge {
     hello: HelloResult,
     addr: String,
     request_timeout: Duration,
+    /// Serialises `events` calls, which must not ask for the same events twice.
+    events: tokio::sync::Mutex<EventCursor>,
+}
+
+/// What this connection has received of its events.
+#[derive(Debug, Default)]
+struct EventCursor {
+    /// The highest `seq` received, acknowledged with the next `events`.
+    acked: u64,
+    /// The script's `dropped` total when last read.
+    dropped: u64,
 }
 
 impl Drop for Bridge {
@@ -174,6 +186,7 @@ impl Bridge {
             hello: HelloResult { script_version: String::new(), protocol: 0, code_hash: String::new() },
             addr,
             request_timeout: opts.request_timeout,
+            events: tokio::sync::Mutex::default(),
         };
         let params = HelloParams { token, protocol: PROTOCOL_VERSION, client: opts.client_name.clone() };
         let hello = bridge
@@ -279,6 +292,55 @@ impl Bridge {
     /// grouped into one undo step in Live.
     pub async fn batch(&self, ops: &[BatchOp], undo_step: bool, stop_on_error: bool) -> Result<Value> {
         self.request("batch", json!({"ops": ops, "undo_step": undo_step, "stop_on_error": stop_on_error})).await
+    }
+
+    /// Adds a listener for `prop` of the target (one of the properties `describe` lists as
+    /// observable). Returns `{subscription, object, value?, existing?}`; observing the same
+    /// property of the same object again returns the existing subscription.
+    ///
+    /// Subscriptions belong to this connection, and end when it closes.
+    pub async fn observe(&self, target: &Target, prop: &str) -> Result<Value> {
+        self.request("observe", json!({"target": target, "prop": prop})).await
+    }
+
+    /// Removes these subscriptions, or all of this connection's when `None`.
+    /// Returns `{removed, unknown}`.
+    pub async fn unobserve(&self, subscriptions: Option<&[u64]>) -> Result<Value> {
+        let params = match subscriptions {
+            Some(ids) => json!({"subscriptions": ids}),
+            None => json!({}),
+        };
+        self.request("unobserve", params).await
+    }
+
+    /// Takes the events queued for this connection since the last call.
+    ///
+    /// The script keeps events until a later call acknowledges them, so a call that fails
+    /// (it timed out, say) loses nothing: the next one returns the same events again.
+    pub async fn events(&self) -> Result<Events> {
+        let mut cursor = self.events.lock().await;
+        let mut events = Vec::new();
+        let mut after = cursor.acked;
+        loop {
+            let result = self.request("events", json!({"ack": cursor.acked, "after": after})).await?;
+            let page: EventsPage =
+                serde_json::from_value(result).map_err(|e| BridgeError::Protocol(format!("events: {e}")))?;
+            match page.events.last() {
+                Some(last) => after = last.seq,
+                None if page.more => {
+                    return Err(BridgeError::Protocol("events: an empty reply says there are more".into()));
+                }
+                None => {}
+            }
+            events.extend(page.events);
+            if !page.more {
+                // Only now are the events in hand: the next call acknowledges them.
+                let dropped = page.dropped.saturating_sub(cursor.dropped);
+                cursor.acked = after;
+                cursor.dropped = page.dropped;
+                return Ok(Events { events, dropped, listening: page.listening });
+            }
+        }
     }
 }
 

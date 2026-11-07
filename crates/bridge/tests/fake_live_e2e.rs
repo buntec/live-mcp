@@ -62,7 +62,7 @@ async fn get_set_call_and_describe() {
     assert_eq!(described["type"], "Track");
     let props: Vec<&str> = described["properties"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
     assert!(props.contains(&"name") && props.contains(&"clip_slots"));
-    assert_eq!(described["observable"], json!(["name"]));
+    assert_eq!(described["observable"], json!(["mute", "name", "solo"]));
     assert_eq!(described["types"], json!(["View"]), "nested classes are not methods");
     assert!(described["methods"].as_array().unwrap().iter().all(|m| !m.as_str().unwrap().contains("listener")));
     assert_eq!(described["values"]["name"], "1-MIDI");
@@ -343,4 +343,215 @@ async fn batch_ops_can_target_earlier_results() {
 
     let err = live.get(&Target::batch_result(0), GetOptions::default()).await.unwrap_err();
     assert_eq!(err.code(), Some(codes::INVALID_PARAMS), "result targets only work inside a batch");
+}
+
+/// Waits until Live's main thread has ticked twice. Like Live, the fake calls listeners on
+/// the tick after a change, so by then every earlier change has been queued.
+async fn settle(live: &Bridge) {
+    let ticks = |status: Value| status["ticks"].as_u64().unwrap();
+    let start = ticks(live.status().await.unwrap());
+    while ticks(live.status().await.unwrap()) < start + 2 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Polls `events` until at least `n` events arrived.
+async fn wait_for_events(live: &Bridge, n: usize) -> Vec<live_mcp_protocol::Event> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut events = Vec::new();
+    while events.len() < n {
+        assert!(std::time::Instant::now() < deadline, "only {} of {n} events arrived: {events:?}", events.len());
+        events.extend(live.events().await.unwrap().events);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    events
+}
+
+#[tokio::test]
+async fn observe_reports_changes_with_values() {
+    let Some(fake) = FakeLive::start() else { return };
+    let live = fake.connect().await;
+
+    let tempo = live.observe(&path("live_set"), "tempo").await.unwrap();
+    assert_eq!(tempo["value"], 120.0);
+    assert_eq!(tempo["object"]["type"], "Song");
+    let tempo_sub = tempo["subscription"].as_u64().unwrap();
+    // Observing the same property of the same object again reuses the subscription.
+    let again = live.observe(&path("song"), "tempo").await.unwrap();
+    assert_eq!(again["subscription"].as_u64(), Some(tempo_sub));
+    assert_eq!(again["existing"], true);
+
+    let playing = live.observe(&path("live_set"), "is_playing").await.unwrap()["subscription"].as_u64().unwrap();
+    let mute = live.observe(&path("live_set tracks 1"), "mute").await.unwrap()["subscription"].as_u64().unwrap();
+    assert_eq!(live.status().await.unwrap()["subscriptions"], 3);
+
+    // Nothing has changed yet.
+    let initial = live.events().await.unwrap();
+    assert!(initial.events.is_empty() && initial.dropped == 0, "{initial:?}");
+
+    live.set(&path("live_set"), "tempo", json!(128.0)).await.unwrap();
+    live.set(&path("live_set"), "tempo", json!(128.0)).await.unwrap(); // unchanged: no event
+    live.set(&path("live_set tracks 1"), "mute", json!(true)).await.unwrap();
+    settle(&live).await;
+    let events = live.events().await.unwrap().events;
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!((events[0].subscription, events[0].value.clone()), (tempo_sub, Some(json!(128.0))));
+    assert_eq!((events[1].subscription, events[1].value.clone()), (mute, Some(json!(true))));
+    assert!(events[0].seq < events[1].seq);
+    assert!(live.events().await.unwrap().events.is_empty(), "events are taken once");
+
+    // Transport changes apply on a later tick, and their listeners fire after that.
+    live.call(&path("live_set"), "start_playing", vec![]).await.unwrap();
+    let events = wait_for_events(&live, 1).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!((events[0].subscription, events[0].value.clone()), (playing, Some(json!(true))));
+
+    // A listener follows the object, not the path it was found by.
+    live.call(&path("live_set"), "create_midi_track", vec![json!(0)]).await.unwrap();
+    live.set(&path("live_set tracks 2"), "mute", json!(false)).await.unwrap();
+    settle(&live).await;
+    let events = live.events().await.unwrap().events;
+    assert_eq!(events.iter().map(|e| e.subscription).collect::<Vec<_>>(), [mute]);
+}
+
+#[tokio::test]
+async fn observables_without_a_property_and_errors() {
+    let Some(fake) = FakeLive::start() else { return };
+    let live = fake.connect().await;
+    live.call(&path("live_set tracks 0 clip_slots 0"), "create_clip", vec![json!(4.0)]).await.unwrap();
+    let clip = path("live_set tracks 0 clip_slots 0 clip");
+
+    // A clip's `notes` has a listener but no property: there is no value to report.
+    let notes = live.observe(&clip, "notes").await.unwrap();
+    assert!(notes.get("value").is_none(), "{notes}");
+    let note = new_live_object("Clip.MidiNoteSpecification", json!({"pitch": 60, "start_time": 0.0, "duration": 1.0}));
+    live.call(&clip, "add_new_notes", vec![tuple(vec![note])]).await.unwrap();
+    settle(&live).await;
+    let events = live.events().await.unwrap().events;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].value, None);
+
+    let err = live.observe(&path("live_set"), "signature_numerator").await.unwrap_err();
+    assert_eq!(err.code(), Some(codes::INVALID_PARAMS));
+    assert!(err.to_string().contains("observable"), "{err}");
+    let err = live.observe(&path("live_set tracks 0 name"), "upper").await.unwrap_err();
+    assert_eq!(err.code(), Some(codes::INVALID_PARAMS), "only Live objects can be observed");
+    let err = live.observe(&path("live_set"), "__class__").await.unwrap_err();
+    assert_eq!(err.code(), Some(codes::INVALID_PARAMS));
+
+    // Subscriptions belong to a connection, so they cannot be made inside a batch.
+    let op = BatchOp { method: "observe".into(), params: json!({"target": "live_set", "prop": "tempo"}) };
+    let result = live.batch(&[op], false, true).await.unwrap();
+    assert_eq!(result["results"][0]["error"]["code"], codes::METHOD_NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unobserve_and_connections_keep_subscriptions_apart() {
+    let Some(fake) = FakeLive::start() else { return };
+    let a = fake.connect().await;
+    let b = fake.connect().await;
+
+    let a_tempo = a.observe(&path("live_set"), "tempo").await.unwrap()["subscription"].as_u64().unwrap();
+    let a_name = a.observe(&path("live_set tracks 0"), "name").await.unwrap()["subscription"].as_u64().unwrap();
+    let b_tempo = b.observe(&path("live_set"), "tempo").await.unwrap()["subscription"].as_u64().unwrap();
+    assert_ne!(a_tempo, b_tempo, "each connection gets its own subscription");
+
+    // Both connections see the change, whichever made it.
+    b.set(&path("live_set"), "tempo", json!(100.0)).await.unwrap();
+    settle(&b).await;
+    assert_eq!(a.events().await.unwrap().events.len(), 1);
+    assert_eq!(b.events().await.unwrap().events.len(), 1);
+
+    // Unobserving discards unread events of that subscription.
+    a.set(&path("live_set tracks 0"), "name", json!("Lead")).await.unwrap();
+    settle(&a).await;
+    let removed = a.unobserve(Some(&[a_name, 999])).await.unwrap();
+    assert_eq!(removed, json!({"removed": [a_name], "unknown": [999]}));
+    assert!(a.events().await.unwrap().events.is_empty());
+    a.set(&path("live_set tracks 0"), "name", json!("Keys")).await.unwrap();
+    settle(&a).await;
+    assert!(a.events().await.unwrap().events.is_empty());
+
+    // A closed connection's listeners are removed.
+    assert_eq!(b.status().await.unwrap()["subscriptions"], 2);
+    drop(a);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while b.status().await.unwrap()["subscriptions"] != 1 {
+        assert!(std::time::Instant::now() < deadline, "a's subscriptions outlived its connection");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // An observed object that is deleted can still be unobserved.
+    let name = b.observe(&path("live_set tracks 1"), "name").await.unwrap()["subscription"].as_u64().unwrap();
+    b.call(&path("live_set"), "delete_track", vec![json!(1)]).await.unwrap();
+    assert_eq!(b.unobserve(None).await.unwrap()["removed"], json!([b_tempo, name]));
+    assert_eq!(b.status().await.unwrap()["subscriptions"], 0);
+}
+
+#[tokio::test]
+async fn events_survive_a_reply_that_never_arrives() {
+    let Some(fake) = FakeLive::start() else { return };
+    let busy = fake.connect().await;
+    let opts = Options { request_timeout: Duration::from_millis(200), ..fake.options() };
+    let live = Bridge::connect(&opts).await.unwrap();
+    let tempo = live.observe(&path("live_set"), "tempo").await.unwrap()["subscription"].as_u64().unwrap();
+    live.set(&path("live_set"), "tempo", json!(130.0)).await.unwrap();
+    settle(&live).await;
+
+    // Live's main thread is busy for longer than the client waits, so the reply comes too late.
+    let song = path("live_set");
+    let (slow, events) = tokio::join!(busy.call(&song, "slow", vec![json!(0.6)]), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        live.events().await
+    });
+    slow.unwrap();
+    assert!(matches!(events, Err(BridgeError::Timeout { .. })), "{events:?}");
+
+    // The script kept the events, as they were never acknowledged.
+    let events = live.events().await.unwrap();
+    assert_eq!(events.events.len(), 1, "{events:?}");
+    assert_eq!((events.events[0].subscription, events.events[0].value.clone()), (tempo, Some(json!(130.0))));
+    assert_eq!((events.dropped, events.listening), (0, 1));
+    assert!(live.events().await.unwrap().events.is_empty(), "acknowledged events are not repeated");
+}
+
+#[tokio::test]
+async fn events_come_in_pages_and_overflow_is_counted() {
+    let Some(fake) = FakeLive::start() else { return };
+    let live = fake.connect().await;
+    live.observe(&path("live_set"), "tempo").await.unwrap();
+    let tempo_changes = |n: usize| -> Vec<BatchOp> {
+        (0..n)
+            .map(|i| BatchOp {
+                method: "set".into(),
+                params: json!({"target": "live_set", "prop": "tempo", "value": 100 + i % 2}),
+            })
+            .collect()
+    };
+
+    // More than one reply holds.
+    live.batch(&tempo_changes(2500), false, true).await.unwrap();
+    settle(&live).await;
+    let events = live.events().await.unwrap();
+    assert_eq!((events.events.len(), events.dropped), (2500, 0));
+    assert!(events.events.windows(2).all(|w| w[0].seq < w[1].seq), "in order, without repeats");
+
+    // More than the script keeps: the oldest are discarded and counted, once.
+    live.batch(&tempo_changes(10_300), false, true).await.unwrap();
+    settle(&live).await;
+    let events = live.events().await.unwrap();
+    assert_eq!((events.events.len(), events.dropped), (10_000, 300));
+    let events = live.events().await.unwrap();
+    assert_eq!((events.events.len(), events.dropped), (0, 0));
+}
+
+#[tokio::test]
+async fn deleted_objects_are_not_listening() {
+    let Some(fake) = FakeLive::start() else { return };
+    let live = fake.connect().await;
+    assert_eq!(live.events().await.unwrap().listening, 0);
+    live.observe(&path("live_set tracks 1"), "mute").await.unwrap();
+    assert_eq!(live.events().await.unwrap().listening, 1);
+    live.call(&path("live_set"), "delete_track", vec![json!(1)]).await.unwrap();
+    assert_eq!(live.events().await.unwrap().listening, 0);
 }

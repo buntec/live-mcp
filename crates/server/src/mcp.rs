@@ -22,9 +22,10 @@ use crate::session::{self, SessionParams};
 use crate::snapshots::{self, CompareParams, SnapshotStore, SnapshotsParams};
 use crate::tracks::{self, CreateTrackParams};
 use crate::transport::{self, TransportParams};
+use crate::watch::{self, EventsParams, ObserveParams, UnobserveParams, Watches};
 
 /// Results larger than this are refused, with a hint to narrow the request.
-const MAX_RESULT_CHARS: usize = 200_000;
+pub(crate) const MAX_RESULT_CHARS: usize = 200_000;
 
 const INSTRUCTIONS: &str = "\
 Controls Ableton Live through the LiveMCP Remote Script. Start with `session` to see the set.
@@ -49,6 +50,11 @@ in real time, so listen to a few bars at a time. `analyze_file` measures an audi
 reference track) the same way. Both return a snapshot id; `compare` reports how two snapshots differ, \
 e.g. a section before and after an edit, or your mix against a reference.
 
+To notice changes made in Live (by the user, automation or playback), `observe` properties that \
+`describe` lists as observable, such as live_set's tempo and is_playing or a track's mute and name, \
+then call `events` for what changed since the last call (`wait_ms` waits for the next change). \
+Events include changes your own calls made; nothing marks who made a change.
+
 Live answers on its UI ticks (about 10 per second). The first call after a pause waits up to \
 ~100 ms; calls that follow quickly are fast. A call that times out may still have been applied: \
 check the state instead of retrying.";
@@ -59,6 +65,7 @@ pub struct LiveServer {
     browser_cache: Arc<BrowserCache>,
     hub: Arc<EarHub>,
     snapshots: Arc<SnapshotStore>,
+    watches: Arc<Watches>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -157,6 +164,7 @@ impl LiveServer {
             browser_cache: Arc::new(BrowserCache::default()),
             hub: Arc::new(EarHub::default()),
             snapshots: Arc::new(SnapshotStore::default()),
+            watches: Arc::new(Watches::default()),
             tool_router: Self::tool_router(),
         }
     }
@@ -283,6 +291,30 @@ impl LiveServer {
     )]
     async fn ears(&self, Parameters(p): Parameters<EarsParams>) -> ToolResult {
         respond(ear::ears(&self.live, &self.hub, p).await)
+    }
+
+    // -------------------------------------------------------------- listeners
+
+    #[tool(description = "Watch properties of a Live object for changes (the ones `describe` lists as observable, \
+                       e.g. live_set tempo, is_playing, current_song_time; a track's mute, solo, arm, name; \
+                       live_set tracks). The listener follows the object, not the path: it keeps watching a track \
+                       that moves. Returns subscription ids and current values; read changes with `events`.")]
+    async fn observe(&self, Parameters(p): Parameters<ObserveParams>) -> ToolResult {
+        respond(watch::observe(&self.live, &self.watches, p).await)
+    }
+
+    #[tool(
+        description = "Changes to observed properties since the last call, oldest first: the value after each change \
+                       and how long ago it happened, including changes this server made. wait_ms waits for the first change if there is none yet; latest_only keeps one \
+                       entry per subscription (useful for fast-changing values such as current_song_time)."
+    )]
+    async fn events(&self, Parameters(p): Parameters<EventsParams>) -> ToolResult {
+        respond(watch::events(&self.live, &self.watches, p).await)
+    }
+
+    #[tool(description = "Stop watching: remove these subscriptions, or all of them when none are given.")]
+    async fn unobserve(&self, Parameters(p): Parameters<UnobserveParams>) -> ToolResult {
+        respond(watch::unobserve(&self.live, &self.watches, p).await)
     }
 
     // ---------------------------------------------------------- generic tools

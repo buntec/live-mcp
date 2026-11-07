@@ -15,6 +15,7 @@ mod session;
 mod snapshots;
 mod tracks;
 mod transport;
+mod watch;
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -91,6 +92,14 @@ enum Cmd {
         #[arg(long)]
         values: bool,
     },
+    /// Print changes to observable properties of TARGET as they happen, one JSON line each, until interrupted.
+    ///
+    /// `describe` lists a target's observable properties.
+    Watch {
+        target: String,
+        #[arg(required = true)]
+        props: Vec<String>,
+    },
     /// Run a JSON array of {"method", "params"} ops from FILE (or "-" for stdin) in one main-thread job.
     Batch {
         file: String,
@@ -147,6 +156,7 @@ async fn run(cli: Cli) -> Result<()> {
             let live = connect(&options).await?;
             print(&live.describe(&parse_target(&target)?, values).await?)
         }
+        Cmd::Watch { target, props } => watch(&options, &target, &props).await,
         Cmd::Batch { file, undo_step, keep_going } => {
             let text = if file == "-" {
                 let mut text = String::new();
@@ -275,6 +285,35 @@ async fn status(options: &Options) -> Result<()> {
         eprintln!("warning: the LiveMCP Ear plugin is {ear}. Run `live-mcp install`, then restart Live.");
     }
     Ok(())
+}
+
+async fn watch(options: &Options, target: &str, props: &[String]) -> Result<()> {
+    let live = connect(options).await?;
+    let target = parse_target(target)?;
+    let mut names = std::collections::HashMap::new();
+    for prop in props {
+        let result = live.observe(&target, prop).await?;
+        let subscription = result["subscription"].as_u64().context("unexpected observe response")?;
+        names.insert(subscription, prop.clone());
+        let value = result.get("value").cloned().unwrap_or(Value::Null);
+        println!("{}", json!({"prop": prop, "value": value, "initial": true}));
+    }
+    // Live closes the connection when the control surface goes away, and its listeners with it.
+    loop {
+        let batch = live.events().await?;
+        if batch.dropped > 0 {
+            // Listed where they would have been: before the changes that followed them.
+            println!("{}", json!({"dropped": batch.dropped}));
+        }
+        for event in batch.events {
+            let mut line = json!({"prop": names.get(&event.subscription), "tick": event.tick});
+            if let Some(value) = event.value {
+                line["value"] = value;
+            }
+            println!("{line}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn connect(options: &Options) -> Result<Bridge> {

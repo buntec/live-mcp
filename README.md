@@ -90,6 +90,7 @@ live-mcp describe "live_set tracks 0" --values
 live-mcp set "live_set" tempo 124
 live-mcp call "live_set tracks 0 clip_slots 0" create_clip 4
 live-mcp get "#<id> clip_slots 0 clip" --props name,length
+live-mcp watch "live_set" tempo is_playing   # print changes until Ctrl-C
 ```
 
 `set` values and `call` arguments are JSON, so strings need quotes: `'"Bass"'`.
@@ -125,6 +126,7 @@ the absolute path of `target/release/live-mcp` in your MCP client's config.
 | `listen`, `ears` | Play bars and get per-bar measurements from a LiveMCP Ear plugin |
 | `analyze_file` | The same measurements for an audio file (e.g. a reference track), plus gated integrated loudness and loudness range |
 | `compare`, `snapshots` | How two results differ (before/after an edit, or your mix against a reference) |
+| `observe`, `events`, `unobserve` | Watch properties (tempo, transport, a track's mute or name, ...) and get what changed since the last call, including changes made by hand in Live |
 | `get`, `set`, `call`, `describe`, `batch` | Generic access to the whole Live Object Model |
 | `status` | Connection and script version check |
 
@@ -229,8 +231,6 @@ are skipped without it.
 
 ## Not yet
 
-- **Listeners and events.** The bridge can't yet watch a property for changes;
-  `observe` and `events` are planned (see `docs/protocol.md`).
 - **Pan and sends in masking.** Track levels are corrected for the fader only.
 - **Other platforms and versions.** Only tested on macOS (arm64) with Live 12.4.
 
