@@ -8,6 +8,8 @@ pub mod ensemble;
 pub mod key;
 pub mod midi;
 pub mod names;
+#[cfg(test)]
+mod replay;
 pub mod rhythm;
 
 use serde_json::{Map, Value, json};

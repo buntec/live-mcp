@@ -72,12 +72,14 @@ pub struct EarHub {
     instances: Mutex<HashMap<u64, Instance>>,
     changed: Notify,
     listening: OnceLock<Result<u16, String>>,
+    state_dir: OnceLock<PathBuf>,
 }
 
 impl EarHub {
     /// Listens on 127.0.0.1 (port from `config.json` `ear_port`, default 19419) and advertises
     /// the port in `ear.json`. Failure is recorded, not fatal: the other tools still work.
     pub async fn start(self: &Arc<Self>, state_dir: &Path) {
+        let _ = self.state_dir.set(state_dir.to_owned());
         let result = self.bind(state_dir).await;
         let _ = self.listening.set(result.map_err(|e| format!("{e:#}")));
     }
@@ -103,6 +105,15 @@ impl EarHub {
             }
         });
         Ok(port)
+    }
+
+    /// The folder `config.json` names as `record_beats`, read on every call so it can be switched
+    /// on and off while the server runs. A relative folder is inside the state folder.
+    fn recording_dir(&self) -> Option<PathBuf> {
+        let state_dir = self.state_dir.get()?;
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(state_dir.join("config.json")).ok()?).ok()?;
+        let dir = PathBuf::from(config.get("record_beats")?.as_str()?);
+        Some(if dir.is_absolute() { dir } else { state_dir.join(dir) })
     }
 
     pub fn listening(&self) -> Result<u16, String> {
@@ -444,6 +455,19 @@ fn spans(reports: &[&BarReport]) -> Vec<BarSpan> {
     reports.iter().map(|r| BarSpan { bar: r.bar, start_beat: r.start_beat, beats: r.beats }).collect()
 }
 
+/// With `record_beats` set in `config.json`, saves what one Ear heard (bars and beat reports) as
+/// `<snapshot>.json`, for tuning and regression tests. Failures are ignored: it is a debugging aid.
+fn record(hub: &EarHub, snapshot: &str, label: &str, tempo: f64, bars: &[BarReport], beats: &[BeatReport]) {
+    let Some(dir) = hub.recording_dir() else { return };
+    let spans: Vec<Value> = bars
+        .iter()
+        .map(|r| json!({"bar": r.bar, "start_beat": r.start_beat, "beats": r.beats, "coverage": r.coverage}))
+        .collect();
+    let body = json!({"label": label, "tempo": tempo, "bars": spans, "beats": beats});
+    let _ = std::fs::create_dir_all(&dir)
+        .and_then(|_| std::fs::write(dir.join(format!("{snapshot}.json")), body.to_string()));
+}
+
 /// Interprets the beats heard in the given bars.
 pub(crate) fn hear_music(reports: &[&BarReport], beats: &[BeatReport], scale: Option<&SetScale>) -> Option<Music> {
     if reports.is_empty() || beats.is_empty() {
@@ -634,7 +658,10 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
             }
             let label = format!("listen on {} bars {range} at {tempo} BPM", track.label());
             let music = music[0].as_ref().map(Music::snapshot);
-            out["snapshot"] = json!(store.add(Kind::Listen, label, "bar", heard.values().copied().collect(), music));
+            let id = store.add(Kind::Listen, label.clone(), "bar", heard.values().copied().collect(), music);
+            let beats: Vec<BeatReport> = heard_beats[0].values().copied().collect();
+            record(hub, &id, &label, tempo, &heard.values().copied().collect::<Vec<_>>(), &beats);
+            out["snapshot"] = json!(id);
         }
         if !missing.is_empty() {
             out["missing_bars"] = json!(missing);
