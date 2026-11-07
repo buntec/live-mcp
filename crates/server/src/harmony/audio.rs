@@ -10,9 +10,13 @@ use super::Beat;
 const MIN_TONAL: f32 = 0.3;
 const MIN_LEVEL_DB: f32 = -50.0;
 const MIN_COVERAGE: f32 = 0.25;
-/// A beat's chroma needs its strongest pitch class at least this many times the mean of all 12
-/// to name pitches: sweeps (808 kicks), noise and dense clusters spread energy evenly.
-const MIN_CONTRAST: f32 = 1.6;
+/// A beat has pitches to name if its in-tune sub-bins stand out from their neighbours by at least
+/// this share of the treble energy (see [`in_tune_peak`]), or if its strongest pitch class is at
+/// least `STRONG_CONTRAST` times the mean of all 12. Measured on real loops: drum loops (808s,
+/// percussion, sweeps) 0.01–0.03, chordal loops 0.05–0.14, lines and leads mostly from 0.03.
+/// Contrast alone cannot tell them apart: drums 1.3–1.5, pads and pianos 1.3–1.8.
+const MIN_PEAK: f32 = 0.035;
+const STRONG_CONTRAST: f32 = 2.0;
 /// A beat whose octaves from C3 (MIDI 60) up hold less than this share of its strongest octave is
 /// a bass line.
 const BASS_ONLY_UPPER: f32 = 0.1;
@@ -79,15 +83,35 @@ fn fold(bins: &[[u8; SUBBINS]; 12], cents: f32) -> [f32; 12] {
     out
 }
 
-/// Chroma with the floor most pitch classes share (the median) taken out, and whether it has clear
-/// peaks at all.
-fn contrast(chroma: [f32; 12]) -> ([f32; 12], bool) {
+/// Chroma with the floor most pitch classes share (the median) taken out, and how many times the
+/// mean its strongest pitch class is.
+fn contrast(chroma: [f32; 12]) -> ([f32; 12], f32) {
     let mean = chroma.iter().sum::<f32>() / 12.0;
     let max = chroma.iter().copied().fold(0.0, f32::max);
     let mut sorted = chroma;
     sorted.sort_by(f32::total_cmp);
     let median = (sorted[5] + sorted[6]) / 2.0;
-    (chroma.map(|v| (v - median).max(0.0)), max > 0.0 && max >= MIN_CONTRAST * mean)
+    (chroma.map(|v| (v - median).max(0.0)), if mean > 0.0 { max / mean } else { 0.0 })
+}
+
+/// How much the sub-bins at in-tune positions (after the tuning offset) rise above the mean of
+/// their two neighbours, as a share of all treble energy. Pitched sound concentrates there;
+/// noise, drums and pitch sweeps spread evenly across the thirds of a semitone.
+fn in_tune_peak(treble: &[[u8; SUBBINS]; 12], cents: f32) -> f32 {
+    const BINS: usize = 12 * SUBBINS;
+    let bins: Vec<f32> = treble.iter().flatten().map(|&v| v as f32).collect();
+    let total: f32 = bins.iter().sum();
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let shift = (cents / (100.0 / SUBBINS as f32)).round() as i64;
+    let peak: f32 = (0..12)
+        .map(|pc| {
+            let at = |offset: i64| bins[((pc * SUBBINS) as i64 + 1 + shift + offset).rem_euclid(BINS as i64) as usize];
+            (at(0) - (at(-1) + at(1)) / 2.0).max(0.0)
+        })
+        .sum();
+    peak / total
 }
 
 /// The heard beats, sorted, and the tuning they were folded with.
@@ -97,8 +121,9 @@ pub fn beats(reports: &[BeatReport]) -> (Vec<Beat>, Option<f32>) {
     let mut beats: Vec<Beat> = reports
         .iter()
         .map(|r| {
-            let (chroma, peaked) = contrast(fold(&r.treble, cents));
+            let (chroma, strength) = contrast(fold(&r.treble, cents));
             let (bass, _) = contrast(fold(&r.bass, cents));
+            let peaked = strength > 0.0 && (in_tune_peak(&r.treble, cents) >= MIN_PEAK || strength >= STRONG_CONTRAST);
             Beat {
                 index: r.beat,
                 coverage: r.coverage,
@@ -246,9 +271,14 @@ mod tests {
 
     #[test]
     fn evenly_spread_chroma_is_not_pitched() {
-        let all: Vec<(usize, usize)> = (0..12).map(|pc| (pc, 1)).collect();
+        // Energy in every third of a semitone, as from noise or an 808's pitch sweep.
+        let all: Vec<(usize, usize)> = (0..12).flat_map(|pc| (0..3).map(move |j| (pc, j))).collect();
         let (heard, _) = beats(&[report(0, &all)]);
         assert!(!heard[0].pitched);
+        // The same energy at in-tune positions only is twelve notes: pitched.
+        let in_tune: Vec<(usize, usize)> = (0..12).map(|pc| (pc, 1)).collect();
+        let (heard, _) = beats(&[report(0, &in_tune)]);
+        assert!(heard[0].pitched);
     }
 
     #[test]
