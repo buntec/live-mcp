@@ -1,4 +1,4 @@
-from . import LiveObject, guard
+from . import LiveObject, guard, observable
 
 
 class MidiNoteSpecification(object):
@@ -54,7 +54,10 @@ class Clip(LiveObject):
     @name.setter
     def name(self, value):
         guard()
+        changed = self._name != value
         self._name = value
+        if changed:
+            self._notify("name")
 
     length = property(lambda self: (guard(), self._length)[1])
     start_time = property(lambda self: (guard(), self._start_time)[1])
@@ -79,6 +82,7 @@ class Clip(LiveObject):
             self._notes.append(MidiNote(spec, self._next_id))
             ids.append(self._next_id)
             self._next_id += 1
+        self._notify("notes")
         return tuple(ids)
 
     def _matching(self, from_pitch, pitch_span, from_time, time_span):
@@ -95,6 +99,7 @@ class Clip(LiveObject):
         guard()
         doomed = set(id(n) for n in self._matching(from_pitch, pitch_span, from_time, time_span))
         self._notes = [n for n in self._notes if id(n) not in doomed]
+        self._notify("notes")
 
     def fire(self):
         guard()
@@ -103,3 +108,6 @@ class Clip(LiveObject):
     def stop(self):
         guard()
         self._is_playing = False
+
+
+observable(Clip, "notes", "name")

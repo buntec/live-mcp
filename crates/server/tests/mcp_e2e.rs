@@ -25,9 +25,11 @@ async fn lists_all_tools_with_object_schemas() {
             "describe",
             "device_parameters",
             "ears",
+            "events",
             "get",
             "listen",
             "load_device",
+            "observe",
             "read_clip",
             "session",
             "set",
@@ -35,6 +37,7 @@ async fn lists_all_tools_with_object_schemas() {
             "snapshots",
             "status",
             "transport",
+            "unobserve",
             "write_clip"
         ]
     );
@@ -297,4 +300,66 @@ async fn generic_tools_reach_the_object_model() {
     assert!(e.contains("no attribute"), "{e}");
     let e = h.err("call", json!({"target": "live_set", "method": "__class__"})).await;
     assert!(e.contains("invalid attribute name"), "{e}");
+}
+
+#[tokio::test]
+async fn observe_and_events() {
+    let Some(h) = Harness::start().await else { return };
+    let empty = h.ok("events", json!({})).await;
+    assert_eq!(empty["events"], json!([]));
+    assert!(empty["note"].as_str().unwrap().contains("observe"), "{empty}");
+
+    let watched = h.ok("observe", json!({"target": "live_set", "props": ["tempo", "is_playing", "nope"]})).await;
+    let watching = watched["watching"].as_array().unwrap();
+    assert_eq!(watching.len(), 2);
+    assert_eq!((&watching[0]["prop"], &watching[0]["value"]), (&json!("tempo"), &json!(120.0)));
+    assert_eq!(watched["errors"][0]["prop"], "nope");
+    let tempo = watching[0]["subscription"].as_u64().unwrap();
+    let err = h.err("observe", json!({"target": "live_set", "props": ["nope"]})).await;
+    assert!(err.contains("observable"), "{err}");
+
+    h.ok("set", json!({"target": "live_set", "prop": "tempo", "value": 125})).await;
+    h.ok("set", json!({"target": "live_set", "prop": "tempo", "value": 126})).await;
+    let got = h.ok("events", json!({})).await;
+    let events = got["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "{got}");
+    assert_eq!(events[1]["target"], "live_set");
+    assert_eq!(events[1]["prop"], "tempo");
+    assert_eq!(events[1]["value"], 126.0);
+    assert_eq!(events[1]["own"], true);
+    assert!(events[1]["ago_ms"].as_u64().is_some());
+    assert_eq!(got["watching"].as_array().unwrap().len(), 2);
+
+    // latest_only: one entry per subscription, with how many changes it saw.
+    for bpm in [90, 91, 92] {
+        h.ok("set", json!({"target": "live_set", "prop": "tempo", "value": bpm})).await;
+    }
+    let got = h.ok("events", json!({"latest_only": true})).await;
+    assert_eq!(
+        got["events"],
+        json!([{
+            "subscription": tempo, "target": "live_set", "prop": "tempo", "value": 92.0,
+            "ago_ms": got["events"][0]["ago_ms"], "own": true, "changes": 3
+        }])
+    );
+
+    // wait_ms waits for a change that Live applies on a later tick.
+    h.ok("call", json!({"target": "live_set", "method": "start_playing"})).await;
+    let got = h.ok("events", json!({"wait_ms": 3000})).await;
+    assert_eq!(got["events"][0]["prop"], "is_playing", "{got}");
+    assert_eq!(got["events"][0]["value"], true);
+    // ...and returns empty-handed when nothing changes.
+    let started = std::time::Instant::now();
+    let got = h.ok("events", json!({"wait_ms": 300})).await;
+    assert_eq!(got["events"], json!([]));
+    assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+
+    let removed = h.ok("unobserve", json!({"subscriptions": [tempo]})).await;
+    assert_eq!(removed["removed"][0]["prop"], "tempo");
+    assert_eq!(removed["watching"].as_array().unwrap().len(), 1);
+    let removed = h.ok("unobserve", json!({})).await;
+    assert_eq!(removed["removed"][0]["prop"], "is_playing");
+    assert_eq!(removed["watching"], json!([]));
+    let status = h.ok("status", json!({})).await;
+    assert_eq!(status["bridge"]["subscriptions"], 0);
 }

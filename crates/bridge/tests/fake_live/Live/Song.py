@@ -1,12 +1,12 @@
 import time
 
-from . import LiveObject, guard, number_arg
+from . import LiveObject, guard, number_arg, observable
 from .Clip import Clip
 from .Device import Device, MixerDevice
 
 
 def _prop(name, writable=False, check=None):
-    """A guarded property backed by `_<name>`."""
+    """A guarded property backed by `_<name>`. Setting it to a new value notifies listeners."""
 
     def getter(self):
         guard()
@@ -19,7 +19,10 @@ def _prop(name, writable=False, check=None):
         guard()
         if check is not None:
             value = check(value)
+        changed = getattr(self, "_" + name) != value
         setattr(self, "_" + name, value)
+        if changed:
+            self._notify(name)
 
     return property(getter, setter)
 
@@ -129,15 +132,8 @@ class Track(LiveObject):
         self._arrangement_clips.sort(key=lambda c: c._start_time)
         return clip
 
-    def add_name_listener(self, callback):
-        guard()
 
-    def remove_name_listener(self, callback):
-        guard()
-
-    def name_has_listener(self, callback):
-        guard()
-        return False
+observable(Track, "name", "mute", "solo")
 
 
 class Scene(LiveObject):
@@ -218,6 +214,7 @@ class Song(LiveObject):
         is_playing reads the old value until the next tick.
         """
         action, self._pending_transport = self._pending_transport, None
+        was_playing = self._is_playing
         if action == "start":  # always from the song start
             self._is_playing, self._current_song_time = True, 0.0
         elif action == "continue":  # from the last stop, not from a position set while stopped
@@ -229,6 +226,8 @@ class Song(LiveObject):
         if self._pending_song_time is not None:
             self._current_song_time = self._pending_song_time
             self._pending_song_time = None
+        if self._is_playing != was_playing:
+            self._notify("is_playing")
     loop = _prop("loop", True, _bool)
     loop_start = _prop("loop_start", True, float)
     loop_length = _prop("loop_length", True, float)
@@ -244,7 +243,10 @@ class Song(LiveObject):
         value = number_arg(value, "Song")
         if not 20.0 <= value <= 999.0:
             raise ValueError("tempo out of range")
+        changed = self._tempo != value
         self._tempo = float(value)
+        if changed:
+            self._notify("tempo")
 
     @property
     def nan_value(self):
@@ -271,6 +273,7 @@ class Song(LiveObject):
             raise IndexError("track index out of range")
         else:
             self._tracks.insert(index, track)
+        self._notify("tracks")
 
     def start_playing(self):
         guard()
@@ -299,8 +302,16 @@ class Song(LiveObject):
         guard()
         self.undo_steps_ended += 1
 
+    def delete_track(self, index):
+        guard()
+        del self._tracks[index]
+        self._notify("tracks")
+
     def slow(self, seconds):
         """Blocks the main thread, to test timeouts."""
         guard()
         time.sleep(seconds)
         self.slow_calls += 1
+
+
+observable(Song, "tempo", "is_playing", "tracks")

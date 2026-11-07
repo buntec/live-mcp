@@ -217,6 +217,39 @@ pub struct BatchOp {
     pub params: Value,
 }
 
+/// A change to an observed property, as `events` returns it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Event {
+    pub subscription: u64,
+    /// Increases across all of the script's events.
+    pub seq: u64,
+    /// The script's tick count when the listener fired.
+    pub tick: u64,
+    /// Unix time (seconds) when the listener fired.
+    pub time: f64,
+    /// The property's value when the listener fired, encoded like a `get` result. `None` when
+    /// the observable has no property of that name (a clip's `notes`); `Some(Null)` is a null value.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    /// The listener fired while one of this connection's own requests was running.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own: bool,
+}
+
+/// The result of `events`: the connection's unread events, oldest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Events {
+    pub events: Vec<Event>,
+    /// Events lost because more were queued than the script keeps.
+    #[serde(default)]
+    pub dropped: u64,
+}
+
+/// Maps a present field to `Some`, even when it is `null`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +298,20 @@ mod tests {
         );
         assert_eq!(Target::id(3).join("name"), Target::Ref { id: 3, path: Some("name".into()) });
         assert_eq!(Target::batch_result(0).join("a").join("b").to_string(), "@0 a b");
+    }
+
+    #[test]
+    fn event_distinguishes_null_from_absent_values() {
+        let events: Events = serde_json::from_value(json!({"events": [
+            {"subscription": 1, "seq": 1, "tick": 5, "time": 1.5, "value": null},
+            {"subscription": 2, "seq": 2, "tick": 5, "time": 1.5, "own": true},
+        ]}))
+        .unwrap();
+        assert_eq!(events.events[0].value, Some(Value::Null));
+        assert!(!events.events[0].own);
+        assert_eq!(events.events[1].value, None);
+        assert!(events.events[1].own);
+        assert_eq!(events.dropped, 0);
     }
 
     #[test]

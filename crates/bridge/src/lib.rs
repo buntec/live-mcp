@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use live_mcp_protocol::{
-    BatchOp, DEFAULT_PORT, HelloParams, HelloResult, PROTOCOL_VERSION, Request, Response, RpcError, Target, codes,
+    BatchOp, DEFAULT_PORT, Events, HelloParams, HelloResult, PROTOCOL_VERSION, Request, Response, RpcError, Target,
+    codes,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -279,6 +280,31 @@ impl Bridge {
     /// grouped into one undo step in Live.
     pub async fn batch(&self, ops: &[BatchOp], undo_step: bool, stop_on_error: bool) -> Result<Value> {
         self.request("batch", json!({"ops": ops, "undo_step": undo_step, "stop_on_error": stop_on_error})).await
+    }
+
+    /// Adds a listener for `prop` of the target (one of the properties `describe` lists as
+    /// observable). Returns `{subscription, object, value?, existing?}`; observing the same
+    /// property of the same object again returns the existing subscription.
+    ///
+    /// Subscriptions belong to this connection, and end when it closes.
+    pub async fn observe(&self, target: &Target, prop: &str) -> Result<Value> {
+        self.request("observe", json!({"target": target, "prop": prop})).await
+    }
+
+    /// Removes these subscriptions, or all of this connection's when `None`.
+    /// Returns `{removed, unknown}`.
+    pub async fn unobserve(&self, subscriptions: Option<&[u64]>) -> Result<Value> {
+        let params = match subscriptions {
+            Some(ids) => json!({"subscriptions": ids}),
+            None => json!({}),
+        };
+        self.request("unobserve", params).await
+    }
+
+    /// Takes the events queued for this connection since the last call.
+    pub async fn events(&self) -> Result<Events> {
+        let result = self.request("events", json!({})).await?;
+        serde_json::from_value(result).map_err(|e| BridgeError::Protocol(format!("events: {e}")))
     }
 }
 

@@ -14,6 +14,8 @@ Wire protocol v1 (full spec: docs/protocol.md in the live-mcp repository):
     while the main thread is executing Python, so a socket thread waits up to
     a tick at every blocking step. Doing all the I/O inside the tick costs at
     most one tick per request, and every Live API call stays on the main thread.
+  * `observe` adds Live listeners. Changes are queued per connection and
+    fetched with `events`; nothing is ever sent unasked.
 
 Standard library only: Live's embedded interpreter cannot install packages.
 """
@@ -39,7 +41,7 @@ except ImportError:  # without it, each request just waits for the next tick
 import Live
 from _Framework.ControlSurface import ControlSurface
 
-SCRIPT_VERSION = "0.3.0"
+SCRIPT_VERSION = "0.4.0"
 PROTOCOL_VERSION = 1
 
 HOST = "127.0.0.1"
@@ -52,6 +54,10 @@ TICK_BUDGET_SECONDS = 0.05
 # How long to wait for a follow-up request after answering one, within the tick budget.
 LINGER_SECONDS = 0.005
 MAX_REGISTRY = 50000
+# Per connection: how many properties it may observe, and how many unread events
+# are kept (the oldest are dropped first, and counted).
+MAX_SUBSCRIPTIONS = 500
+MAX_EVENTS = 10000
 
 ERR_PARSE = -32700
 ERR_INVALID_REQUEST = -32600
@@ -63,6 +69,8 @@ ERR_STALE_REF = -32003
 ERR_UNAVAILABLE = -32004
 
 LIVE_API_METHODS = ("info", "get", "set", "call", "describe", "batch")
+# Methods whose state belongs to the connection that calls them; not allowed in a batch.
+CONNECTION_METHODS = ("observe", "unobserve", "events")
 
 # Attribute and method names must look like plain identifiers. Rejecting a
 # leading underscore keeps reflection from reaching Python internals such as
@@ -98,9 +106,10 @@ class RpcError(Exception):
 
 
 class _Client(object):
-    """One connection: byte buffers in and out, plus its auth state."""
+    """One connection: byte buffers in and out, its auth state, and what it observes."""
 
-    __slots__ = ("sock", "inbuf", "outbuf", "authed", "eof", "closing")
+    __slots__ = ("sock", "inbuf", "outbuf", "authed", "eof", "closing",
+                 "subs", "events", "dropped")
 
     def __init__(self, sock):
         self.sock = sock
@@ -109,6 +118,9 @@ class _Client(object):
         self.authed = False
         self.eof = False      # peer closed its side; finish buffered requests, then drop
         self.closing = False  # we decided to close; flush the output, then drop
+        self.subs = {}        # subscription id -> _Subscription
+        self.events = collections.deque(maxlen=MAX_EVENTS)  # unread, oldest first
+        self.dropped = 0      # events lost to the MAX_EVENTS cap since the last `events`
 
     def next_line(self):
         while True:
@@ -122,6 +134,18 @@ class _Client(object):
 
     def has_line(self):
         return b"\n" in self.inbuf
+
+
+class _Subscription(object):
+    """A listener this script added to a Live object on behalf of one connection."""
+
+    __slots__ = ("obj", "oid", "prop", "callback")
+
+    def __init__(self, obj, oid, prop, callback):
+        self.obj = obj
+        self.oid = oid
+        self.prop = prop
+        self.callback = callback  # kept so it can be removed again
 
 
 def _state_dir():
@@ -230,6 +254,9 @@ class LiveMCP(ControlSurface):
         self._code_hash = _CODE_HASH
         self._registry = collections.OrderedDict()
         self._batch_results = None  # results so far while a batch runs
+        self._handling = None  # the client whose request is running, if any
+        self._next_subscription = 1
+        self._event_seq = 0
         self._server = None
         self._port = None
         self._clients = []
@@ -435,6 +462,8 @@ class LiveMCP(ControlSurface):
     def _drop(self, client):
         if client in self._clients:
             self._clients.remove(client)
+        for sid in list(client.subs):
+            self._remove_subscription(client, sid)
         try:
             client.sock.close()
         except Exception:
@@ -457,6 +486,7 @@ class LiveMCP(ControlSurface):
         params = request.get("params")
         if params is None:
             params = {}
+        self._handling = client
         try:
             if not isinstance(params, dict):
                 raise RpcError(ERR_INVALID_PARAMS, "params must be an object")
@@ -469,6 +499,8 @@ class LiveMCP(ControlSurface):
                 result = self._status()
             elif method in LIVE_API_METHODS:
                 result = self._execute(method, params, False)
+            elif method in CONNECTION_METHODS:
+                result = self._connection_method(client, method, params)
             else:
                 raise RpcError(ERR_METHOD_NOT_FOUND, "unknown method: %s" % method)
             self._queue(client, _ok(req_id, result))
@@ -479,6 +511,8 @@ class LiveMCP(ControlSurface):
         except Exception as exc:
             self._queue(client, {"jsonrpc": "2.0", "id": req_id,
                                  "error": self._live_error(exc, params)})
+        finally:
+            self._handling = None
 
     def _hello(self, params):
         token = params.get("token")
@@ -503,7 +537,122 @@ class LiveMCP(ControlSurface):
             "tick_rate": round(self._ticks / uptime, 2) if uptime > 0 else None,
             "clients": len(self._clients),
             "pending_requests": sum(c.inbuf.count(b"\n") for c in self._clients),
+            "subscriptions": sum(len(c.subs) for c in self._clients),
         }
+
+    # ------------------------------------------------------------- listeners
+
+    def _connection_method(self, client, method, params):
+        if method == "observe":
+            return self._m_observe(client, params)
+        if method == "unobserve":
+            return self._m_unobserve(client, params)
+        return self._m_events(client)
+
+    def _m_observe(self, client, params):
+        """Add a listener for one property of a Live object (`add_<prop>_listener`).
+
+        Every change is queued for this connection, with the value read when the
+        listener fired, until the client fetches it with `events`.
+        """
+        obj = self._resolve(params.get("target"))
+        self._require_live_object(obj, "observe")
+        prop = _check_name(params.get("prop"))
+        add = getattr(obj, "add_%s_listener" % prop, None)
+        if not callable(add) or not callable(getattr(obj, "remove_%s_listener" % prop, None)):
+            raise RpcError(ERR_INVALID_PARAMS, "%s has no observable property %r (describe lists "
+                           "them under observable)" % (type(obj).__name__, prop))
+        oid = self._remember(obj)
+        result = {"object": {"$obj": oid, "type": type(obj).__name__}}
+        for sid, sub in client.subs.items():
+            if sub.oid == oid and sub.prop == prop:
+                result.update(subscription=sid, existing=True)
+                break
+        else:
+            if len(client.subs) >= MAX_SUBSCRIPTIONS:
+                raise RpcError(ERR_UNAVAILABLE, "a connection can observe at most %d properties; "
+                               "unobserve some first" % MAX_SUBSCRIPTIONS)
+            sid = self._next_subscription
+            self._next_subscription += 1
+            callback = self._listener(client, sid)
+            add(callback)
+            client.subs[sid] = _Subscription(obj, oid, prop, callback)
+            result["subscription"] = sid
+        readable, value = self._observed_value(obj, prop)
+        if readable:
+            result["value"] = value
+        return result
+
+    def _listener(self, client, sid):
+        # A fresh closure per subscription: Live refuses the same callable twice.
+        def listener(*_args):
+            try:
+                self._record_event(client, sid)
+            except Exception as exc:  # never let an error escape into Live's notification
+                self._log("listener error: %s\n%s" % (exc, traceback.format_exc()))
+        return listener
+
+    def _record_event(self, client, sid):
+        sub = client.subs.get(sid)
+        if sub is None or client not in self._clients:
+            return
+        self._event_seq += 1
+        event = {"subscription": sid, "seq": self._event_seq, "tick": self._ticks,
+                 "time": round(time.time(), 3)}
+        readable, value = self._observed_value(sub.obj, sub.prop)
+        if readable:
+            event["value"] = value
+        if self._handling is client:
+            event["own"] = True  # fired while this connection's own request was running
+        if len(client.events) == client.events.maxlen:
+            client.dropped += 1
+        client.events.append(event)
+
+    def _observed_value(self, obj, prop):
+        """(readable, encoded value). Some observables, such as a clip's `notes`,
+        have a listener but no property of that name."""
+        try:
+            return True, self._encode(getattr(obj, prop))
+        except AttributeError:
+            return False, None
+        except Exception as exc:
+            return True, {"$error": str(exc) or type(exc).__name__}
+
+    def _m_unobserve(self, client, params):
+        sids = params.get("subscriptions")
+        if sids is None:
+            sids = list(client.subs)
+        elif not isinstance(sids, list):
+            raise RpcError(ERR_INVALID_PARAMS, "subscriptions must be a list of ids")
+        removed, unknown = [], []
+        for sid in sids:
+            if isinstance(sid, int) and not isinstance(sid, bool) and sid in client.subs:
+                self._remove_subscription(client, sid)
+                removed.append(sid)
+            else:
+                unknown.append(sid)
+        # Drop queued events of removed subscriptions, so `events` only reports live ones.
+        if removed:
+            gone = set(removed)
+            kept = [e for e in client.events if e["subscription"] not in gone]
+            client.events.clear()
+            client.events.extend(kept)
+        return {"removed": removed, "unknown": unknown}
+
+    def _remove_subscription(self, client, sid):
+        sub = client.subs.pop(sid, None)
+        if sub is None:
+            return
+        try:
+            getattr(sub.obj, "remove_%s_listener" % sub.prop)(sub.callback)
+        except Exception:
+            pass  # the object is gone (e.g. its track was deleted), and its listeners with it
+
+    def _m_events(self, client):
+        events = list(client.events)
+        client.events.clear()
+        dropped, client.dropped = client.dropped, 0
+        return {"events": events, "dropped": dropped}
 
     # ---------------------------------------------------------------- Live API
 

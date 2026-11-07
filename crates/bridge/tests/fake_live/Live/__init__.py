@@ -31,5 +31,40 @@ class LiveObject(object):
     def _live_ptr(self):
         return id(self)
 
+    def _notify(self, prop):
+        for callback in list(getattr(self, "_listeners", {}).get(prop, ())):
+            callback()
+
+
+def observable(cls, *props):
+    """Give `cls` Live's add_/remove_/<prop>_has_listener methods for each prop.
+
+    Like Live, adding the same callable twice or removing one that is not
+    connected raises. `LiveObject._notify(prop)` calls the listeners.
+    """
+    for prop in props:
+        def add(self, callback, prop=prop):
+            guard()
+            callbacks = self.__dict__.setdefault("_listeners", {}).setdefault(prop, [])
+            if callback in callbacks:
+                raise RuntimeError("Listener already connected")
+            callbacks.append(callback)
+
+        def remove(self, callback, prop=prop):
+            guard()
+            callbacks = self.__dict__.get("_listeners", {}).get(prop, [])
+            if callback not in callbacks:
+                raise RuntimeError("Listener not connected")
+            callbacks.remove(callback)
+
+        def has(self, callback, prop=prop):
+            guard()
+            return callback in self.__dict__.get("_listeners", {}).get(prop, [])
+
+        setattr(cls, "add_%s_listener" % prop, add)
+        setattr(cls, "remove_%s_listener" % prop, remove)
+        setattr(cls, "%s_has_listener" % prop, has)
+    return cls
+
 
 from . import Application, Clip, Device, Song  # noqa: E402,F401  (submodules, like the real Live)

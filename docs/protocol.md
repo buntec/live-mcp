@@ -140,19 +140,61 @@ property that takes a string, such as a track name, keeps the string.
 | Method | Params | Result |
 |---|---|---|
 | `hello` | `token`, `protocol`, `client` | `{script_version, protocol, code_hash}` |
-| `status` | | `{ticks, uptime, tick_rate, clients, pending_requests}` |
+| `status` | | `{ticks, uptime, tick_rate, clients, pending_requests, subscriptions}` |
 | `info` | | script, Python and Live versions, platform |
 | `get` | `target`, `props?`, `fields?`, `offset?`, `limit?` | the encoded target, or `{prop: value}` when `props` is given |
 | `set` | `target`, `prop`, `value` | `{"value": <read back after setting>}` |
 | `call` | `target`, `method`, `args?`, `kwargs?`, `fields?` | the encoded return value |
 | `describe` | `target`, `values?` | `{type, module, properties, methods, types, observable, values?}`. `types` lists nested classes and enums such as `Track.View` |
 | `batch` | `ops: [{method, params}]`, `stop_on_error?` (default true), `undo_step?` | `{"results": [{"ok": true, "result"} \| {"ok": false, "error"}]}` |
+| `observe` | `target`, `prop` | `{subscription, object, value?, existing?}` |
+| `unobserve` | `subscriptions?` (default: all) | `{removed, unknown}` |
+| `events` | | `{events: [{subscription, seq, tick, time, value?, own?}], dropped}` |
 
 `batch` runs all of its ops in one main-thread job, back to back. With
 `undo_step: true`, they are wrapped in `song.begin_undo_step()` /
 `end_undo_step()` when Live provides those methods. Batches cannot be nested.
 
 Any request can pass `debug: true` to get a Python traceback in `error.data`.
+
+## Listeners
+
+`observe` adds a listener for one property of a Live object, through the
+object's `add_<prop>_listener`. `describe` lists these properties as
+`observable`. The script never sends anything unasked. It queues every change
+for the connection that observed the property, and the client takes the queue
+with `events`:
+
+- **Values.** Each event carries the property's value when the listener fired,
+  encoded like a `get` result. `value` is absent when the observable has no
+  property of that name: a clip's `notes` has a listener but no `notes`
+  property, so read the notes yourself.
+- **Own changes.** `own: true` marks a listener that fired while one of this
+  connection's own requests was running, as when a `set` of `tempo` fires the
+  `tempo` listener. Live applies some changes on a later tick, such as
+  `start_playing` or setting `current_song_time`. Their listeners fire outside
+  the request, so the event has no `own`.
+- **Objects, not paths.** A listener is attached to the object the target
+  resolved to. If tracks are reordered, it keeps watching the same track. When
+  the object is deleted, its listeners go with it and fire no more. `unobserve`
+  still accepts the subscription.
+- **Duplicates.** Observing the same property of the same object again on the
+  same connection returns the existing subscription with `existing: true`.
+- **Scope.** Subscriptions belong to the connection. They end when it closes,
+  and a new connection, even one from the same client, starts with none. Other
+  connections' changes are not `own`. `observe`, `unobserve` and `events` can't
+  run inside a `batch`.
+- **Limits.** A connection can hold at most 500 subscriptions (beyond that,
+  `-32004`) and 10 000 unread events. Past that, the oldest events are discarded
+  and counted in `dropped`. `seq` increases across all events, so a gap within
+  one connection's events means some were dropped. `time` is Unix time in
+  seconds, and `tick` is the script's tick count.
+- **Removal.** `unobserve` removes the listeners and discards the unread events
+  of the subscriptions it removed.
+
+A listener runs inside Live's change notification. The script only reads the
+property there and never changes the set, because Live forbids changes from
+notifications.
 
 ## Errors
 
@@ -171,5 +213,6 @@ Any request can pass `debug: true` to get a Python traceback in `error.data`.
 
 - **No `eval`/`exec`.** Anything the generic methods can't express should be
   added as a method here, on purpose.
-- No listeners or events yet. `observe` and `events` are planned, based on
-  `add_<prop>_listener`, which `describe` already lists as `observable`.
+- **No pushed notifications.** The bridge only answers requests, so `events`
+  is polled. The MCP server's `events` tool polls about every 50 ms while it
+  waits.
