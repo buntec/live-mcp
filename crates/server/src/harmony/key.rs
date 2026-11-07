@@ -66,6 +66,7 @@ fn pearson(a: &[f32; 12], b: &[f32; 12]) -> f32 {
 
 /// The likeliest key for a pitch-class profile, or `None` if the profile is flat, empty, or has
 /// too few pitch classes.
+#[cfg(test)]
 pub fn estimate(profile: &[f32; 12]) -> Option<KeyEstimate> {
     estimate_with_tonic_hint(profile, None)
 }
