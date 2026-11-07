@@ -17,23 +17,38 @@ const LIST_DB: f64 = -20.0;
 pub struct Heard<'a> {
     pub label: Value,
     pub name: String,
-    /// Gain in dB between the Ear and the mix: the track's fader plus the faders of the groups
-    /// it is in. `None` for −∞ (a fader all the way down).
+    /// Gain in dB between the Ear and the mix: the track's fader plus the faders of the tracks
+    /// its audio passes through (its groups, or a track it is routed to). `None` for −∞ (a
+    /// fader all the way down).
     pub gain_db: Option<f64>,
     /// Why the track does not count, if it does not: muted, silenced by solo, ….
     pub left_out: Option<String>,
     pub bars: &'a [BarReport],
 }
 
-/// A regular or return track's switches, and the group track it sits in.
-#[derive(Debug, Clone, Default)]
+/// Where a track's output goes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Out {
+    /// Into another regular or return track (its group, or a bus), by strip index.
+    Strip(usize),
+    /// Straight to Main.
+    Main,
+    /// Not into the mix: Ext. Out, Sends Only, No Output, …; Live's name for it.
+    Elsewhere(String),
+}
+
+/// A regular or return track's switches, and where its audio goes.
+#[derive(Debug, Clone)]
 pub struct Strip {
     pub name: String,
     pub mute: bool,
     pub solo: bool,
+    /// Live's own answer to whether another track's solo silences this one.
+    pub muted_via_solo: bool,
     /// Index of the group track this track is in (groups are regular tracks).
     pub group: Option<usize>,
-    pub is_return: bool,
+    pub is_group: bool,
+    pub out: Out,
 }
 
 /// How the regular tracks (first) and the return tracks (after them) reach the mix.
@@ -42,68 +57,153 @@ pub struct Mixer {
     pub strips: Vec<Strip>,
 }
 
+/// Live's `RoutingTypeCategory`s that mean "Main" and "the group this track is in".
+const ROUTE_MASTER: u64 = 3;
+const ROUTE_PARENT_GROUP: u64 = 5;
+
 impl Mixer {
-    /// From `get` of `live_set tracks` with fields name, mute, solo, group_track, and of
-    /// `live_set return_tracks` with fields name, mute, solo.
-    pub fn from_live(tracks: &Value, returns: &Value) -> Self {
-        let tracks = items(tracks);
-        let ids: Vec<Option<u64>> = tracks.iter().map(obj_id).collect();
-        let strip = |t: &Value, is_return: bool| Strip {
-            name: field_str(t, "name").to_owned(),
-            mute: field_bool(t, "mute") == Some(true),
-            solo: field_bool(t, "solo") == Some(true),
-            group: field(t, "group_track")
-                .and_then(obj_id)
-                .and_then(|id| ids.iter().position(|other| *other == Some(id))),
-            is_return,
-        };
-        let mut strips: Vec<Strip> = tracks.iter().map(|t| strip(t, false)).collect();
-        strips.extend(items(returns).iter().map(|t| strip(t, true)));
+    /// From `get` of `live_set tracks` with fields name, mute, solo, muted_via_solo,
+    /// group_track and is_foldable, and of `live_set return_tracks` with the same fields; then
+    /// for each of those tracks in turn its `output_routing_type`'s display_name, category and
+    /// attached_object (`Null` where they could not be read), and the master track object.
+    pub fn from_live(tracks: &Value, returns: &Value, routes: &[Value], master: &Value) -> Self {
+        let all: Vec<&Value> = items(tracks).iter().chain(items(returns)).collect();
+        let ids: Vec<Option<u64>> = all.iter().map(|t| obj_id(t)).collect();
+        let index_of = |v: Option<&Value>| v.and_then(obj_id).and_then(|id| ids.iter().position(|o| *o == Some(id)));
+        let master = obj_id(master);
+        let strips = all
+            .iter()
+            .enumerate()
+            .map(|(k, t)| {
+                let group = index_of(field(t, "group_track")).filter(|&g| g != k);
+                let route = routes.get(k).filter(|r| r.is_object());
+                let out = match route {
+                    // Unknown: assume the default, through the group if there is one.
+                    None => group.map_or(Out::Main, Out::Strip),
+                    Some(r) => {
+                        let attached = r.get("attached_object").filter(|v| !v.is_null());
+                        let category = r.get("category").and_then(Value::as_u64);
+                        if attached.and_then(obj_id).is_some_and(|id| Some(id) == master) {
+                            Out::Main
+                        } else if let Some(j) = index_of(attached).filter(|&j| j != k) {
+                            Out::Strip(j)
+                        } else if category == Some(ROUTE_MASTER) {
+                            Out::Main
+                        } else if category == Some(ROUTE_PARENT_GROUP) {
+                            group.map_or(Out::Main, Out::Strip)
+                        } else {
+                            let name = r.get("display_name").and_then(Value::as_str).unwrap_or("no output");
+                            Out::Elsewhere(name.to_owned())
+                        }
+                    }
+                };
+                Strip {
+                    name: field_str(t, "name").to_owned(),
+                    mute: field_bool(t, "mute") == Some(true),
+                    solo: field_bool(t, "solo") == Some(true),
+                    muted_via_solo: field_bool(t, "muted_via_solo") == Some(true),
+                    group,
+                    is_group: field_bool(t, "is_foldable") == Some(true),
+                    out,
+                }
+            })
+            .collect();
         Self { strips }
     }
 
-    /// The groups track `k` is in, innermost first.
-    pub fn groups(&self, k: usize) -> Vec<usize> {
-        let mut out = Vec::new();
-        let mut at = self.strips.get(k).and_then(|s| s.group);
-        while let Some(g) = at {
-            if g == k || out.contains(&g) || g >= self.strips.len() {
-                break; // a malformed answer; Live's groups do not loop
+    /// The tracks track `k`'s audio passes through on its way out, starting with `k` itself,
+    /// and where it ends up: `None` for Main, or the name of where it goes instead.
+    pub fn route(&self, k: usize) -> (Vec<usize>, Option<String>) {
+        let mut path = Vec::new();
+        let mut at = k;
+        loop {
+            let Some(strip) = self.strips.get(at) else { return (path, None) };
+            if path.contains(&at) {
+                return (path, None); // a malformed answer; Live's routing does not loop
             }
-            out.push(g);
-            at = self.strips[g].group;
+            path.push(at);
+            match &strip.out {
+                Out::Strip(j) => at = *j,
+                Out::Main => return (path, None),
+                Out::Elsewhere(name) => return (path, Some(name.clone())),
+            }
         }
-        out
     }
 
-    /// Whether group track `g` contains track `k`, at any depth.
-    pub fn contains(&self, g: usize, k: usize) -> bool {
-        self.groups(k).contains(&g)
-    }
-
-    /// Why track `k` does not reach the mix, or `None` if it does. Assumes Live's default Solo
-    /// in Place: soloing a regular track keeps the return tracks playing.
-    pub fn silenced(&self, k: usize) -> Option<&'static str> {
-        let strip = self.strips.get(k)?;
-        let groups = self.groups(k);
-        if strip.mute {
-            return Some("muted");
+    /// Why track `k` does not reach the mix, or `None` if it does: it, or a track its audio
+    /// passes through, is muted or silenced by solo, or its output goes somewhere else.
+    pub fn silenced(&self, k: usize) -> Option<String> {
+        let (path, elsewhere) = self.route(k);
+        for &s in &path {
+            let strip = &self.strips[s];
+            let through = |what: &str| {
+                let kind = if strip.is_group { "its group" } else { "the track it plays through" };
+                format!("{kind}, {}, is {what}", strip.name)
+            };
+            if strip.mute {
+                return Some(if s == k { "muted".into() } else { through("muted") });
+            }
+            if strip.muted_via_solo {
+                return Some(if s == k { "another track is soloed".into() } else { through("silenced by a solo") });
+            }
         }
-        if groups.iter().any(|&g| self.strips[g].mute) {
-            return Some("its group is muted");
-        }
-        if !self.strips.iter().any(|s| s.solo) {
-            return None;
-        }
-        let heard = if strip.is_return {
-            strip.solo || !self.strips.iter().any(|s| s.is_return && s.solo)
+        let name = elsewhere?;
+        let at = &self.strips[*path.last()?].name;
+        Some(if path.len() == 1 {
+            format!("its output goes to {name}, not Main")
         } else {
-            strip.solo
-                || groups.iter().any(|&g| self.strips[g].solo)
-                || (0..self.strips.len()).any(|j| self.strips[j].solo && self.contains(k, j))
-        };
-        (!heard).then_some("another track is soloed")
+            format!("its audio goes on from {at} to {name}, not Main")
+        })
     }
+
+    /// The tracks whose output goes straight into track `k`.
+    fn feeders(&self, k: usize) -> impl Iterator<Item = usize> + '_ {
+        self.strips.iter().enumerate().filter(move |(_, s)| s.out == Out::Strip(k)).map(|(j, _)| j)
+    }
+
+    /// Whether all of track `k`'s audible signal is measured by the Ears of `voices` (or there is
+    /// none): `k` is silent, is one of them, or is a group whose tracks are all covered.
+    fn covered(&self, k: usize, voices: &[usize], depth: usize) -> bool {
+        self.silenced(k).is_some() || voices.contains(&k) || self.replaced(k, voices, depth)
+    }
+
+    /// Whether group `g`'s Ear can give way to its tracks' Ears: every track that plays into it
+    /// is covered by `voices`, and at least one of them is audible. (Only for groups: another
+    /// track that tracks are routed into can play clips of its own.)
+    fn replaced(&self, g: usize, voices: &[usize], depth: usize) -> bool {
+        if depth > self.strips.len() || !self.strips.get(g).is_some_and(|s| s.is_group) {
+            return false;
+        }
+        let feeders: Vec<usize> = self.feeders(g).collect();
+        feeders.iter().any(|&j| self.silenced(j).is_none())
+            && feeders.iter().all(|&j| self.covered(j, voices, depth + 1))
+    }
+
+    /// Why the Ear on track `k`, one of `voices` (the tracks listened to whose Ears heard
+    /// something and that reach the mix), does not count, so that no signal is counted twice:
+    /// its tracks' Ears count instead, or it plays through a track whose Ear counts.
+    pub fn overlap(&self, k: usize, voices: &[usize]) -> Option<String> {
+        if self.replaced(k, voices, 0) {
+            return Some("a group whose tracks have their own Ears, which count instead".into());
+        }
+        let (path, _) = self.route(k);
+        let by = path.iter().skip(1).find(|&&s| voices.contains(&s) && !self.replaced(s, voices, 0))?;
+        Some(format!("its audio is counted in the Ear on {}, which it plays through", self.strips[*by].name))
+    }
+}
+
+/// A track's band levels over the bars its Ear heard (at least half of), or `None` if it heard
+/// none.
+fn band_levels(bars: &[BarReport]) -> Option<[f64; 5]> {
+    let levels: Option<Vec<f64>> = (0..5)
+        .map(|i| energy_mean(bars.iter().filter(|r| r.coverage >= 0.5).map(|r| r.stats.bands_dbfs[i] as f64)))
+        .collect();
+    levels.map(|l| std::array::from_fn(|i| l[i]))
+}
+
+/// Whether an Ear heard enough of these bars for its track to count.
+pub fn heard_anything(bars: &[BarReport]) -> bool {
+    band_levels(bars).is_some()
 }
 
 fn energy_mean(levels: impl Iterator<Item = f64>) -> Option<f64> {
@@ -133,17 +233,20 @@ pub fn analyze(tracks: &[Heard<'_>]) -> Value {
         .filter(|t| t.left_out.is_none())
         .filter_map(|t| {
             let gain = t.gain_db?;
-            let levels: Option<Vec<f64>> = (0..5)
-                .map(|i| energy_mean(t.bars.iter().filter(|r| r.coverage >= 0.5).map(|r| r.stats.bands_dbfs[i] as f64)))
-                .collect();
-            let levels = levels?;
-            Some((t, std::array::from_fn(|i| levels[i] + gain)))
+            let levels = band_levels(t.bars)?;
+            Some((t, levels.map(|l| l + gain)))
         })
         .collect();
     let excluded: Vec<Value> = tracks
         .iter()
         .filter_map(|t| {
-            let why = t.left_out.as_deref().or(t.gain_db.is_none().then_some("volume at −∞"))?;
+            let why = t.left_out.as_deref().or_else(|| {
+                if t.gain_db.is_none() {
+                    Some("volume at −∞")
+                } else {
+                    (!heard_anything(t.bars)).then_some("its Ear heard none of these bars")
+                }
+            })?;
             Some(json!({"track": t.label, "name": t.name, "why": why}))
         })
         .collect();
@@ -178,8 +281,10 @@ pub fn analyze(tracks: &[Heard<'_>]) -> Value {
         "method": format!(
             "share_db is each track's part of the band's total across these tracks (0 dB = all of it; −6 dB = a \
              quarter). A band is contested when two or more tracks carry at least {CARRY_DB} dB of it. Levels are \
-             after each track's fader and the faders of its groups; muted tracks and tracks silenced by solo \
-             are left out. Pan is ignored. Sends count through the return tracks that have an Ear."
+             after each track's fader and the faders of the tracks its audio passes through on the way to Main \
+             (its groups, or a track it is routed to); tracks that are muted, silenced by solo or do not reach \
+             Main are left out, and so is an Ear whose signal another Ear already counts. Pan is ignored. Sends \
+             count through the return tracks that have an Ear."
         ),
     });
     if !excluded.is_empty() {
@@ -273,98 +378,236 @@ mod tests {
         assert_eq!(out["contested"], json!([]), "{out}");
     }
 
-    /// Tracks as `get live_set tracks` returns them: ids, and each group_track as an object.
-    fn live_tracks(tracks: &[(&str, bool, bool, Option<usize>)]) -> Value {
+    /// Where a test track's output goes.
+    #[derive(Clone, Copy)]
+    enum To {
+        /// Live's default: its group, or Main.
+        Default,
+        Main,
+        Track(usize),
+        Nowhere(&'static str),
+    }
+
+    /// A test track: name, whether it is a group, the group it is in, and where it plays to.
+    #[derive(Clone, Copy)]
+    struct T {
+        name: &'static str,
+        group: Option<usize>,
+        is_group: bool,
+        to: To,
+        mute: bool,
+        via_solo: bool,
+    }
+
+    fn track(name: &'static str) -> T {
+        T { name, group: None, is_group: false, to: To::Default, mute: false, via_solo: false }
+    }
+
+    fn group(name: &'static str) -> T {
+        T { is_group: true, ..track(name) }
+    }
+
+    impl T {
+        fn r#in(self, g: usize) -> Self {
+            T { group: Some(g), ..self }
+        }
+        fn to(self, to: To) -> Self {
+            T { to, ..self }
+        }
+        fn muted(self) -> Self {
+            T { mute: true, ..self }
+        }
+        fn via_solo(self) -> Self {
+            T { via_solo: true, ..self }
+        }
+    }
+
+    /// The mixer as `from_live` reads it from Live: tracks (then returns) with ids, group_track
+    /// as an object, and each output_routing_type as Live reports it.
+    fn mixer(tracks: &[T], returns: &[T]) -> Mixer {
+        const MASTER: u64 = 9999;
         let id = |i: usize| 1000 + i as u64;
-        Value::Array(
-            tracks
-                .iter()
-                .enumerate()
-                .map(|(i, (name, mute, solo, group))| {
-                    json!({"$obj": id(i), "type": "Track", "fields": {
-                        "name": name, "mute": mute, "solo": solo,
-                        "group_track": group.map(|g| json!({"$obj": id(g), "type": "Track"})),
-                    }})
-                })
-                .collect(),
-        )
-    }
-
-    fn returns(list: &[(&str, bool, bool)]) -> Value {
-        Value::Array(
-            list.iter()
-                .enumerate()
-                .map(|(i, (name, mute, solo))| {
-                    json!({"$obj": 2000 + i, "type": "Track", "fields": {"name": name, "mute": mute, "solo": solo}})
-                })
-                .collect(),
-        )
-    }
-
-    #[test]
-    fn groups_are_read_from_live_objects() {
-        // Drums [Kick, Perc [Shaker]], Bass
-        let mixer = Mixer::from_live(
-            &live_tracks(&[
-                ("Drums", false, false, None),
-                ("Kick", false, false, Some(0)),
-                ("Perc", false, false, Some(0)),
-                ("Shaker", false, false, Some(2)),
-                ("Bass", false, false, None),
-            ]),
-            &returns(&[("A-Reverb", false, false)]),
-        );
-        assert_eq!(mixer.strips.len(), 6);
-        assert_eq!(mixer.groups(3), [2, 0]);
-        assert_eq!(mixer.groups(1), [0]);
-        assert!(mixer.groups(4).is_empty() && mixer.groups(5).is_empty());
-        assert!(mixer.contains(0, 3) && !mixer.contains(2, 1));
-        assert!(mixer.strips[5].is_return && mixer.strips[5].name == "A-Reverb");
-        assert!((0..6).all(|k| mixer.silenced(k).is_none()));
-    }
-
-    #[test]
-    fn a_muted_group_silences_its_tracks() {
-        let mixer = Mixer::from_live(
-            &live_tracks(&[
-                ("Drums", true, false, None),
-                ("Kick", false, false, Some(0)),
-                ("Perc", false, false, Some(0)),
-                ("Shaker", false, false, Some(2)),
-                ("Bass", false, false, None),
-            ]),
-            &Value::Null,
-        );
-        assert_eq!(mixer.silenced(0), Some("muted"));
-        assert_eq!(mixer.silenced(1), Some("its group is muted"));
-        assert_eq!(mixer.silenced(3), Some("its group is muted"));
-        assert_eq!(mixer.silenced(4), None);
-    }
-
-    #[test]
-    fn solo_silences_what_is_not_soloed() {
-        let set = |solo: [bool; 5], return_solo: bool| {
-            Mixer::from_live(
-                &live_tracks(&[
-                    ("Drums", false, solo[0], None),
-                    ("Kick", false, solo[1], Some(0)),
-                    ("Perc", false, solo[2], Some(0)),
-                    ("Shaker", false, solo[3], Some(2)),
-                    ("Bass", false, solo[4], None),
-                ]),
-                &returns(&[("A", false, return_solo), ("B", false, false)]),
+        let all: Vec<T> = tracks.iter().chain(returns).copied().collect();
+        let list = |range: std::ops::Range<usize>| {
+            Value::Array(
+                range
+                    .map(|i| {
+                        let t = &all[i];
+                        json!({"$obj": id(i), "type": "Track", "fields": {
+                            "name": t.name, "mute": t.mute, "solo": false, "muted_via_solo": t.via_solo,
+                            "is_foldable": t.is_group,
+                            "group_track": t.group.map(|g| json!({"$obj": id(g), "type": "Track"})),
+                        }})
+                    })
+                    .collect(),
             )
         };
-        let heard = |m: &Mixer| (0..m.strips.len()).filter(|&k| m.silenced(k).is_none()).collect::<Vec<_>>();
-        // Soloing a track inside a group: the group plays, its other tracks don't. Returns play
-        // on (Solo in Place).
-        assert_eq!(heard(&set([false, false, false, true, false], false)), [0, 2, 3, 5, 6]);
-        // Soloing a group: everything in it plays.
-        assert_eq!(heard(&set([true, false, false, false, false], false)), [0, 1, 2, 3, 5, 6]);
-        assert_eq!(set([true, false, false, false, false], false).silenced(4), Some("another track is soloed"));
-        // Soloing a return: only that return.
-        assert_eq!(heard(&set([false; 5], true)), [5]);
-        // A track and a return.
-        assert_eq!(heard(&set([false, false, false, false, true], true)), [4, 5]);
+        let main = json!({"display_name": "Main", "category": 3, "attached_object": {"$obj": MASTER, "type": "Track"}});
+        let routes: Vec<Value> = all
+            .iter()
+            .map(|t| match (t.to, t.group) {
+                (To::Default, Some(_)) => json!({"display_name": "Group", "category": 5, "attached_object": null}),
+                (To::Default, None) | (To::Main, _) => main.clone(),
+                (To::Track(j), _) => json!({
+                    "display_name": all[j].name, "category": 4, "attached_object": {"$obj": id(j), "type": "Track"},
+                }),
+                (To::Nowhere(name), _) => json!({"display_name": name, "category": 6, "attached_object": null}),
+            })
+            .collect();
+        Mixer::from_live(
+            &list(0..tracks.len()),
+            &list(tracks.len()..all.len()),
+            &routes,
+            &json!({"$obj": MASTER, "type": "Track"}),
+        )
+    }
+
+    /// Drums [Kick, Perc [Shaker, Hat]], Bass, and a return.
+    fn drums(change: impl Fn(&mut [T])) -> Mixer {
+        let mut tracks = [
+            group("Drums"),
+            track("Kick").r#in(0),
+            group("Perc").r#in(0),
+            track("Shaker").r#in(2),
+            track("Hat").r#in(2),
+            track("Bass"),
+        ];
+        change(&mut tracks);
+        mixer(&tracks, &[track("A-Reverb")])
+    }
+
+    #[test]
+    fn routes_follow_the_output_routing() {
+        let m = drums(|_| {});
+        assert_eq!(m.strips.len(), 7);
+        assert_eq!(m.route(3), (vec![3, 2, 0], None));
+        assert_eq!(m.route(1), (vec![1, 0], None));
+        assert_eq!(m.route(5), (vec![5], None));
+        assert_eq!(m.route(6), (vec![6], None), "a return plays to Main");
+        assert!(m.strips[0].is_group && !m.strips[1].is_group && m.strips[6].name == "A-Reverb");
+        assert!((0..7).all(|k| m.silenced(k).is_none()));
+
+        // A track in a group can play straight to Main, or into another track, past its group.
+        let m = drums(|t| {
+            t[1] = t[1].to(To::Main);
+            t[3] = t[3].to(To::Track(5));
+        });
+        assert_eq!(m.route(1), (vec![1], None));
+        assert_eq!(m.route(3), (vec![3, 5], None));
+        assert_eq!(m.strips[1].group, Some(0), "still in its group");
+
+        // A route that could not be read: the default, through its group.
+        let list = json!([
+            {"$obj": 1, "fields": {"name": "Drums", "is_foldable": true}},
+            {"$obj": 2, "fields": {"name": "Kick", "group_track": {"$obj": 1}}},
+        ]);
+        let m = Mixer::from_live(&list, &Value::Null, &[Value::Null, Value::Null], &Value::Null);
+        assert_eq!(m.route(1), (vec![1, 0], None));
+    }
+
+    #[test]
+    fn muting_anywhere_on_the_route_silences() {
+        let m = drums(|t| t[0] = t[0].muted());
+        assert_eq!(m.silenced(0).as_deref(), Some("muted"));
+        assert_eq!(m.silenced(1).as_deref(), Some("its group, Drums, is muted"));
+        assert_eq!(m.silenced(3).as_deref(), Some("its group, Drums, is muted"));
+        assert_eq!(m.silenced(5), None);
+
+        // A track that plays past its muted group is still heard; one routed into a muted
+        // track is not.
+        let m = drums(|t| {
+            t[0] = t[0].muted();
+            t[1] = t[1].to(To::Main);
+            t[5] = t[5].muted();
+            t[4] = t[4].to(To::Track(5));
+        });
+        assert_eq!(m.silenced(1), None);
+        assert_eq!(m.silenced(4).as_deref(), Some("the track it plays through, Bass, is muted"));
+    }
+
+    #[test]
+    fn solo_is_read_from_live() {
+        // Live says which tracks a solo silences, whatever the solo mode and routing.
+        let m = drums(|t| {
+            t[5] = t[5].via_solo();
+            t[2] = t[2].via_solo();
+        });
+        assert_eq!(m.silenced(5).as_deref(), Some("another track is soloed"));
+        assert_eq!(m.silenced(2).as_deref(), Some("another track is soloed"));
+        assert_eq!(m.silenced(3).as_deref(), Some("its group, Perc, is silenced by a solo"));
+        assert_eq!(m.silenced(1), None);
+    }
+
+    #[test]
+    fn output_that_does_not_reach_main_is_left_out() {
+        let m = drums(|t| {
+            t[5] = t[5].to(To::Nowhere("Sends Only"));
+            t[1] = t[1].to(To::Track(5));
+        });
+        assert_eq!(m.silenced(5).as_deref(), Some("its output goes to Sends Only, not Main"));
+        assert_eq!(m.silenced(1).as_deref(), Some("its audio goes on from Bass to Sends Only, not Main"));
+    }
+
+    /// Which of `voices` count, given as names.
+    fn counted(m: &Mixer, voices: &[usize]) -> Vec<&'static str> {
+        let names = ["Drums", "Kick", "Perc", "Shaker", "Hat", "Bass", "A-Reverb"];
+        voices.iter().filter(|&&k| m.overlap(k, voices).is_none()).map(|&k| names[k]).collect()
+    }
+
+    #[test]
+    fn a_group_ear_gives_way_only_to_ears_that_cover_it() {
+        // Every track in the group has an Ear: they count instead of the group.
+        let m = drums(|_| {});
+        assert_eq!(counted(&m, &[0, 1, 3, 4, 5]), ["Kick", "Shaker", "Hat", "Bass"]);
+        assert_eq!(
+            m.overlap(0, &[0, 1, 3, 4, 5]).as_deref(),
+            Some("a group whose tracks have their own Ears, which count instead")
+        );
+        // The subgroup's Ear covers its tracks too.
+        assert_eq!(counted(&m, &[0, 1, 2, 5]), ["Kick", "Perc", "Bass"]);
+        // Hat has no Ear: Perc's Ear counts, and Shaker's (inside it) does not. Perc in turn
+        // covers its part of Drums.
+        assert_eq!(counted(&m, &[0, 1, 2, 3, 5]), ["Kick", "Perc", "Bass"]);
+        assert_eq!(
+            m.overlap(3, &[0, 1, 2, 3, 5]).as_deref(),
+            Some("its audio is counted in the Ear on Perc, which it plays through")
+        );
+        // Without Perc's Ear, Drums is not covered, so Drums counts and the tracks in it don't.
+        assert_eq!(counted(&m, &[0, 1, 3, 5]), ["Drums", "Bass"]);
+
+        // A silent track needs no Ear, but a group whose only sound is its own Ear's stays.
+        let m = drums(|t| t[4] = t[4].muted());
+        assert_eq!(counted(&m, &[0, 1, 3, 5]), ["Kick", "Shaker", "Bass"]);
+        let m = drums(|t| {
+            t[3] = t[3].muted();
+            t[4] = t[4].muted();
+        });
+        assert_eq!(counted(&m, &[2]), ["Perc"]);
+    }
+
+    #[test]
+    fn a_muted_or_unheard_track_does_not_displace_its_group() {
+        // Kick is muted (so not a voice): its Ear must not take the place of Drums, which
+        // still carries the rest of the kit.
+        let m = drums(|t| t[1] = t[1].muted());
+        assert_eq!(counted(&m, &[0, 5]), ["Drums", "Bass"]);
+        // Kick's Ear is not among the voices (muted, −∞ or nothing heard): Drums still counts.
+        let m = drums(|_| {});
+        assert_eq!(counted(&m, &[0, 5]), ["Drums", "Bass"]);
+    }
+
+    #[test]
+    fn only_the_tracks_that_play_through_a_group_overlap_it() {
+        // Kick plays straight to Main: it does not overlap Drums, and is not needed to cover it.
+        let m = drums(|t| t[1] = t[1].to(To::Main));
+        assert_eq!(counted(&m, &[0, 1, 5]), ["Drums", "Kick", "Bass"]);
+        assert_eq!(counted(&m, &[0, 1, 2, 5]), ["Kick", "Perc", "Bass"]);
+        // Into a bus that is not a group: the bus's Ear counts (it may play clips of its own).
+        let m = drums(|t| t[1] = t[1].to(To::Track(5)));
+        assert_eq!(counted(&m, &[1, 5]), ["Bass"]);
+        assert_eq!(
+            m.overlap(1, &[1, 5]).as_deref(),
+            Some("its audio is counted in the Ear on Bass, which it plays through")
+        );
     }
 }

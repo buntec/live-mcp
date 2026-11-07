@@ -174,11 +174,17 @@ one playback. It returns each track's bars (each kept as its own snapshot), plus
   such as bass and kick both in the low band.
 
 An Ear at the end of a track's device chain hears the signal before the fader,
-so each track's level is corrected by its volume and by the volume of every group
-it is in. Tracks that are muted, in a muted group, or silenced by another track's
-solo are left out, each with the reason. Solo is read as Live's default, Solo in
-Place, where soloing a track keeps the return tracks playing. A group track whose
-own tracks also have Ears is left out, so they are not counted twice.
+so each track's level is corrected by its volume and by the volume of every track
+its audio passes through on the way to Main: its groups, or a track it is routed
+to. A track routed straight to Main skips its group's fader. Tracks are left out,
+each with the reason, when they or a track they play through are muted or silenced
+by solo (as Live reports it, whatever the solo mode), or when their output does not
+reach Main.
+
+No signal is counted twice. A group track's Ear gives way to its tracks' Ears when
+they cover everything audible in the group; otherwise the group's Ear counts, and
+the Ears of tracks playing through it do not. An ordinary track that others are
+routed into always counts in place of theirs, since it can play clips of its own.
 
 Sends reach the mix through return tracks: put an Ear on a return to count its
 reverb or delay as a track of its own. Pan is not taken into account: bands are

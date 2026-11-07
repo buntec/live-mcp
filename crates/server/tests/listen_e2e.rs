@@ -204,7 +204,8 @@ async fn listens_to_several_tracks_and_finds_shared_bands() {
     // Solo the kick: the bass is silent in the mix, so nothing is contested.
     h.ok("set", json!({"target": "live_set tracks 1 mixer_device volume", "prop": "value", "value": 0.85})).await;
     h.ok("set", json!({"target": "live_set tracks 1", "prop": "solo", "value": true})).await;
-    let heard = h.ok("listen", json!({"tracks": [0, 1], "start_bar": 3, "bars": 1})).await;
+    // A new start bar: the fake plugin reports when playback starts somewhere new.
+    let heard = h.ok("listen", json!({"tracks": [0, 1], "start_bar": 4, "bars": 1})).await;
     assert_eq!(heard["tracks"][1]["solo"], true, "{heard}");
     assert_eq!(heard["masking"]["contested"], json!([]), "{}", heard["masking"]);
     assert_eq!(
@@ -220,6 +221,129 @@ async fn listens_to_several_tracks_and_finds_shared_bands() {
     assert!(heard.get("masking").is_none() && heard["masking_note"].is_string());
     let e = h.err("listen", json!({"tracks": [0, "Nope"]})).await;
     assert!(e.contains("no track named"), "{e}");
+    for plugin in plugins {
+        plugin.abort();
+    }
+}
+
+/// Routes `track`'s output to the routing type Live lists under `name`.
+async fn route(h: &Harness, track: usize, name: &str) {
+    let types = h
+        .ok("get", json!({"target": format!("live_set tracks {track} available_output_routing_types"), "fields": ["display_name"]}))
+        .await;
+    let index = types
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|t| t["fields"]["display_name"] == name)
+        .unwrap_or_else(|| panic!("no output {name:?} in {types}"));
+    let value = json!({"$ref": format!("live_set tracks {track} available_output_routing_types {index}")});
+    h.ok("set", json!({"target": format!("live_set tracks {track}"), "prop": "output_routing_type", "value": value}))
+        .await;
+}
+
+/// The names in a masking analysis's contested low band, or none.
+fn contested_low(heard: &Value) -> Vec<String> {
+    let contested = heard["masking"]["contested"].as_array().unwrap();
+    let Some(low) = contested.iter().filter_map(Value::as_str).find(|c| c.starts_with("low")) else { return vec![] };
+    ["Drums", "Kick", "Snare", "Bass", "Bus", "Source"]
+        .iter()
+        .filter(|n| low.contains(*n))
+        .map(|n| n.to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn masking_follows_groups_routing_and_solo() {
+    let Some(h) = Harness::start().await else { return };
+    // Source (the MIDI track), Drums [Kick, Snare], Bass, and Bus, an ordinary track that
+    // Source can be routed into.
+    for _ in 0..3 {
+        h.ok("call", json!({"target": "live_set", "method": "create_audio_track", "args": []})).await;
+    }
+    h.ok("call", json!({"target": "live_set", "method": "fake_group_tracks", "args": [1, 2]})).await;
+    for (k, name) in ["Source", "Drums", "Kick", "Snare", "Bass", "Bus"].iter().enumerate() {
+        h.ok("set", json!({"target": format!("live_set tracks {k}"), "prop": "name", "value": name})).await;
+    }
+    // Every Ear hears the same low tone: a tie in the low band whenever two of them count.
+    const LOW: &[(f64, f64)] = &[(60.0, -12.0)];
+    let ear = json!(["plugins", "live-mcp", "LiveMCP Ear"]);
+    let mut plugins = Vec::new();
+    for (k, track) in [1usize, 2, 4, 5].into_iter().enumerate() {
+        h.ok("load_device", json!({"track": track, "path": ear})).await;
+        let param: &'static str = Box::leak(format!("live_set tracks {track} devices 0 parameters 1 value").into());
+        plugins.push(tokio::spawn(fake_plugin(h.state_dir(), h.fake.connect().await, param, 10 + k as u64, LOW)));
+    }
+    // Each listen starts from a new bar: the fake plugin reports when playback starts or jumps.
+    let bar = std::cell::Cell::new(0);
+    let listen = |tracks: Value| {
+        let (h, start_bar) = (&h, bar.replace(bar.get() + 1) + 1);
+        async move { h.ok("listen", json!({"tracks": tracks, "start_bar": start_bar, "bars": 1})).await }
+    };
+    let excluded = |heard: &Value, name: &str| -> Option<String> {
+        heard["masking"]["excluded"].as_array()?.iter().find(|e| e["name"] == name)?["why"].as_str().map(str::to_owned)
+    };
+
+    // A muted Kick must not take the place of Drums, which still carries the Snare.
+    let heard = listen(json!(["Drums", "Bass"])).await;
+    assert_eq!(contested_low(&heard), ["Drums", "Bass"], "{}", heard["masking"]);
+    h.ok("set", json!({"target": "live_set tracks 2", "prop": "mute", "value": true})).await;
+    let heard = listen(json!(["Drums", "Kick", "Bass"])).await;
+    assert_eq!(contested_low(&heard), ["Drums", "Bass"], "{}", heard["masking"]);
+    assert_eq!(excluded(&heard, "Kick").as_deref(), Some("muted"));
+    assert_eq!(heard["tracks"][1]["group"], "Drums");
+    // With Kick playing, its Ear covers only part of Drums (the Snare has none): Drums counts,
+    // and Kick, already in it, does not.
+    h.ok("set", json!({"target": "live_set tracks 2", "prop": "mute", "value": false})).await;
+    let heard = listen(json!(["Drums", "Kick", "Bass"])).await;
+    assert_eq!(contested_low(&heard), ["Drums", "Bass"], "{}", heard["masking"]);
+    assert_eq!(
+        excluded(&heard, "Kick").as_deref(),
+        Some("its audio is counted in the Ear on Drums, which it plays through")
+    );
+    // With the Snare muted, Kick's Ear covers all of Drums and counts instead.
+    h.ok("set", json!({"target": "live_set tracks 3", "prop": "mute", "value": true})).await;
+    let heard = listen(json!(["Drums", "Kick", "Bass"])).await;
+    assert_eq!(contested_low(&heard), ["Kick", "Bass"], "{}", heard["masking"]);
+    assert!(excluded(&heard, "Drums").unwrap().contains("their own Ears"), "{}", heard["masking"]);
+    h.ok("set", json!({"target": "live_set tracks 3", "prop": "mute", "value": false})).await;
+
+    // The group fader counts only for audio that passes through the group.
+    h.ok("set", json!({"target": "live_set tracks 1 mixer_device volume", "prop": "value", "value": 0.085})).await;
+    let heard = listen(json!(["Kick", "Bass"])).await;
+    assert_eq!(contested_low(&heard), Vec::<String>::new(), "Kick is 20 dB down through Drums: {}", heard["masking"]);
+    route(&h, 2, "Main").await;
+    let heard = listen(json!(["Kick", "Bass"])).await;
+    assert_eq!(heard["tracks"][0]["output"], "Main", "{heard}");
+    assert_eq!(contested_low(&heard), ["Kick", "Bass"], "{}", heard["masking"]);
+    let shares: Vec<f64> = heard["masking"]["bands"][0]["tracks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["share_db"].as_f64().unwrap())
+        .collect();
+    assert!(shares.iter().all(|s| (s + 3.0).abs() < 0.5), "{shares:?}");
+    // Played straight to Main, Kick no longer overlaps Drums: both count.
+    let heard = listen(json!(["Drums", "Kick"])).await;
+    assert!(heard["masking"].get("excluded").is_none(), "{}", heard["masking"]);
+    route(&h, 2, "Group").await;
+    h.ok("set", json!({"target": "live_set tracks 1 mixer_device volume", "prop": "value", "value": 0.85})).await;
+
+    // A bus that a soloed track plays into stays audible.
+    route(&h, 0, "Bus").await;
+    for track in [0, 4] {
+        h.ok("set", json!({"target": format!("live_set tracks {track}"), "prop": "solo", "value": true})).await;
+    }
+    let heard = listen(json!(["Bus", "Bass", "Drums"])).await;
+    assert_eq!(contested_low(&heard), ["Bass", "Bus"], "{}", heard["masking"]);
+    assert_eq!(excluded(&heard, "Drums").as_deref(), Some("another track is soloed"));
+    for track in [0, 4] {
+        h.ok("set", json!({"target": format!("live_set tracks {track}"), "prop": "solo", "value": false})).await;
+    }
+    // Into a track that goes nowhere: left out, with where it goes.
+    route(&h, 5, "Sends Only").await;
+    let heard = listen(json!(["Bus", "Bass"])).await;
+    assert_eq!(excluded(&heard, "Bus").as_deref(), Some("its output goes to Sends Only, not Main"));
     for plugin in plugins {
         plugin.abort();
     }
