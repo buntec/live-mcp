@@ -25,7 +25,7 @@ use crate::transport::{self, TransportParams};
 use crate::watch::{self, EventsParams, ObserveParams, UnobserveParams, Watches};
 
 /// Results larger than this are refused, with a hint to narrow the request.
-const MAX_RESULT_CHARS: usize = 200_000;
+pub(crate) const MAX_RESULT_CHARS: usize = 200_000;
 
 const INSTRUCTIONS: &str = "\
 Controls Ableton Live through the LiveMCP Remote Script. Start with `session` to see the set.

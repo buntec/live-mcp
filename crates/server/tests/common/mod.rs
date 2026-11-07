@@ -19,10 +19,15 @@ pub struct Harness {
 
 impl Harness {
     pub async fn start() -> Option<Self> {
+        Self::start_with(&[]).await
+    }
+
+    /// Starts `live-mcp <args> serve`.
+    pub async fn start_with(args: &[&str]) -> Option<Self> {
         let fake = FakeLive::start()?;
         let state = fake.state_dir();
         let command = tokio::process::Command::new(env!("CARGO_BIN_EXE_live-mcp")).configure(|cmd| {
-            cmd.arg("serve").env(STATE_DIR_ENV, &state);
+            cmd.args(args).arg("serve").env(STATE_DIR_ENV, &state);
         });
         let client = ().serve(TokioChildProcess::new(command).expect("spawn live-mcp")).await.expect("initialize");
         Some(Self { client, fake })

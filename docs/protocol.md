@@ -189,9 +189,11 @@ with `events`:
   `observe`, `unobserve` and `events` can't run inside a `batch`.
 - **Limits.** A connection can hold at most 500 subscriptions (beyond that,
   `-32004`) and 10 000 unread events. Past that, the oldest events are discarded
-  and counted in `dropped`. `seq` increases across all events, so a gap within
-  one connection's events means some were dropped. `time` is Unix time in
-  seconds, and `tick` is the script's tick count.
+  and counted in `dropped`, which is the only measure of loss. `seq` orders
+  events: it is one counter for the whole script, shared by all connections,
+  so one connection's events skip the numbers given to other connections'
+  events, and gaps mean nothing on their own. `time` is Unix time in seconds,
+  and `tick` is the script's tick count.
 - **Removal.** `unobserve` removes the listeners and discards the unread events
   of the subscriptions it removed.
 

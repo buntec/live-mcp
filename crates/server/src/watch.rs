@@ -16,9 +16,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::live::Live;
+use crate::mcp::MAX_RESULT_CHARS;
 
 /// At most this many events are returned per call; the oldest beyond it are counted, not listed.
 const MAX_EVENTS: usize = 500;
+/// Room kept free in a response for the fields added after the events are chosen (`omitted`, `note`).
+const RESERVED_CHARS: usize = 1024;
 /// Longest `wait_ms`.
 const MAX_WAIT: Duration = Duration::from_secs(60);
 /// How often `events` asks the script while waiting. The script answers on its ~10 Hz ticks.
@@ -57,6 +60,12 @@ impl Watches {
         }
     }
 
+    fn has_lost(&self) -> bool {
+        !self.state.lock().expect("watch state").lost.is_empty()
+    }
+
+    /// Takes the loss notices for a response. Call it only once nothing can fail before the
+    /// response goes out, or the only copy of a notice is gone.
     fn take_lost(&self) -> Vec<Watch> {
         std::mem::take(&mut self.state.lock().expect("watch state").lost)
     }
@@ -142,12 +151,11 @@ pub async fn events(live: &Live, watches: &Watches, p: EventsParams) -> Result<V
     let deadline = Instant::now() + wait;
     let bridge = live.bridge().await?;
     watches.sync(&bridge);
-    let mut lost = watches.take_lost();
 
     let mut events = Vec::new();
     let mut dropped = 0;
     // Waiting for a change makes no sense when nothing is observed (or the observations just ended).
-    let waitable = lost.is_empty() && !watches.watching().is_empty();
+    let waitable = !watches.has_lost() && !watches.watching().is_empty();
     loop {
         match bridge.events().await {
             Ok(batch) => {
@@ -158,7 +166,6 @@ pub async fn events(live: &Live, watches: &Watches, p: EventsParams) -> Result<V
                 // Live went away (e.g. while we waited): the subscriptions went with it.
                 let current = live.bridge().await?;
                 watches.sync(&current);
-                lost.extend(watches.take_lost());
                 break;
             }
             Err(e) => return Err(e.into()),
@@ -171,7 +178,7 @@ pub async fn events(live: &Live, watches: &Watches, p: EventsParams) -> Result<V
 
     let labels: HashMap<u64, Watch> = watches.watching().into_iter().map(|w| (w.subscription, w)).collect();
     let now = unix_now();
-    let mut reported: Vec<(Value, u64)> = if p.latest_only {
+    let reported: Vec<(Value, u64)> = if p.latest_only {
         // One entry per subscription, at its latest change, in the order of those changes.
         let mut changes: HashMap<u64, u64> = HashMap::new();
         let mut last: HashMap<u64, usize> = HashMap::new();
@@ -188,10 +195,7 @@ pub async fn events(live: &Live, watches: &Watches, p: EventsParams) -> Result<V
     } else {
         events.iter().map(|e| (describe_event(e, labels.get(&e.subscription), now), 1)).collect()
     };
-    let omitted = reported.len().saturating_sub(MAX_EVENTS);
-    reported.drain(..omitted);
-
-    let listed: Vec<Value> = reported
+    let entries: Vec<Value> = reported
         .into_iter()
         .map(|(mut event, changes)| {
             if p.latest_only {
@@ -200,19 +204,34 @@ pub async fn events(live: &Live, watches: &Watches, p: EventsParams) -> Result<V
             event
         })
         .collect();
-    let mut out = json!({"events": listed, "watching": watches.watching()});
-    if omitted > 0 {
-        out["omitted"] = json!(omitted);
-        out["note"] = json!(format!(
-            "only the latest {MAX_EVENTS} are listed; use latest_only to see one entry per subscription"
-        ));
-    }
+
+    // Nothing below can fail, so the loss notices are safe to take now.
+    let lost = watches.take_lost();
+    let mut out = json!({"events": [], "watching": watches.watching()});
     if dropped > 0 {
         out["dropped"] = json!(dropped);
     }
     if !lost.is_empty() {
         out["lost"] = lost_report(&lost);
-    } else if labels.is_empty() {
+    }
+    // The events have already left the script's queue, so the response must not be too large to
+    // send: list the latest that fit, rather than failing and losing them all.
+    let budget = MAX_RESULT_CHARS.saturating_sub(json_len(&out) + RESERVED_CHARS);
+    let fitted = fit(entries, MAX_EVENTS, budget);
+    out["events"] = json!(fitted.events);
+    if fitted.omitted > 0 {
+        out["omitted"] = json!(fitted.omitted);
+        out["note"] = json!(if p.latest_only {
+            "only the latest changes fit in one response; read the other observed properties with get".to_owned()
+        } else {
+            format!(
+                "only the latest changes fit in one response (at most {MAX_EVENTS}, within the size limit); \
+                 use latest_only to see one entry per subscription"
+            )
+        });
+    } else if fitted.elided > 0 {
+        out["note"] = json!("some values are too large to list; read those properties with get");
+    } else if lost.is_empty() && labels.is_empty() {
         out["note"] = json!("nothing is observed; use observe first");
     }
     Ok(out)
@@ -252,6 +271,55 @@ fn describe_event(event: &Event, watch: Option<&Watch>, now: f64) -> Value {
     Value::Object(out)
 }
 
+struct Fitted {
+    /// Oldest first.
+    events: Vec<Value>,
+    /// The oldest entries, left out.
+    omitted: usize,
+    /// Entries listed without their value, because it alone would not fit.
+    elided: usize,
+}
+
+/// Keeps the latest of `entries` (oldest first) that fit in `budget` characters of JSON, and at
+/// most `max` of them. An entry too large to fit even on its own is kept without its value.
+fn fit(entries: Vec<Value>, max: usize, budget: usize) -> Fitted {
+    let total = entries.len();
+    let mut kept = Vec::new();
+    let mut used = 2; // the brackets around the list
+    let mut elided = 0;
+    for mut entry in entries.into_iter().rev() {
+        if kept.len() == max {
+            break;
+        }
+        let mut size = json_len(&entry) + 1; // and a comma
+        let mut without_value = false;
+        if size > budget
+            && let Some(obj) = entry.as_object_mut()
+            && let Some(value) = obj.remove("value")
+        {
+            let chars = json_len(&value);
+            obj.insert(
+                "value_omitted".into(),
+                json!(format!("too large to list ({chars} characters); read the property with get")),
+            );
+            size = json_len(&entry) + 1;
+            without_value = true;
+        }
+        if used + size > budget {
+            break;
+        }
+        used += size;
+        elided += usize::from(without_value);
+        kept.push(entry);
+    }
+    kept.reverse();
+    Fitted { omitted: total - kept.len(), events: kept, elided }
+}
+
+fn json_len(value: &Value) -> usize {
+    serde_json::to_string(value).map_or(0, |s| s.len())
+}
+
 fn lost_report(lost: &[Watch]) -> Value {
     json!({
         "subscriptions": lost,
@@ -262,4 +330,48 @@ fn lost_report(lost: &[Watch]) -> Value {
 
 fn unix_now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(subscription: u64, value: Value) -> Value {
+        json!({"subscription": subscription, "value": value, "ago_ms": 0})
+    }
+
+    #[test]
+    fn fit_keeps_the_latest_that_fit() {
+        let entries: Vec<Value> = (0..10).map(|i| entry(i, json!("x".repeat(100)))).collect();
+        let one = json_len(&entries[0]) + 1;
+        let fitted = fit(entries.clone(), 500, 2 + 3 * one);
+        assert_eq!((fitted.omitted, fitted.elided), (7, 0));
+        assert_eq!(fitted.events, entries[7..]);
+        assert!(json_len(&json!(fitted.events)) <= 2 + 3 * one);
+
+        let fitted = fit(entries.clone(), 4, usize::MAX);
+        assert_eq!((fitted.omitted, fitted.events), (6, entries[6..].to_vec()));
+        let fitted = fit(entries.clone(), 500, usize::MAX);
+        assert_eq!((fitted.omitted, fitted.events), (0, entries));
+    }
+
+    #[test]
+    fn fit_lists_a_value_too_large_on_its_own_without_it() {
+        let entries = vec![entry(1, json!(1)), entry(2, json!("x".repeat(5000))), entry(3, json!(3))];
+        let fitted = fit(entries.clone(), 500, 1000);
+        assert_eq!((fitted.omitted, fitted.elided), (0, 1));
+        assert_eq!(fitted.events[0], entries[0]);
+        assert_eq!(fitted.events[2], entries[2]);
+        let big = &fitted.events[1];
+        assert_eq!(big["subscription"], 2);
+        assert!(big.get("value").is_none());
+        assert!(big["value_omitted"].as_str().unwrap().contains("5002 characters"), "{big}");
+        assert!(json_len(&json!(fitted.events)) <= 1000);
+    }
+
+    #[test]
+    fn fit_with_no_room_lists_nothing() {
+        let fitted = fit(vec![entry(1, json!(1))], 500, 0);
+        assert_eq!((fitted.events.len(), fitted.omitted, fitted.elided), (0, 1, 0));
+    }
 }

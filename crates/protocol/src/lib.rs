@@ -221,7 +221,8 @@ pub struct BatchOp {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub subscription: u64,
-    /// Increases across all of the script's events.
+    /// Orders events. One counter for the whole script, shared by all connections, so a
+    /// connection's events have gaps; `dropped` (not a gap) is what reports discarded events.
     pub seq: u64,
     /// The script's tick count when the listener fired.
     pub tick: u64,

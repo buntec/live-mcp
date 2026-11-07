@@ -365,3 +365,49 @@ async fn observe_and_events() {
     let status = h.ok("status", json!({})).await;
     assert_eq!(status["bridge"]["subscriptions"], 0);
 }
+
+#[tokio::test]
+async fn events_fit_in_one_response() {
+    let Some(h) = Harness::start().await else { return };
+    let watched = h.ok("observe", json!({"target": "live_set", "props": ["tracks"]})).await;
+    let tracks = watched["watching"][0]["value"].as_array().unwrap().len();
+    // Each change lists every track, so these events are far larger than one response.
+    let op = json!({"method": "call", "params": {"target": "live_set", "method": "create_midi_track", "args": [-1]}});
+    let ops = vec![op; 120];
+    h.ok("batch", json!({"ops": ops})).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let got = h.ok("events", json!({})).await;
+    let events = got["events"].as_array().unwrap();
+    assert!(!events.is_empty(), "{}", got["note"]);
+    assert_eq!(events.len() + got["omitted"].as_u64().unwrap() as usize, 120, "{}", got["note"]);
+    // The latest change is listed, so the current list of tracks is not lost.
+    assert_eq!(events.last().unwrap()["value"].as_array().unwrap().len(), tracks + 120);
+    assert!(got["note"].as_str().unwrap().contains("latest_only"), "{}", got["note"]);
+    assert!(got.to_string().len() <= 200_000);
+}
+
+#[tokio::test]
+async fn lost_subscriptions_survive_a_failed_events_call() {
+    let Some(mut h) = Harness::start_with(&["--timeout", "0.2"]).await else { return };
+    h.ok("observe", json!({"target": "live_set", "props": ["tempo"]})).await;
+    h.fake.restart();
+    h.ok("status", json!({})).await;
+
+    // Live is busy, so `events` times out after the subscriptions were found lost.
+    let busy = h.call("call", json!({"target": "live_set", "method": "slow", "args": [0.8]}));
+    let events = async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        h.call("events", json!({})).await
+    };
+    let (_, events) = tokio::join!(busy, events);
+    let e = events.expect_err("events should time out while Live is busy");
+    assert!(e.contains("no response"), "{e}");
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    let got = h.ok("events", json!({})).await;
+    assert_eq!(got["lost"]["subscriptions"][0]["prop"], "tempo", "{got}");
+    // ...reported once.
+    let got = h.ok("events", json!({})).await;
+    assert!(got.get("lost").is_none(), "{got}");
+}
