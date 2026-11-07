@@ -300,6 +300,9 @@ class Song(LiveObject):
     is_playing = property(lambda self: (guard(), self._is_playing)[1])
     signature_numerator = property(lambda self: (guard(), 4)[1])
     signature_denominator = property(lambda self: (guard(), 4)[1])
+    root_note = property(lambda self: (guard(), 0)[1])
+    scale_name = property(lambda self: (guard(), "Major")[1])
+    scale_intervals = property(lambda self: (guard(), [0, 2, 4, 5, 7, 9, 11])[1])
     @property
     def current_song_time(self):
         guard()

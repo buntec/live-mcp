@@ -7,6 +7,7 @@ mod clips;
 mod devices;
 mod ear;
 mod ear_install;
+mod harmony;
 mod live;
 mod masking;
 mod mcp;

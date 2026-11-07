@@ -117,3 +117,65 @@ async fn compares_a_mix_against_a_reference() {
     let e = h.err("compare", json!({"a": "s99", "b": rid})).await;
     assert!(e.contains("no snapshot"), "{e}");
 }
+
+/// Four bars at 120 BPM, one chord (MIDI notes) per bar, each note with a few harmonics and a
+/// pluck on every beat.
+fn chords(sample_rate: u32, bars: &[&[f64]]) -> Vec<f32> {
+    let sr = sample_rate as f64;
+    (0..(bars.len() as f64 * 2.0 * sr) as usize)
+        .map(|n| {
+            let t = n as f64 / sr;
+            let notes = bars[(t / 2.0) as usize];
+            let pluck = (-(t % 0.5) * 5.0).exp();
+            let sum: f64 = notes
+                .iter()
+                .map(|&m| {
+                    let f = 440.0 * 2f64.powf((m - 69.0) / 12.0);
+                    (1..=4).map(|h| (2.0 * std::f64::consts::PI * f * h as f64 * t).sin() / h as f64).sum::<f64>()
+                })
+                .sum();
+            (sum * 0.08 * pluck) as f32
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn reads_and_compares_the_music_of_files() {
+    let Some(h) = Harness::start().await else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let (c, f, g, dm) = (
+        &[48.0, 55.0, 60.0, 64.0][..],
+        &[53.0, 57.0, 60.0, 65.0][..],
+        &[55.0, 59.0, 62.0, 67.0][..],
+        &[50.0, 57.0, 62.0, 65.0][..],
+    );
+    let before = dir.path().join("before.wav");
+    let after = dir.path().join("after.wav");
+    let a = chords(48_000, &[c, f, g, c]);
+    let b = chords(48_000, &[c, dm, g, c]);
+    write_wav(&before, 48_000, &[a.clone(), a]);
+    write_wav(&after, 48_000, &[b.clone(), b]);
+
+    let x = h.ok("analyze_file", json!({"path": before.display().to_string(), "bpm": 120})).await;
+    assert_eq!(x["music"]["progression"], "C | F | G | C", "{}", x["music"]);
+    assert_eq!(x["music"]["key"]["name"], "C major", "{}", x["music"]);
+    assert_eq!(x["bars"][1]["chord"], "F", "{}", x["bars"][1]);
+    // An onset on every beat (strong or weaker) and nothing in between.
+    let grid: String = x["bars"][1]["rhythm"].as_str().unwrap().replace('X', "x");
+    assert_eq!(grid, "x... x... x... x...", "{}", x["bars"][1]);
+    let y = h.ok("analyze_file", json!({"path": after.display().to_string(), "bpm": 120})).await;
+    assert_eq!(y["music"]["progression"], "C | Dm | G | C", "{}", y["music"]);
+
+    let compared = h.ok("compare", json!({"a": y["snapshot"], "b": x["snapshot"]})).await;
+    let music = &compared["music"];
+    assert_eq!(music["per_bar"], json!([{"a": 2, "b": 2, "chords": ["Dm", "F"]}]), "{music}");
+    let notes: Vec<&str> = compared["notes"].as_array().unwrap().iter().map(|n| n.as_str().unwrap()).collect();
+    assert!(notes.contains(&"the chords differ in 1 of 4 paired bars"), "{notes:?}");
+
+    // Without a bpm there is no rhythm grid, and music: false leaves the music out.
+    let sections = h.ok("analyze_file", json!({"path": before.display().to_string()})).await;
+    assert!(sections["music"].get("rhythm").is_none() && sections["sections"][0].get("rhythm").is_none());
+    assert!(sections["sections"][0]["pcs"].is_string(), "{}", sections["sections"][0]);
+    let plain = h.ok("analyze_file", json!({"path": before.display().to_string(), "bpm": 120, "music": false})).await;
+    assert!(plain.get("music").is_none() && plain["bars"][0].get("chord").is_none());
+}

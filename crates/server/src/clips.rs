@@ -6,8 +6,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::harmony::midi::{self, MidiNote};
+use crate::harmony::{self, BarSpan, Section, SetScale, Source};
 use crate::live::{
-    Live, TrackRef, call, call_fields, default_true, field, field_bool, field_f64, get_props, items, set,
+    Live, TrackRef, call, call_fields, default_true, field, field_bool, field_f64, get_fields, get_props, items, set,
 };
 use crate::session::beats_per_bar;
 
@@ -177,6 +179,10 @@ pub struct ReadClipParams {
     /// Include the notes (default true).
     #[serde(default = "default_true")]
     pub notes: bool,
+    /// For MIDI clips, add a musical reading of the notes (default true): key, chords per bar,
+    /// bass, pitch classes, a 16th-note rhythm grid, range and fit with the set's scale.
+    #[serde(default = "default_true")]
+    pub music: bool,
 }
 
 const CLIP_FIELDS: &[&str] = &[
@@ -190,6 +196,8 @@ const CLIP_FIELDS: &[&str] = &[
     "start_marker",
     "end_marker",
     "start_time",
+    "signature_numerator",
+    "signature_denominator",
 ];
 
 const NOTE_FIELDS: &[&str] =
@@ -230,7 +238,7 @@ pub async fn read_clip(live: &Live, params: ReadClipParams) -> Result<Value> {
     }
     let midi = field_bool(&info, "is_midi_clip") != Some(false);
     out["kind"] = json!(if midi { "midi" } else { "audio" });
-    if midi && params.notes {
+    if midi && (params.notes || params.music) {
         let span = [field_f64(&info, "length"), field_f64(&info, "loop_end"), field_f64(&info, "end_marker")]
             .into_iter()
             .flatten()
@@ -247,10 +255,101 @@ pub async fn read_clip(live: &Live, params: ReadClipParams) -> Result<Value> {
                 false,
             )
             .await?;
-        let notes: Vec<Value> = items(&results[0]).iter().map(note_out).collect();
-        out["notes"] = json!(notes);
+        let raw = items(&results[0]);
+        if params.notes {
+            out["notes"] = json!(raw.iter().map(note_out).collect::<Vec<_>>());
+        }
+        if params.music {
+            let (scale, drums) = music_context(live, &track.target).await;
+            out["music"] = clip_music(&info, raw, scale.as_ref(), drums);
+        }
     }
     Ok(out)
+}
+
+/// The set's scale (Live 12), or `None` if Live has none.
+pub(crate) async fn set_scale(live: &Live) -> Option<SetScale> {
+    let song = Target::path("live_set");
+    let results = live.batch_lenient(vec![get_props(&song, &["root_note", "scale_name", "scale_intervals"])]).await;
+    let props = results.ok()?.into_iter().next()?.ok()?;
+    SetScale::from_song(props.get("root_note"), props.get("scale_name"), props.get("scale_intervals"))
+}
+
+/// The set's scale (Live 12; `None` if Live has none), and whether the track plays a Drum Rack,
+/// whose pitches are pads rather than notes.
+async fn music_context(live: &Live, track: &Target) -> (Option<SetScale>, bool) {
+    let song = Target::path("live_set");
+    let ops = vec![
+        get_props(&song, &["root_note", "scale_name", "scale_intervals"]),
+        get_fields(&track.join("devices"), &["can_have_drum_pads"]),
+    ];
+    let Ok(results) = live.batch_lenient(ops).await else { return (None, false) };
+    let mut results = results.into_iter();
+    let scale = results.next().and_then(Result::ok).and_then(|props| {
+        SetScale::from_song(props.get("root_note"), props.get("scale_name"), props.get("scale_intervals"))
+    });
+    let drums = results
+        .next()
+        .and_then(Result::ok)
+        .is_some_and(|devices| items(&devices).iter().any(|d| field_bool(d, "can_have_drum_pads") == Some(true)));
+    (scale, drums)
+}
+
+/// Interprets the notes that play: the loop if the clip loops, else start to end marker. Bars
+/// count from the clip's beat 0 (bar 1), in the clip's time signature. For a Drum Rack only the
+/// rhythm means anything.
+fn clip_music(info: &Value, raw_notes: &[Value], scale: Option<&SetScale>, drums: bool) -> Value {
+    let get = |name| field_f64(info, name);
+    let (from, to) = if field_bool(info, "looping") == Some(true) {
+        (get("loop_start").unwrap_or(0.0), get("loop_end").or(get("length")).unwrap_or(0.0))
+    } else {
+        (get("start_marker").unwrap_or(0.0), get("end_marker").or(get("length")).unwrap_or(0.0))
+    };
+    let numerator = get("signature_numerator").filter(|n| *n > 0.0).unwrap_or(4.0);
+    let denominator = get("signature_denominator").filter(|d| *d > 0.0).unwrap_or(4.0);
+    let beats_per_bar = numerator * 4.0 / denominator;
+    let notes: Vec<MidiNote> = raw_notes
+        .iter()
+        .filter(|n| field_bool(n, "mute") != Some(true))
+        .filter_map(|n| {
+            Some(MidiNote {
+                pitch: field_f64(n, "pitch")?.clamp(0.0, 127.0) as u8,
+                start: field_f64(n, "start_time")?,
+                duration: field_f64(n, "duration")?,
+                velocity: field_f64(n, "velocity").unwrap_or(100.0),
+            })
+        })
+        .collect();
+    let mut beats = midi::beats(&notes, from, to);
+    if drums {
+        for beat in &mut beats {
+            *beat =
+                harmony::Beat { index: beat.index, coverage: beat.coverage, onsets: beat.onsets, ..Default::default() };
+        }
+    }
+    let first_bar = (from / beats_per_bar + 1e-9).floor() as i64;
+    let last_bar = ((to / beats_per_bar - 1e-9).ceil() as i64).max(first_bar + 1);
+    let bars: Vec<BarSpan> = (first_bar..last_bar)
+        .map(|k| BarSpan { bar: k + 1, start_beat: k as f64 * beats_per_bar, beats: beats_per_bar })
+        .collect();
+    let analysis = harmony::analyze(&Section { bars: &bars, beats: &beats, source: Source::Midi, scale });
+    let mut music = analysis.summary;
+    music.insert("region".into(), json!([from, to]));
+    if drums {
+        music.insert("drum_rack".into(), json!(true));
+    }
+    let bars: Vec<Value> = analysis
+        .bars
+        .into_iter()
+        .map(|(bar, fields)| {
+            let mut entry = Map::new();
+            entry.insert("bar".into(), json!(bar));
+            entry.extend(fields);
+            Value::Object(entry)
+        })
+        .collect();
+    music.insert("bars".into(), json!(bars));
+    Value::Object(music)
 }
 
 /// A note as tools report it: defaults left out to keep responses small.

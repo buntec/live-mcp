@@ -7,10 +7,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use live_mcp_analysis::{BAND_NAMES, BarReport};
+use live_mcp_analysis::{BAND_NAMES, BarReport, BeatReport};
 use live_mcp_bridge::paths;
 use live_mcp_protocol::Target;
-use live_mcp_protocol::ear::{EAR_DEFAULT_PORT, EAR_PROTOCOL_VERSION, EarEndpoint, EarMessage, TAG_MAX};
+use live_mcp_protocol::ear::{
+    EAR_DEFAULT_PORT, EAR_MIN_PROTOCOL_VERSION, EAR_PROTOCOL_VERSION, EarEndpoint, EarMessage, TAG_MAX,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -18,22 +20,29 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
+use crate::harmony::{self, BarSpan, Section, SetScale, Source, ensemble};
 use crate::live::{
     Live, Track, TrackKind, TrackRef, call, default_true, field_f64, field_str, get_fields, get_props, items, set,
 };
 use crate::masking;
-use crate::snapshots::{Kind, SnapshotStore};
+use crate::snapshots::{Kind, SnapshotMusic, SnapshotStore};
 
 /// The plugin's name in Live's browser and device chain.
 pub const EAR_NAME: &str = "LiveMCP Ear";
 pub const EAR_BROWSER_PATH: [&str; 3] = ["plugins", "live-mcp", EAR_NAME];
 /// Bars kept per instance.
 const HISTORY: usize = 1024;
+/// Beats kept per instance.
+const BEAT_HISTORY: usize = 4096;
 /// How long to wait for plugins to report a newly written tag.
 const TAG_WAIT: Duration = Duration::from_millis(1500);
 /// Longest `listen` call, so MCP clients do not time out.
 const MAX_LISTEN: Duration = Duration::from_secs(60);
 const MAX_LINE: usize = 1 << 20;
+/// Tuning offsets smaller than this (cents) are not worth mentioning.
+const TUNING_NOTE_CENTS: f32 = 10.0;
+const OLD_EAR_NOTE: &str = "this LiveMCP Ear is an older build that reports levels only, not pitch or rhythm; \
+     the user can run `live-mcp install`, then reload the plugin (or restart Live)";
 
 #[derive(Debug, Clone)]
 pub struct Instance {
@@ -44,7 +53,17 @@ pub struct Instance {
     pub tag_seen_at: Instant,
     pub sample_rate: f32,
     pub version: String,
+    /// The plugin's protocol: 2 and up also report beats (pitch and rhythm).
+    pub protocol: u32,
     bars: VecDeque<(Instant, BarReport)>,
+    beats: VecDeque<(Instant, BeatReport)>,
+}
+
+impl Instance {
+    /// Whether the plugin reports beats, which `listen` turns into key, chords and rhythm.
+    pub fn hears_music(&self) -> bool {
+        self.protocol >= 2
+    }
 }
 
 /// Accepts connections from plugin instances and keeps what they report.
@@ -53,12 +72,14 @@ pub struct EarHub {
     instances: Mutex<HashMap<u64, Instance>>,
     changed: Notify,
     listening: OnceLock<Result<u16, String>>,
+    state_dir: OnceLock<PathBuf>,
 }
 
 impl EarHub {
     /// Listens on 127.0.0.1 (port from `config.json` `ear_port`, default 19419) and advertises
     /// the port in `ear.json`. Failure is recorded, not fatal: the other tools still work.
     pub async fn start(self: &Arc<Self>, state_dir: &Path) {
+        let _ = self.state_dir.set(state_dir.to_owned());
         let result = self.bind(state_dir).await;
         let _ = self.listening.set(result.map_err(|e| format!("{e:#}")));
     }
@@ -86,6 +107,15 @@ impl EarHub {
         Ok(port)
     }
 
+    /// Where `listen` records beats, per `config.json`'s `record_beats` (see [`recording_dir`]).
+    /// The file is read on every call, so recording can be switched on and off while the server
+    /// runs.
+    fn recording_dir(&self) -> Option<PathBuf> {
+        let state_dir = self.state_dir.get()?;
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(state_dir.join("config.json")).ok()?).ok()?;
+        recording_dir(&config, state_dir)
+    }
+
     pub fn listening(&self) -> Result<u16, String> {
         self.listening.get().cloned().unwrap_or_else(|| Err("not started".into()))
     }
@@ -96,7 +126,8 @@ impl EarHub {
         let Ok(Some(first)) = lines.next_line().await else { return };
         let id = match serde_json::from_str::<EarMessage>(&first) {
             Ok(EarMessage::Hello { token: given, protocol, instance, plugin_version, sample_rate })
-                if tokens_match(&given, token) && protocol == EAR_PROTOCOL_VERSION =>
+                if tokens_match(&given, token)
+                    && (EAR_MIN_PROTOCOL_VERSION..=EAR_PROTOCOL_VERSION).contains(&protocol) =>
             {
                 let mut instances = self.instances.lock().expect("hub lock");
                 let entry = instances.entry(instance).or_insert_with(|| Instance {
@@ -107,11 +138,14 @@ impl EarHub {
                     tag_seen_at: Instant::now(),
                     sample_rate,
                     version: plugin_version.clone(),
+                    protocol,
                     bars: VecDeque::new(),
+                    beats: VecDeque::new(),
                 });
                 entry.connected = true;
                 entry.sample_rate = sample_rate;
                 entry.version = plugin_version;
+                entry.protocol = protocol;
                 instance
             }
             _ => return, // wrong token, protocol or first message: drop the connection
@@ -138,6 +172,13 @@ impl EarHub {
                             instance.bars.pop_front();
                         }
                         instance.bars.push_back((Instant::now(), report));
+                    }
+                    EarMessage::Beat { tag, report } => {
+                        instance.tag = tag;
+                        if instance.beats.len() == BEAT_HISTORY {
+                            instance.beats.pop_front();
+                        }
+                        instance.beats.push_back((Instant::now(), report));
                     }
                     EarMessage::Hello { .. } => {}
                 }
@@ -170,9 +211,28 @@ impl EarHub {
             .unwrap_or_default()
     }
 
+    fn beats_since(&self, instance: u64, since: Instant) -> Vec<BeatReport> {
+        let instances = self.instances.lock().expect("hub lock");
+        instances
+            .get(&instance)
+            .map(|i| i.beats.iter().filter(|(at, _)| *at >= since).map(|(_, r)| *r).collect())
+            .unwrap_or_default()
+    }
+
     async fn changed_or(&self, timeout: Duration) {
         let _ = tokio::time::timeout(timeout, self.changed.notified()).await;
     }
+}
+
+/// `record_beats`: `true` records into `recordings` in the state folder; a string names the folder
+/// (relative to the state folder unless absolute); anything else, or no key, records nothing.
+fn recording_dir(config: &Value, state_dir: &Path) -> Option<PathBuf> {
+    let dir = match config.get("record_beats")? {
+        Value::Bool(true) => PathBuf::from("recordings"),
+        Value::String(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+        _ => return None,
+    };
+    Some(if dir.is_absolute() { dir } else { state_dir.join(dir) })
 }
 
 fn write_endpoint(state_dir: &Path, port: u16) -> Result<()> {
@@ -311,6 +371,7 @@ pub async fn ears(live: &Live, hub: &EarHub, _params: EarsParams) -> Result<Valu
                 Some(i) => {
                     entry["connected"] = json!(true);
                     entry["sample_rate"] = json!(i.sample_rate);
+                    entry["music"] = json!(i.hears_music());
                     if let Some((_, last)) = i.bars.back() {
                         entry["last_bar"] = compact_bar(last);
                     }
@@ -330,6 +391,8 @@ pub async fn ears(live: &Live, hub: &EarHub, _params: EarsParams) -> Result<Valu
             "no {EAR_NAME} in the set; add one with load_device and path {EAR_BROWSER_PATH:?}. If Live's \
                  browser doesn't have it, the user needs to run `live-mcp install` and restart Live"
         ));
+    } else if bindings.iter().any(|b| b.instance.as_ref().is_some_and(|i| !i.hears_music())) {
+        out["hint"] = json!(OLD_EAR_NOTE);
     } else if bindings.iter().any(|b| b.instance.is_none()) {
         out["hint"] = json!(
             "a device that is not connected may be from an older plugin build, or it may report to another \
@@ -355,6 +418,102 @@ pub struct ListenParams {
     /// playback is controlled elsewhere.
     #[serde(default = "default_true")]
     pub play: bool,
+    /// "all" (default): mix measurements and music; "mix": levels, bands and stereo only;
+    /// "music": key, chords, bass, pitch classes, rhythm and range only.
+    #[serde(default)]
+    pub focus: Focus,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Focus {
+    #[default]
+    All,
+    Mix,
+    Music,
+}
+
+/// The best report per wanted beat that an instance sent since `mark`.
+fn collect_beats(
+    hub: &EarHub,
+    instance: u64,
+    mark: Instant,
+    wanted: &std::ops::Range<i64>,
+) -> BTreeMap<i64, BeatReport> {
+    let mut heard: BTreeMap<i64, BeatReport> = BTreeMap::new();
+    for report in hub.beats_since(instance, mark) {
+        if wanted.contains(&report.beat) && heard.get(&report.beat).is_none_or(|old| report.coverage >= old.coverage) {
+            heard.insert(report.beat, report);
+        }
+    }
+    heard
+}
+
+/// What one Ear (or one file) held musically.
+pub(crate) struct Music {
+    pub summary: Map<String, Value>,
+    pub bars: BTreeMap<i64, Map<String, Value>>,
+    pub beats: Vec<harmony::Beat>,
+}
+
+impl Music {
+    pub fn snapshot(&self) -> SnapshotMusic {
+        SnapshotMusic { summary: self.summary.clone(), bars: self.bars.clone() }
+    }
+}
+
+fn spans(reports: &[&BarReport]) -> Vec<BarSpan> {
+    reports.iter().map(|r| BarSpan { bar: r.bar, start_beat: r.start_beat, beats: r.beats }).collect()
+}
+
+/// With `record_beats` set in `config.json`, saves what one Ear heard (bars and beat reports) as
+/// `<snapshot>.json`, for tuning and regression tests. Failures are ignored: it is a debugging aid.
+fn record(hub: &EarHub, snapshot: &str, label: &str, tempo: f64, bars: &[BarReport], beats: &[BeatReport]) {
+    let Some(dir) = hub.recording_dir() else { return };
+    let spans: Vec<Value> = bars
+        .iter()
+        .map(|r| json!({"bar": r.bar, "start_beat": r.start_beat, "beats": r.beats, "coverage": r.coverage}))
+        .collect();
+    let body = json!({"label": label, "tempo": tempo, "bars": spans, "beats": beats});
+    let _ = std::fs::create_dir_all(&dir)
+        .and_then(|_| std::fs::write(dir.join(format!("{snapshot}.json")), body.to_string()));
+}
+
+/// Interprets the beats heard in the given bars.
+pub(crate) fn hear_music(reports: &[&BarReport], beats: &[BeatReport], scale: Option<&SetScale>) -> Option<Music> {
+    if reports.is_empty() || beats.is_empty() {
+        return None;
+    }
+    let (beats, tuning) = harmony::audio::beats(beats);
+    let bars = spans(reports);
+    let analysis = harmony::analyze(&Section { bars: &bars, beats: &beats, source: Source::Audio, scale });
+    let mut summary = analysis.summary;
+    if let Some(cents) = tuning.filter(|c| c.abs() >= TUNING_NOTE_CENTS && summary.contains_key("key")) {
+        summary.insert("tuning_cents".into(), json!(cents.round()));
+    }
+    Some(Music { summary, bars: analysis.bars.into_iter().collect(), beats })
+}
+
+/// Bars as `listen` and `analyze_file` report them: mix measurements, music, or both.
+pub(crate) fn bar_entries(reports: &[&BarReport], focus: Focus, music: Option<&Music>) -> Vec<Value> {
+    reports
+        .iter()
+        .map(|r| {
+            let mut entry = if focus == Focus::Music {
+                let mut e = json!({"bar": r.bar});
+                if r.coverage < 0.99 {
+                    e["coverage"] = json!(round2(r.coverage));
+                }
+                e
+            } else {
+                compact_bar(r)
+            };
+            if let (Some(fields), Value::Object(map)) = (music.and_then(|m| m.bars.get(&r.bar)), &mut entry) {
+                map.extend(fields.clone());
+            }
+            entry
+        })
+        .collect()
 }
 
 /// The connected Ear on `track`, or an error that says what is wrong.
@@ -445,12 +604,27 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
         crate::transport::play_from(live, (start_bar - 1) as f64 * beats_per_bar).await?;
     }
     let wanted = start_bar..start_bar + bars;
+    // Beats wholly inside the wanted bars; music needs them, and they arrive ~0.25 s after each
+    // beat ends.
+    let wanted_beats = ((start_bar - 1) as f64 * beats_per_bar).ceil() as i64
+        ..((start_bar - 1 + bars) as f64 * beats_per_bar + 1e-9).floor() as i64;
+    let focus = params.focus;
+    let music_from = |i: &Instance| focus != Focus::Mix && i.hears_music();
     let deadline = Instant::now() + Duration::from_secs_f64(seconds + if params.play { 1.5 } else { seconds.max(2.0) });
-    let heard: Vec<BTreeMap<i64, BarReport>> = loop {
+    type Heard = (Vec<BTreeMap<i64, BarReport>>, Vec<BTreeMap<i64, BeatReport>>);
+    let (heard, heard_beats): Heard = loop {
         let heard: Vec<_> = targets.iter().map(|(_, i)| collect(hub, i.id, mark, &wanted)).collect();
-        let complete = heard.iter().all(|h| h.len() as i64 == bars && h.values().all(|r| r.coverage >= 0.95));
-        if complete || Instant::now() >= deadline {
-            break heard;
+        let beats: Vec<_> = targets
+            .iter()
+            .map(|(_, i)| if music_from(i) { collect_beats(hub, i.id, mark, &wanted_beats) } else { BTreeMap::new() })
+            .collect();
+        let bars_done = heard.iter().all(|h| h.len() as i64 == bars && h.values().all(|r| r.coverage >= 0.95));
+        let beats_done = targets.iter().zip(&beats).all(|((_, i), b)| {
+            !music_from(i)
+                || (b.len() as i64 == wanted_beats.end - wanted_beats.start && b.values().all(|r| r.coverage >= 0.95))
+        });
+        if (bars_done && beats_done) || Instant::now() >= deadline {
+            break (heard, beats);
         }
         hub.changed_or(Duration::from_millis(100)).await;
     };
@@ -464,20 +638,41 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
         "some bars were not heard: was the song playing through them?"
     };
 
+    let scale = if focus == Focus::Mix { None } else { crate::clips::set_scale(live).await };
+    let music: Vec<Option<Music>> = heard
+        .iter()
+        .zip(&heard_beats)
+        .map(|(bars, beats)| {
+            let beats: Vec<BeatReport> = beats.values().copied().collect();
+            hear_music(&bars.values().collect::<Vec<_>>(), &beats, scale.as_ref())
+        })
+        .collect();
+
     if !multi {
-        let (track, _) = &targets[0];
+        let (track, instance) = &targets[0];
         let heard = &heard[0];
         let missing: Vec<i64> = wanted.clone().filter(|b| !heard.contains_key(b)).collect();
         let reports: Vec<&BarReport> = heard.values().collect();
         let mut out = json!({
             "track": track.label(),
             "tempo": tempo,
-            "bars": reports.iter().map(|r| compact_bar(r)).collect::<Vec<_>>(),
+            "bars": bar_entries(&reports, focus, music[0].as_ref()),
         });
+        if let Some(m) = &music[0] {
+            out["music"] = Value::Object(m.summary.clone());
+        } else if focus != Focus::Mix && !instance.hears_music() {
+            out["music_note"] = json!(OLD_EAR_NOTE);
+        }
         if !reports.is_empty() {
-            out["summary"] = summary(&reports);
+            if focus != Focus::Music {
+                out["summary"] = summary(&reports);
+            }
             let label = format!("listen on {} bars {range} at {tempo} BPM", track.label());
-            out["snapshot"] = json!(store.add(Kind::Listen, label, "bar", heard.values().copied().collect()));
+            let music = music[0].as_ref().map(Music::snapshot);
+            let id = store.add(Kind::Listen, label.clone(), "bar", heard.values().copied().collect(), music);
+            let beats: Vec<BeatReport> = heard_beats[0].values().copied().collect();
+            record(hub, &id, &label, tempo, &heard.values().copied().collect::<Vec<_>>(), &beats);
+            out["snapshot"] = json!(id);
         }
         if !missing.is_empty() {
             out["missing_bars"] = json!(missing);
@@ -595,10 +790,19 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
             }
         }
         if !reports.is_empty() {
-            entry["summary"] = summary(&reports);
+            if focus != Focus::Music {
+                entry["summary"] = summary(&reports);
+            }
+            if let Some(m) = &music[k] {
+                entry["music"] = Value::Object(m.summary.clone());
+            } else if focus != Focus::Mix && !targets[k].1.hears_music() {
+                entry["music_note"] = json!(OLD_EAR_NOTE);
+            }
             let label = format!("listen on {} ({name}) bars {range} at {tempo} BPM", track.label());
-            entry["snapshot"] = json!(store.add(Kind::Listen, label, "bar", heard[k].values().copied().collect()));
-            entry["bars"] = json!(reports.iter().map(|r| compact_bar(r)).collect::<Vec<_>>());
+            let snapshot_music = music[k].as_ref().map(Music::snapshot);
+            entry["snapshot"] =
+                json!(store.add(Kind::Listen, label, "bar", heard[k].values().copied().collect(), snapshot_music));
+            entry["bars"] = json!(bar_entries(&reports, focus, music[k].as_ref()));
         }
         let missing: Vec<i64> = wanted.clone().filter(|b| !heard[k].contains_key(b)).collect();
         if !missing.is_empty() {
@@ -624,11 +828,38 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
         .collect();
 
     let mut out = json!({"tempo": tempo, "bars": range, "tracks": entries});
-    if voices.len() >= 2 {
-        out["masking"] = masking::analyze(&voices);
-    } else {
-        out["masking_note"] =
-            json!("put Ears on two or more tracks (not just master) to see which tracks share each band");
+    // The counted tracks together: the chords they make, where they rub, which octaves they crowd.
+    let parts: Vec<ensemble::Voice> = voices
+        .iter()
+        .filter(|v| v.left_out.is_none())
+        .filter_map(|v| {
+            let k = targets.iter().position(|(t, _)| t.label() == v.label)?;
+            let beats = &music[k].as_ref()?.beats;
+            Some(ensemble::Voice { name: v.name.clone(), gain: 10f32.powf(v.gain_db? as f32 / 20.0), beats })
+        })
+        .collect();
+    if parts.len() >= 2 {
+        let bars: Vec<BarSpan> = wanted
+            .clone()
+            .map(|bar| BarSpan { bar, start_beat: (bar - 1) as f64 * beats_per_bar, beats: beats_per_bar })
+            .collect();
+        let combined = ensemble::combined(&parts);
+        let together =
+            harmony::analyze(&Section { bars: &bars, beats: &combined, source: Source::Audio, scale: scale.as_ref() });
+        let mut music = together.summary;
+        music.insert("tracks".into(), json!(parts.iter().map(|p| p.name.clone()).collect::<Vec<_>>()));
+        music.insert("clashes".into(), ensemble::clashes(&parts, &together.chords, &bars, together.spelling));
+        music.insert("crowded".into(), ensemble::crowded(&parts, &bars));
+        out["music"] = Value::Object(music);
+    }
+    // Masking is about the mix, so focus "music" leaves it out.
+    if focus != Focus::Music {
+        if voices.len() >= 2 {
+            out["masking"] = masking::analyze(&voices);
+        } else {
+            out["masking_note"] =
+                json!("put Ears on two or more tracks (not just master) to see which tracks share each band");
+        }
     }
     if !missing_any.is_empty() {
         out["missing"] = json!(missing_any);
@@ -715,6 +946,19 @@ fn tokens_match(given: &str, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_beats_takes_true_or_a_folder() {
+        let state = Path::new("/state");
+        let dir = |config: Value| recording_dir(&config, state);
+        assert_eq!(dir(json!({"record_beats": true})), Some(PathBuf::from("/state/recordings")));
+        assert_eq!(dir(json!({"record_beats": "mine"})), Some(PathBuf::from("/state/mine")));
+        assert_eq!(dir(json!({"record_beats": "/tmp/x"})), Some(PathBuf::from("/tmp/x")));
+        for off in [json!({}), json!({"record_beats": false}), json!({"record_beats": ""}), json!({"record_beats": 3})]
+        {
+            assert_eq!(dir(off), None);
+        }
+    }
 
     #[test]
     fn tokens_match_only_when_equal() {
