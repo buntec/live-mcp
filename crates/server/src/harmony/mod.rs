@@ -65,6 +65,33 @@ pub struct Beat {
     /// Nearly all energy is in the bass register (below C3): a bass line, whose treble chroma is
     /// only its harmonics. Such beats get no chord, and count towards the key by their bass.
     pub bass_only: bool,
+    /// The bass line per 16th: its fundamental, from the Ear's pitch tracker or the lowest MIDI
+    /// note sounding.
+    pub bass_line: [Option<BassNote>; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BassNote {
+    pub pitch: u8,
+    pub cents: f32,
+    /// 0–1.
+    pub confidence: f32,
+}
+
+impl Beat {
+    /// Pitch classes of the bass line, weighted by confidence; `None` without a bass line.
+    pub fn bass_line_pcs(&self) -> Option<[f32; 12]> {
+        let mut pcs = [0.0f32; 12];
+        for note in self.bass_line.iter().flatten() {
+            pcs[(note.pitch % 12) as usize] += note.confidence;
+        }
+        pcs.iter().any(|v| *v > 0.0).then_some(pcs)
+    }
+
+    /// The bass as pitch-class weights: the bass line if there is one, else the bass chroma.
+    pub fn bass_weights(&self) -> [f32; 12] {
+        self.bass_line_pcs().unwrap_or(self.bass)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -128,10 +155,17 @@ fn shape(values: &[f32; 12]) -> [f32; 12] {
 /// Weighted pitch-class profile of some beats. With `with_bass` (for the key) the bass counts as
 /// much as the treble, and bass lines count by their bass alone: their treble chroma is mostly
 /// harmonics (a low D's 5th harmonic is an F#, which would suggest D major).
+///
+/// A bass line's notes, when the beat has them, stand in for the bass chroma, and for a bass-only
+/// beat they are its pitch classes too.
 fn profile<'a>(beats: impl Iterator<Item = &'a Beat>, with_bass: bool) -> [f32; 12] {
     let mut sum = [0.0f32; 12];
     for beat in beats.filter(|b| b.pitched) {
-        let (chroma, bass) = (shape(&beat.chroma), shape(&beat.bass));
+        let bass = shape(&beat.bass_weights());
+        let chroma = match beat.bass_line_pcs() {
+            Some(line) if beat.bass_only => shape(&line),
+            _ => shape(&beat.chroma),
+        };
         for pc in 0..12 {
             let value = match (with_bass, beat.bass_only) {
                 (false, _) => chroma[pc],
@@ -142,6 +176,38 @@ fn profile<'a>(beats: impl Iterator<Item = &'a Beat>, with_bass: bool) -> [f32; 
         }
     }
     sum
+}
+
+/// A bar's bass line on the 16th grid: a note name where a note starts (the pitch changes, after
+/// silence, or the same note again on a strong onset), `-` while it is held, `.` for no bass; two
+/// spaces between beats. `None` if the bar has no bass line.
+fn bass_line_text(beats: &[Beat], bar: &BarSpan, onset_reference: f32, spelling: Spelling) -> Option<String> {
+    let first = (bar.start_beat * 4.0).round() as i64;
+    let slots = (bar.beats * 4.0).round().max(1.0) as i64;
+    let at = |slot: i64| {
+        let beat = beats.iter().find(|b| b.index == slot.div_euclid(4))?;
+        let s = slot.rem_euclid(4) as usize;
+        Some((beat.bass_line[s], beat.onsets[s]))
+    };
+    let mut out = String::new();
+    let mut any = false;
+    let mut previous: Option<u8> = None;
+    for j in 0..slots {
+        if j > 0 {
+            out.push_str(if j % 4 == 0 { "  " } else { " " });
+        }
+        let (note, onset) = at(first + j).unwrap_or((None, 0.0));
+        match note {
+            Some(n) if previous == Some(n.pitch) && !rhythm::is_strong(onset, onset_reference) => out.push('-'),
+            Some(n) => {
+                out.push_str(&note_name(n.pitch, spelling));
+                any = true;
+            }
+            None => out.push('.'),
+        }
+        previous = note.map(|n| n.pitch);
+    }
+    any.then_some(out)
 }
 
 /// Positions in `beats` that fall in each bar.
@@ -206,7 +272,11 @@ fn pcs_text(profile: &[f32; 12], spelling: Spelling) -> Option<String> {
 }
 
 fn range_text(beats: &[Beat], spelling: Spelling) -> Option<String> {
-    let spans: Vec<(u8, u8)> = beats.iter().filter_map(|b| b.span).collect();
+    let mut spans: Vec<(u8, u8)> = beats.iter().filter_map(|b| b.span).collect();
+    // A bass line's notes are exact.
+    if spans.is_empty() && beats.iter().all(|b| b.bass_only || !b.pitched) {
+        spans = beats.iter().flat_map(|b| b.bass_line.iter().flatten().map(|n| (n.pitch, n.pitch))).collect();
+    }
     if !spans.is_empty() {
         let low = spans.iter().map(|s| s.0).min()?;
         let high = spans.iter().map(|s| s.1).max()?;
@@ -256,6 +326,7 @@ pub fn analyze(section: &Section) -> Analysis {
     }
     let labels = chords::label_beats(beats, &change_cost, key, section.source);
     let (rhythm_bars, rhythm) = rhythm::analyze(beats, section.bars);
+    let onset_reference = rhythm::reference(beats);
 
     let mut bars = Vec::new();
     let mut progression = Vec::new();
@@ -295,7 +366,7 @@ pub fn analyze(section: &Section) -> Analysis {
         }
         let mut bass = [0.0f32; 12];
         for beat in bar_beats.iter().filter(|b| b.pitched) {
-            for (sum, b) in bass.iter_mut().zip(shape(&beat.bass)) {
+            for (sum, b) in bass.iter_mut().zip(shape(&beat.bass_weights())) {
                 *sum += b * beat.weight;
             }
         }
@@ -307,6 +378,9 @@ pub fn analyze(section: &Section) -> Analysis {
         }
         if let Some(r) = bar_rhythm {
             out.insert("rhythm".into(), json!(r.grid));
+        }
+        if let Some(line) = bass_line_text(bar_beats, bar, onset_reference, spelling) {
+            out.insert("bass_line".into(), json!(line));
         }
         if let Some(range) = range_text(bar_beats, spelling) {
             out.insert("range".into(), json!(range));

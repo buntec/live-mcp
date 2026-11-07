@@ -100,6 +100,25 @@ came from running real and synthesized audio through the whole path.
   reading, and `compare` adds key, progression and per-bar chord and rhythm
   differences.
 
+**Bass line (protocol 3).** Chroma cannot name bass notes: a low note's harmonics
+outweigh it, and a third of a semitone at 40 Hz is narrower than any usable FFT bin.
+`bassline.rs` tracks the fundamental with YIN on the mid signal low-passed at
+350 Hz and decimated to about 3 kHz (128-sample window, a frame every ~11 ms,
+30–340 Hz). Each `BeatReport` carries, per 16th, the winning note, its cents and a
+confidence (`bass_notes`, `bass_cents`, `bass_confidence`; empty from protocol 2
+plugins). That roughly doubles the beat analysis cost, to about 0.09% of a core.
+The server drops unsure 16ths, fixes octave slips (where a kick lands on a new
+note the tracker often reads an octave low), and uses the notes for the bar's
+`bass`, for inversions, for the key profile, and for the `pcs` and `range` of bass
+lines. Each bar gets a `bass_line` on the 16th grid: a note where one starts, `-`
+held, `.` none. A repeated note on a weak onset reads as held, because pluck decays
+also produce weak flux. MIDI clips get the same field from their lowest sounding
+notes. A beat with a confident bass line and less than 0.22 of its strongest
+octave's energy above C3 (real bass loops: median 0.01–0.18; chordal loops from
+about 0.7) is a bass line, with no chord; neighbouring beats vote, so labels don't
+flicker. On the master, kicks and low pads overlap the bass, so its line gets
+sparser there than on the bass track's own Ear.
+
 **Validation.** Unit tests on synthesized signals, including plucked sawtooth
 bands with kick and hats at +20 cents (Am–F–C–G) and in tune (Dm7–G7–Cmaj7–A7).
 End-to-end tests for `read_clip`, `listen` (single and multi-track, clashes) and
@@ -121,9 +140,11 @@ through the Ear (the pack's files decode only inside Live), recorded with
   `audio.rs`): chroma contrast was the same for drum loops and for pads and
   pianos.
 
-Known weak spots: bass lines (treble chroma is only harmonics; the bass
-sub-bins are too coarse to resolve pitch in the low register), heavily filtered or
-pitch-bending synths, and chord changes where sustained notes overlap.
+Known weak spots: heavily filtered or pitch-bending synths, chord changes where
+sustained notes overlap, and single-note hooks, where the loop alone does not
+determine the key. Bass lines were weak too until the bass-line tracker; it has
+been validated on synthetic bass lines with kicks, and still needs a re-run on the
+real bass loops.
 
 ## 1. Plugin features (`crates/analysis`)
 

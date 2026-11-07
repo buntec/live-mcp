@@ -43,6 +43,18 @@ fn metric_weight(slot: usize, beats: f64) -> i32 {
     }
 }
 
+/// The onset strength `X` and `x` are measured against: the section's 90th percentile.
+pub fn reference(beats: &[Beat]) -> f32 {
+    let mut positive: Vec<f32> = beats.iter().flat_map(|b| b.onsets).filter(|v| *v > 0.0).collect();
+    positive.sort_by(f32::total_cmp);
+    positive.get(positive.len() * 9 / 10).or(positive.last()).copied().unwrap_or(0.0)
+}
+
+/// Whether an onset is strong (`X`) relative to the section's reference.
+pub fn is_strong(onset: f32, reference: f32) -> bool {
+    reference > 0.0 && onset / reference >= STRONG
+}
+
 pub fn analyze(beats: &[Beat], bars: &[BarSpan]) -> (Vec<Option<BarRhythm>>, Summary) {
     let mut strength: HashMap<i64, f32> = HashMap::new();
     let mut heard = std::collections::HashSet::new();
@@ -52,9 +64,7 @@ pub fn analyze(beats: &[Beat], bars: &[BarSpan]) -> (Vec<Option<BarRhythm>>, Sum
             strength.insert(beat.index * 4 + sub as i64, *value);
         }
     }
-    let mut positive: Vec<f32> = strength.values().copied().filter(|v| *v > 0.0).collect();
-    positive.sort_by(f32::total_cmp);
-    let reference = positive.get(positive.len() * 9 / 10).or(positive.last()).copied().unwrap_or(0.0);
+    let reference = reference(beats);
 
     let mut per_bar = Vec::with_capacity(bars.len());
     let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(bars.len());

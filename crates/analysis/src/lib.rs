@@ -14,6 +14,7 @@
 //! programme, for offline analysis of files.
 
 pub mod bars;
+pub mod bassline;
 pub mod beats;
 pub mod filter;
 pub mod loudness;

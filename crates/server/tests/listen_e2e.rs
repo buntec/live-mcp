@@ -152,7 +152,9 @@ async fn listen_through_an_ear_on_the_master_track() {
     // A single A is no chord and no key, but its pitch class, register and attack are heard.
     assert_eq!(bar["chord"], "N", "{bar}");
     assert_eq!(bar["pcs"], "A 1.0", "{bar}");
-    assert_eq!(bar["range"], "C2–B2", "{bar}"); // 220 Hz is A2 in Live
+    // 220 Hz is A2 in Live; the bass tracker hears it held through the bar.
+    assert_eq!(bar["range"], "A2", "{bar}");
+    assert_eq!(bar["bass_line"], "A2 - - -  - - - -  - - - -  - - - -", "{bar}");
     assert!(bar["tonal"].as_f64().unwrap() > 0.9, "{bar}");
     assert_eq!(heard["music"]["key"], Value::Null, "{heard}");
     assert_eq!(heard["music"]["scale"], json!({"set": "C Major", "outside": []}));

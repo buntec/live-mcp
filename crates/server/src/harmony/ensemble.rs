@@ -57,6 +57,14 @@ pub fn combined(voices: &[Voice]) -> Vec<Beat> {
             for (s, v) in sum.onsets.iter_mut().zip(&beat.onsets) {
                 *s = s.max(*v);
             }
+            // The lowest confident note any voice plays is the bass line.
+            for (slot, note) in sum.bass_line.iter_mut().zip(&beat.bass_line) {
+                if let Some(n) = note
+                    && slot.is_none_or(|s| n.pitch < s.pitch)
+                {
+                    *slot = Some(*n);
+                }
+            }
             let tonal = beat.tonal.unwrap_or(0.0);
             sum.tonal = Some(sum.tonal.map_or(tonal, |t| t.max(tonal)));
         }

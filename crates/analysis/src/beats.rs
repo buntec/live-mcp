@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::bars::Transport;
+use crate::bassline::{BassFrame, BassTracker, LOWEST_NOTE, NOTES};
 use crate::meter::FLOOR_DB;
 use crate::onset::OnsetMeter;
 use crate::pitch::{OCTAVES, PitchFrame, PitchMeter, SUBBINS};
@@ -34,6 +35,15 @@ pub struct BeatReport {
     pub octaves: [u8; OCTAVES],
     /// Onset strength per 16th note, on a fixed scale (comparable across beats and tracks).
     pub onsets: [u8; 4],
+    /// The bass line per 16th (protocol 3): the fundamental's MIDI note (0 = none), its offset in
+    /// cents, and how sure the tracker was (0–255: the share of the 16th's frames that agreed,
+    /// times their periodicity).
+    #[serde(default)]
+    pub bass_notes: [u8; 4],
+    #[serde(default)]
+    pub bass_cents: [i8; 4],
+    #[serde(default)]
+    pub bass_confidence: [u8; 4],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -48,6 +58,10 @@ struct OpenBeat {
     tonal: f32,
     tonal_weight: f32,
     onsets: [f32; 4],
+    /// Per 16th: confidence summed per bass note, cents × confidence per note, and frames seen.
+    bass_votes: [[f32; NOTES]; 4],
+    bass_cents: [[f32; NOTES]; 4],
+    bass_frames: [u16; 4],
 }
 
 impl OpenBeat {
@@ -63,6 +77,18 @@ impl OpenBeat {
             tonal: 0.0,
             tonal_weight: 0.0,
             onsets: [0.0; 4],
+            bass_votes: [[0.0; NOTES]; 4],
+            bass_cents: [[0.0; NOTES]; 4],
+            bass_frames: [0; 4],
+        }
+    }
+
+    fn add_bass(&mut self, sixteenth: usize, frame: &BassFrame) {
+        self.bass_frames[sixteenth] = self.bass_frames[sixteenth].saturating_add(1);
+        if let Some((note, cents)) = frame.note() {
+            let k = (note - LOWEST_NOTE) as usize;
+            self.bass_votes[sixteenth][k] += frame.confidence;
+            self.bass_cents[sixteenth][k] += cents * frame.confidence;
         }
     }
 
@@ -89,6 +115,16 @@ impl OpenBeat {
             let flat = scaled(values);
             std::array::from_fn(|pc| std::array::from_fn(|j| flat[pc * SUBBINS + j]))
         }
+        let (mut bass_notes, mut bass_cents, mut bass_confidence) = ([0u8; 4], [0i8; 4], [0u8; 4]);
+        for s in 0..4 {
+            let votes = &self.bass_votes[s];
+            let Some((k, &best)) = votes.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)) else { continue };
+            if best > 0.0 && self.bass_frames[s] > 0 {
+                bass_notes[s] = LOWEST_NOTE + k as u8;
+                bass_cents[s] = (self.bass_cents[s][k] / best).round().clamp(-50.0, 50.0) as i8;
+                bass_confidence[s] = (best / self.bass_frames[s] as f32 * 255.0).round().min(255.0) as u8;
+            }
+        }
         let beat_samples = 60.0 / self.tempo * sample_rate;
         let mean_square = if self.samples > 0 { self.square / self.samples as f64 } else { 0.0 };
         BeatReport {
@@ -100,6 +136,9 @@ impl OpenBeat {
             bass: grouped(&self.bass),
             octaves: scaled(&self.octaves),
             onsets: self.onsets.map(|f| (f * ONSET_SCALE).round().min(255.0) as u8),
+            bass_notes,
+            bass_cents,
+            bass_confidence,
         }
     }
 }
@@ -113,6 +152,7 @@ pub struct BeatAnalyzer {
     sample_rate: f64,
     pitch: PitchMeter,
     onset: OnsetMeter,
+    bass: BassTracker,
     open: [Option<OpenBeat>; MAX_OPEN],
     expected_beat: Option<f64>,
 }
@@ -124,6 +164,7 @@ impl BeatAnalyzer {
             sample_rate,
             pitch: PitchMeter::new(sample_rate),
             onset: OnsetMeter::new(sample_rate),
+            bass: BassTracker::new(sample_rate),
             open: [None; MAX_OPEN],
             expected_beat: None,
         }
@@ -134,6 +175,7 @@ impl BeatAnalyzer {
         self.open = [None; MAX_OPEN];
         self.pitch.reset();
         self.onset.reset();
+        self.bass.reset();
         self.expected_beat = None;
     }
 
@@ -148,6 +190,7 @@ impl BeatAnalyzer {
         }
         self.pitch.reset();
         self.onset.reset();
+        self.bass.reset();
     }
 
     fn slot(&mut self, index: i64) -> Option<&mut OpenBeat> {
@@ -207,6 +250,7 @@ impl BeatAnalyzer {
         let beats_per_sample = tempo / 60.0 / self.sample_rate;
         let onset_delay = self.onset.attack_delay() as f64 * beats_per_sample;
         let pitch_delay = self.pitch.centre_delay() as f64 * beats_per_sample;
+        let bass_delay = self.bass.centre_delay() as f64 * beats_per_sample;
         for (i, (&l, &r)) in left.iter().zip(right).enumerate() {
             let beat = start_beat + i as f64 * beats_per_sample;
             let mid = (l + r) * 0.5;
@@ -221,6 +265,14 @@ impl BeatAnalyzer {
                 let sixteenth = at.rem_euclid(4) as usize;
                 if let Some(open) = self.slot(at.div_euclid(4)) {
                     open.onsets[sixteenth] = open.onsets[sixteenth].max(flux);
+                }
+            }
+            if let Some(frame) = self.bass.push(mid) {
+                let centre = beat - bass_delay;
+                let index = (centre + 1e-9).floor() as i64;
+                let sixteenth = (((centre - index as f64) * 4.0) as usize).min(3);
+                if let Some(open) = self.slot(index) {
+                    open.add_bass(sixteenth, &frame);
                 }
             }
             if let Some(frame) = self.pitch.push(mid) {
@@ -289,6 +341,22 @@ mod tests {
         for r in &reports[1..reports.len() - 1] {
             assert!(r.onsets[0] > 20 && r.onsets[2] > 20, "{:?}", r.onsets);
             assert!(r.onsets[1] < r.onsets[0] / 4 && r.onsets[3] < r.onsets[2] / 4, "{:?}", r.onsets);
+        }
+    }
+
+    #[test]
+    fn the_bass_line_comes_out_per_sixteenth() {
+        // 120 BPM: a sawtooth bass playing A1 (MIDI 45) for an 8th, then C2 (MIDI 48) for an 8th,
+        // over and over.
+        let signal = |t: f64| {
+            let f = if ((t / 0.25) as usize).is_multiple_of(2) { 110.0 } else { 130.81 };
+            (1..=12).map(|h| (2.0 * PI * f * h as f64 * t).sin() / h as f64).sum::<f64>() * 0.2
+        };
+        let reports = play(signal, 120.0, 3.0);
+        for r in &reports[1..reports.len() - 1] {
+            assert_eq!(r.bass_notes, [45, 45, 48, 48], "{r:?}");
+            assert!(r.bass_confidence.iter().all(|&c| c > 150), "{:?}", r.bass_confidence);
+            assert!(r.bass_cents.iter().all(|c| c.abs() < 10), "{:?}", r.bass_cents);
         }
     }
 

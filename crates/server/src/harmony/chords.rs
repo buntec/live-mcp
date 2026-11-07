@@ -152,7 +152,7 @@ pub fn label_beats(beats: &[Beat], change_cost: &[f32], key: Option<Key>, source
                 e[NO_CHORD] = 1.0;
                 return e;
             }
-            let bass = argmax(&beat.bass);
+            let bass = argmax(&beat.bass_weights());
             for s in 0..CHORDS {
                 e[s] = cosine(&beat.chroma, &templates[s]);
                 if bass == Some((s % 12) as u8) {
@@ -241,7 +241,7 @@ pub fn segments(beats: &[Beat], labels: &Labels, range: std::ops::Range<usize>) 
         if let Some(chord) = chord.as_mut() {
             let mut bass = [0.0f32; 12];
             for beat in &beats[start..end] {
-                for (sum, b) in bass.iter_mut().zip(&beat.bass) {
+                for (sum, b) in bass.iter_mut().zip(&beat.bass_weights()) {
                     *sum += b;
                 }
             }

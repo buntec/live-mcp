@@ -4,8 +4,9 @@
 use live_mcp_analysis::{BarReport, BeatReport};
 use serde::{Deserialize, Serialize};
 
-/// Version 2 added [`EarMessage::Beat`].
-pub const EAR_PROTOCOL_VERSION: u32 = 2;
+/// Version 2 added [`EarMessage::Beat`]; version 3 added the bass line to beat reports
+/// (`bass_notes`, `bass_cents`, `bass_confidence`, empty when parsed from version 2).
+pub const EAR_PROTOCOL_VERSION: u32 = 3;
 /// The oldest plugin protocol the server still accepts. Version 1 plugins report bars only.
 pub const EAR_MIN_PROTOCOL_VERSION: u32 = 1;
 

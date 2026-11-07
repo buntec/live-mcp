@@ -1,6 +1,6 @@
 //! Beats from MIDI notes: exact input for the interpreter.
 
-use super::Beat;
+use super::{BassNote, Beat};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MidiNote {
@@ -58,6 +58,15 @@ fn beat(notes: &[MidiNote], index: i64, lo: f64, hi: f64) -> Beat {
             beat.bass[(n.pitch % 12) as usize] += (n.velocity / 127.0) as f32 / BASS_SAMPLES as f32;
         }
     }
+    // The bass line: the lowest note sounding just after each 16th starts.
+    for s in 0..4 {
+        let t = index as f64 + s as f64 / 4.0 + 0.01;
+        if t < lo || t >= hi {
+            continue;
+        }
+        let lowest = notes.iter().filter(|n| n.start <= t && t < n.start + n.duration).min_by_key(|n| n.pitch);
+        beat.bass_line[s] = lowest.map(|n| BassNote { pitch: n.pitch, cents: 0.0, confidence: 1.0 });
+    }
     beat.weight = beat.chroma.iter().sum();
     beat.pitched = beat.weight > 0.0;
     beat.span = span;
@@ -84,6 +93,10 @@ mod tests {
         assert_eq!(beats[1].span, Some((48, 67)));
         assert_eq!(beats[2].bass[7], 0.75); // only the G sounds in beat 3, for 3/4 of it
         assert_eq!(beats[2].octaves[3], 0.75);
+        let line: Vec<Option<u8>> = beats[1].bass_line.iter().map(|n| n.map(|n| n.pitch)).collect();
+        assert_eq!(line, [Some(48), Some(48), Some(48), Some(48)]);
+        let line: Vec<Option<u8>> = beats[2].bass_line.iter().map(|n| n.map(|n| n.pitch)).collect();
+        assert_eq!(line, [Some(67), Some(67), Some(67), None]);
     }
 
     #[test]
