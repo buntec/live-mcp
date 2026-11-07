@@ -3,6 +3,8 @@
 use live_mcp_analysis::{BAND_EDGES_HZ, BAND_NAMES, BarReport};
 use serde_json::{Value, json};
 
+use crate::live::{field, field_bool, field_str, items, obj_id};
+
 /// A track whose share of a band is at least this (in dB of the band's total) carries it.
 /// −6 dB is a quarter of the band's energy.
 pub const CARRY_DB: f64 = -6.0;
@@ -15,10 +17,93 @@ const LIST_DB: f64 = -20.0;
 pub struct Heard<'a> {
     pub label: Value,
     pub name: String,
-    /// Track volume in dB (post-Ear). `None` for −∞ (fader all the way down).
+    /// Gain in dB between the Ear and the mix: the track's fader plus the faders of the groups
+    /// it is in. `None` for −∞ (a fader all the way down).
     pub gain_db: Option<f64>,
-    pub muted: bool,
+    /// Why the track does not count, if it does not: muted, silenced by solo, ….
+    pub left_out: Option<String>,
     pub bars: &'a [BarReport],
+}
+
+/// A regular or return track's switches, and the group track it sits in.
+#[derive(Debug, Clone, Default)]
+pub struct Strip {
+    pub name: String,
+    pub mute: bool,
+    pub solo: bool,
+    /// Index of the group track this track is in (groups are regular tracks).
+    pub group: Option<usize>,
+    pub is_return: bool,
+}
+
+/// How the regular tracks (first) and the return tracks (after them) reach the mix.
+#[derive(Debug, Default)]
+pub struct Mixer {
+    pub strips: Vec<Strip>,
+}
+
+impl Mixer {
+    /// From `get` of `live_set tracks` with fields name, mute, solo, group_track, and of
+    /// `live_set return_tracks` with fields name, mute, solo.
+    pub fn from_live(tracks: &Value, returns: &Value) -> Self {
+        let tracks = items(tracks);
+        let ids: Vec<Option<u64>> = tracks.iter().map(obj_id).collect();
+        let strip = |t: &Value, is_return: bool| Strip {
+            name: field_str(t, "name").to_owned(),
+            mute: field_bool(t, "mute") == Some(true),
+            solo: field_bool(t, "solo") == Some(true),
+            group: field(t, "group_track")
+                .and_then(obj_id)
+                .and_then(|id| ids.iter().position(|other| *other == Some(id))),
+            is_return,
+        };
+        let mut strips: Vec<Strip> = tracks.iter().map(|t| strip(t, false)).collect();
+        strips.extend(items(returns).iter().map(|t| strip(t, true)));
+        Self { strips }
+    }
+
+    /// The groups track `k` is in, innermost first.
+    pub fn groups(&self, k: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut at = self.strips.get(k).and_then(|s| s.group);
+        while let Some(g) = at {
+            if g == k || out.contains(&g) || g >= self.strips.len() {
+                break; // a malformed answer; Live's groups do not loop
+            }
+            out.push(g);
+            at = self.strips[g].group;
+        }
+        out
+    }
+
+    /// Whether group track `g` contains track `k`, at any depth.
+    pub fn contains(&self, g: usize, k: usize) -> bool {
+        self.groups(k).contains(&g)
+    }
+
+    /// Why track `k` does not reach the mix, or `None` if it does. Assumes Live's default Solo
+    /// in Place: soloing a regular track keeps the return tracks playing.
+    pub fn silenced(&self, k: usize) -> Option<&'static str> {
+        let strip = self.strips.get(k)?;
+        let groups = self.groups(k);
+        if strip.mute {
+            return Some("muted");
+        }
+        if groups.iter().any(|&g| self.strips[g].mute) {
+            return Some("its group is muted");
+        }
+        if !self.strips.iter().any(|s| s.solo) {
+            return None;
+        }
+        let heard = if strip.is_return {
+            strip.solo || !self.strips.iter().any(|s| s.is_return && s.solo)
+        } else {
+            strip.solo
+                || groups.iter().any(|&g| self.strips[g].solo)
+                || (0..self.strips.len()).any(|j| self.strips[j].solo && self.contains(k, j))
+        };
+        (!heard).then_some("another track is soloed")
+    }
 }
 
 fn energy_mean(levels: impl Iterator<Item = f64>) -> Option<f64> {
@@ -45,7 +130,7 @@ pub fn analyze(tracks: &[Heard<'_>]) -> Value {
     // Post-fader band levels of the tracks that reach the mix.
     let audible: Vec<(&Heard<'_>, [f64; 5])> = tracks
         .iter()
-        .filter(|t| !t.muted)
+        .filter(|t| t.left_out.is_none())
         .filter_map(|t| {
             let gain = t.gain_db?;
             let levels: Option<Vec<f64>> = (0..5)
@@ -55,8 +140,13 @@ pub fn analyze(tracks: &[Heard<'_>]) -> Value {
             Some((t, std::array::from_fn(|i| levels[i] + gain)))
         })
         .collect();
-    let excluded: Vec<String> =
-        tracks.iter().filter(|t| t.muted || t.gain_db.is_none()).map(|t| t.name.clone()).collect();
+    let excluded: Vec<Value> = tracks
+        .iter()
+        .filter_map(|t| {
+            let why = t.left_out.as_deref().or(t.gain_db.is_none().then_some("volume at −∞"))?;
+            Some(json!({"track": t.label, "name": t.name, "why": why}))
+        })
+        .collect();
 
     let mix: [Option<f64>; 5] = std::array::from_fn(|i| {
         let total: f64 = audible.iter().map(|(_, l)| 10f64.powf(l[i] / 10.0)).sum();
@@ -88,12 +178,12 @@ pub fn analyze(tracks: &[Heard<'_>]) -> Value {
         "method": format!(
             "share_db is each track's part of the band's total across these tracks (0 dB = all of it; −6 dB = a \
              quarter). A band is contested when two or more tracks carry at least {CARRY_DB} dB of it. Levels are \
-             post-fader; pan and sends are ignored."
+             after each track's fader and the faders of its groups; muted tracks and tracks silenced by solo \
+             are left out. Pan is ignored. Sends count through the return tracks that have an Ear."
         ),
     });
     if !excluded.is_empty() {
         out["excluded"] = json!(excluded);
-        out["excluded_reason"] = json!("muted, or volume at −∞");
     }
     out
 }
@@ -132,7 +222,7 @@ mod tests {
     }
 
     fn heard<'a>(name: &str, gain_db: Option<f64>, bars: &'a [BarReport]) -> Heard<'a> {
-        Heard { label: json!(name), name: name.into(), gain_db, muted: false, bars }
+        Heard { label: json!(name), name: name.into(), gain_db, left_out: None, bars }
     }
 
     #[test]
@@ -162,9 +252,15 @@ mod tests {
         assert!((kick_share + 20.0).abs() < 1.0, "{}", out["bands"][0]);
         // Muted, or at −∞: left out entirely.
         let mut muted = heard("Kick", Some(0.0), &kick);
-        muted.muted = true;
+        muted.left_out = Some("muted".into());
         let out = analyze(&[heard("Bass", Some(0.0), &bass), muted, heard("Sub", None, &kick)]);
-        assert_eq!(out["excluded"], json!(["Kick", "Sub"]));
+        assert_eq!(
+            out["excluded"],
+            json!([
+                {"track": "Kick", "name": "Kick", "why": "muted"},
+                {"track": "Sub", "name": "Sub", "why": "volume at −∞"},
+            ])
+        );
         assert_eq!(out["bands"][0]["tracks"].as_array().unwrap().len(), 1);
     }
 
@@ -175,5 +271,100 @@ mod tests {
         let b = bars(&[(9500.0, -60.0)]);
         let out = analyze(&[heard("A", Some(0.0), &a), heard("B", Some(0.0), &b)]);
         assert_eq!(out["contested"], json!([]), "{out}");
+    }
+
+    /// Tracks as `get live_set tracks` returns them: ids, and each group_track as an object.
+    fn live_tracks(tracks: &[(&str, bool, bool, Option<usize>)]) -> Value {
+        let id = |i: usize| 1000 + i as u64;
+        Value::Array(
+            tracks
+                .iter()
+                .enumerate()
+                .map(|(i, (name, mute, solo, group))| {
+                    json!({"$obj": id(i), "type": "Track", "fields": {
+                        "name": name, "mute": mute, "solo": solo,
+                        "group_track": group.map(|g| json!({"$obj": id(g), "type": "Track"})),
+                    }})
+                })
+                .collect(),
+        )
+    }
+
+    fn returns(list: &[(&str, bool, bool)]) -> Value {
+        Value::Array(
+            list.iter()
+                .enumerate()
+                .map(|(i, (name, mute, solo))| {
+                    json!({"$obj": 2000 + i, "type": "Track", "fields": {"name": name, "mute": mute, "solo": solo}})
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn groups_are_read_from_live_objects() {
+        // Drums [Kick, Perc [Shaker]], Bass
+        let mixer = Mixer::from_live(
+            &live_tracks(&[
+                ("Drums", false, false, None),
+                ("Kick", false, false, Some(0)),
+                ("Perc", false, false, Some(0)),
+                ("Shaker", false, false, Some(2)),
+                ("Bass", false, false, None),
+            ]),
+            &returns(&[("A-Reverb", false, false)]),
+        );
+        assert_eq!(mixer.strips.len(), 6);
+        assert_eq!(mixer.groups(3), [2, 0]);
+        assert_eq!(mixer.groups(1), [0]);
+        assert!(mixer.groups(4).is_empty() && mixer.groups(5).is_empty());
+        assert!(mixer.contains(0, 3) && !mixer.contains(2, 1));
+        assert!(mixer.strips[5].is_return && mixer.strips[5].name == "A-Reverb");
+        assert!((0..6).all(|k| mixer.silenced(k).is_none()));
+    }
+
+    #[test]
+    fn a_muted_group_silences_its_tracks() {
+        let mixer = Mixer::from_live(
+            &live_tracks(&[
+                ("Drums", true, false, None),
+                ("Kick", false, false, Some(0)),
+                ("Perc", false, false, Some(0)),
+                ("Shaker", false, false, Some(2)),
+                ("Bass", false, false, None),
+            ]),
+            &Value::Null,
+        );
+        assert_eq!(mixer.silenced(0), Some("muted"));
+        assert_eq!(mixer.silenced(1), Some("its group is muted"));
+        assert_eq!(mixer.silenced(3), Some("its group is muted"));
+        assert_eq!(mixer.silenced(4), None);
+    }
+
+    #[test]
+    fn solo_silences_what_is_not_soloed() {
+        let set = |solo: [bool; 5], return_solo: bool| {
+            Mixer::from_live(
+                &live_tracks(&[
+                    ("Drums", false, solo[0], None),
+                    ("Kick", false, solo[1], Some(0)),
+                    ("Perc", false, solo[2], Some(0)),
+                    ("Shaker", false, solo[3], Some(2)),
+                    ("Bass", false, solo[4], None),
+                ]),
+                &returns(&[("A", false, return_solo), ("B", false, false)]),
+            )
+        };
+        let heard = |m: &Mixer| (0..m.strips.len()).filter(|&k| m.silenced(k).is_none()).collect::<Vec<_>>();
+        // Soloing a track inside a group: the group plays, its other tracks don't. Returns play
+        // on (Solo in Place).
+        assert_eq!(heard(&set([false, false, false, true, false], false)), [0, 2, 3, 5, 6]);
+        // Soloing a group: everything in it plays.
+        assert_eq!(heard(&set([true, false, false, false, false], false)), [0, 1, 2, 3, 5, 6]);
+        assert_eq!(set([true, false, false, false, false], false).silenced(4), Some("another track is soloed"));
+        // Soloing a return: only that return.
+        assert_eq!(heard(&set([false; 5], true)), [5]);
+        // A track and a return.
+        assert_eq!(heard(&set([false, false, false, false, true], true)), [4, 5]);
     }
 }

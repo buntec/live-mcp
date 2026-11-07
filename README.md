@@ -174,8 +174,15 @@ one playback. It returns each track's bars (each kept as its own snapshot), plus
   such as bass and kick both in the low band.
 
 An Ear at the end of a track's device chain hears the signal before the fader,
-so levels are corrected by each track's volume, and muted tracks are left out.
-Pan and sends are not yet taken into account.
+so each track's level is corrected by its volume and by the volume of every group
+it is in. Tracks that are muted, in a muted group, or silenced by another track's
+solo are left out, each with the reason. Solo is read as Live's default, Solo in
+Place, where soloing a track keeps the return tracks playing. A group track whose
+own tracks also have Ears is left out, so they are not counted twice.
+
+Sends reach the mix through return tracks: put an Ear on a return to count its
+reverb or delay as a track of its own. Pan is not taken into account: bands are
+measured on the mid signal, as if every track were centred.
 
 How it works:
 - The plugin measures audio on the audio thread without allocating (about
@@ -231,7 +238,8 @@ are skipped without it.
 
 ## Not yet
 
-- **Pan and sends in masking.** Track levels are corrected for the fader only.
+- **Pan in masking.** Tracks panned apart mask each other less than the analysis
+  reports.
 - **Other platforms and versions.** Only tested on macOS (arm64) with Live 12.4.
 
 ## License

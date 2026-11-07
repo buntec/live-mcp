@@ -201,6 +201,20 @@ async fn listens_to_several_tracks_and_finds_shared_bands() {
     assert_eq!(heard["tracks"][1]["volume"], "-20.0 dB");
     assert_eq!(heard["masking"]["contested"], json!([]), "{}", heard["masking"]);
 
+    // Solo the kick: the bass is silent in the mix, so nothing is contested.
+    h.ok("set", json!({"target": "live_set tracks 1 mixer_device volume", "prop": "value", "value": 0.85})).await;
+    h.ok("set", json!({"target": "live_set tracks 1", "prop": "solo", "value": true})).await;
+    let heard = h.ok("listen", json!({"tracks": [0, 1], "start_bar": 3, "bars": 1})).await;
+    assert_eq!(heard["tracks"][1]["solo"], true, "{heard}");
+    assert_eq!(heard["masking"]["contested"], json!([]), "{}", heard["masking"]);
+    assert_eq!(
+        heard["masking"]["excluded"],
+        json!([{"track": 0, "name": "1-MIDI", "why": "another track is soloed"}]),
+        "{}",
+        heard["masking"]
+    );
+    h.ok("set", json!({"target": "live_set tracks 1", "prop": "solo", "value": false})).await;
+
     // A single-track list still gets the multi-track shape, without a masking analysis.
     let heard = h.ok("listen", json!({"tracks": ["master"], "start_bar": 1, "bars": 1})).await;
     assert!(heard.get("masking").is_none() && heard["masking_note"].is_string());

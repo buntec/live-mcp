@@ -88,6 +88,7 @@ class Track(LiveObject):
         self._clip_slots = [ClipSlot(self) for _ in range(slots)] if kind == "track" else []
         self._arrangement_clips = []
         self._mixer_device = MixerDevice()
+        self._group = None  # the group Track this one is in
 
     name = _prop("name", True, _str)
     mute = _prop("mute", True, _bool)
@@ -109,7 +110,9 @@ class Track(LiveObject):
 
     has_midi_input = property(lambda self: (guard(), self._is_midi and self._kind == "track")[1])
     has_audio_input = property(lambda self: (guard(), not self._is_midi and self._kind == "track")[1])
-    is_foldable = property(lambda self: (guard(), False)[1])
+    is_foldable = property(lambda self: (guard(), self._kind == "group")[1])
+    is_grouped = property(lambda self: (guard(), self._group is not None)[1])
+    group_track = property(lambda self: (guard(), self._group)[1])
     devices = property(lambda self: (guard(), tuple(self._devices))[1])
     mixer_device = property(lambda self: (guard(), self._mixer_device)[1])
     clip_slots = property(lambda self: (guard(), tuple(self._clip_slots))[1])
