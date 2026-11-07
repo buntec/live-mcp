@@ -13,6 +13,9 @@ const MIN_COVERAGE: f32 = 0.25;
 /// A beat's chroma needs its strongest pitch class at least this many times the mean of all 12
 /// to name pitches: sweeps (808 kicks), noise and dense clusters spread energy evenly.
 const MIN_CONTRAST: f32 = 1.6;
+/// A beat whose octaves from C3 (MIDI 60) up hold less than this share of its strongest octave is
+/// a bass line.
+const BASS_ONLY_UPPER: f32 = 0.1;
 /// Onset strengths below this (on the Ear's 0–255 scale) are the flutter of steady sound, not
 /// attacks.
 pub const ONSET_FLOOR: f32 = 12.0;
@@ -104,6 +107,7 @@ pub fn beats(reports: &[BeatReport]) -> (Vec<Beat>, Option<f32>) {
                 chroma,
                 bass,
                 octaves: r.octaves.map(|v| v as f32 / 255.0),
+                bass_only: r.octaves[3..].iter().map(|&v| v as f32).sum::<f32>() < BASS_ONLY_UPPER * 255.0,
                 onsets: r.onsets.map(|v| if (v as f32) < ONSET_FLOOR { 0.0 } else { v as f32 }),
                 span: None,
                 tonal: Some(r.tonal),

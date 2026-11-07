@@ -147,7 +147,8 @@ pub fn label_beats(beats: &[Beat], change_cost: &[f32], key: Option<Key>, source
         .iter()
         .map(|beat| {
             let mut e = [0.0f32; STATES];
-            if !beat.pitched {
+            // Nothing pitched, or only a bass line: no chord to name.
+            if !beat.pitched || beat.bass_only {
                 e[NO_CHORD] = 1.0;
                 return e;
             }
@@ -164,9 +165,12 @@ pub fn label_beats(beats: &[Beat], change_cost: &[f32], key: Option<Key>, source
                     e[s] -= POWER_CHORD_MARGIN_AUDIO;
                 }
             }
-            let single = notes.iter().map(|t| cosine(&beat.chroma, t)).fold(0.0, f32::max);
+            // The best single note, with the bass bonus only if the bass is that note.
+            let single = (0..12u8)
+                .map(|pc| cosine(&beat.chroma, &notes[pc as usize]) + if bass == Some(pc) { BASS_BONUS } else { 0.0 })
+                .fold(0.0, f32::max);
             let margin = if source == Source::Audio { SINGLE_NOTE_MARGIN_AUDIO } else { 0.0 };
-            e[NO_CHORD] = NO_CHORD_SCORE.max(single + BASS_BONUS - margin);
+            e[NO_CHORD] = NO_CHORD_SCORE.max(single - margin);
             e
         })
         .collect();
@@ -305,6 +309,30 @@ mod tests {
         // C major, then a beat where the fifth drops out (C E: still C, or Am at a stretch).
         let beats = [beat(0, &[48, 52, 55]), beat(1, &[48, 52, 55]), beat(2, &[48, 52]), beat(3, &[48, 52, 55])];
         assert_eq!(names(&beats, &[0.16; 4]), ["Cx4"]);
+    }
+
+    #[test]
+    fn a_root_heavy_chord_over_another_bass_is_still_a_chord() {
+        // Heard in a string loop: Bb strongest, F, A and D weaker, D in the bass. The single Bb
+        // must not get the bass bonus that belongs to D.
+        let mut b = beat(0, &[]);
+        b.pitched = true;
+        b.chroma[10] = 1.0;
+        b.chroma[5] = 0.4;
+        b.chroma[9] = 0.4;
+        b.chroma[2] = 0.3;
+        b.bass[2] = 1.0;
+        let labels = label_beats(&[b], &[0.0], None, Source::Audio);
+        let chord = labels.chord(0).expect("a chord");
+        assert_eq!(chord.root, 10, "{}", chord.name(spelling(None)));
+    }
+
+    #[test]
+    fn bass_lines_get_no_chord() {
+        let mut b = beat(0, &[45, 52, 57]);
+        b.bass_only = true;
+        let labels = label_beats(&[b], &[0.0], None, Source::Audio);
+        assert_eq!(labels.chord(0), None);
     }
 
     #[test]

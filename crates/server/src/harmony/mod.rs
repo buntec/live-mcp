@@ -32,6 +32,10 @@ const KEY_CHANGE_MIN_BARS: usize = 12;
 const KEY_WINDOW_BARS: usize = 8;
 /// A local key must hold for this many bars to count as a key change.
 const KEY_CHANGE_HOLD_BARS: usize = 4;
+/// A key needs at least this share of the heard beats to be pitched (and at least
+/// `KEY_MIN_PITCHED` of them): a drum loop with a few tonal hits has no key.
+const KEY_MIN_PITCHED_SHARE: f32 = 0.25;
+const KEY_MIN_PITCHED: usize = 2;
 
 /// What was heard (or written) during one beat (quarter note).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -56,6 +60,9 @@ pub struct Beat {
     pub span: Option<(u8, u8)>,
     /// 0 = noise, 1 = clearly pitched; audio only.
     pub tonal: Option<f32>,
+    /// Nearly all energy is in the bass register (below C3): a bass line, whose treble chroma is
+    /// only its harmonics. Such beats get no chord, and count towards the key by their bass.
+    pub bass_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -116,13 +123,20 @@ fn shape(values: &[f32; 12]) -> [f32; 12] {
     if max > 0.0 { values.map(|v| v / max) } else { [0.0; 12] }
 }
 
-/// Weighted pitch-class profile of some beats, bass counted at half weight.
+/// Weighted pitch-class profile of some beats. With `with_bass` (for the key) the bass counts as
+/// much as the treble, and bass lines count by their bass alone: their treble chroma is mostly
+/// harmonics (a low D's 5th harmonic is an F#, which would suggest D major).
 fn profile<'a>(beats: impl Iterator<Item = &'a Beat>, with_bass: bool) -> [f32; 12] {
     let mut sum = [0.0f32; 12];
     for beat in beats.filter(|b| b.pitched) {
         let (chroma, bass) = (shape(&beat.chroma), shape(&beat.bass));
         for pc in 0..12 {
-            sum[pc] += beat.weight * (chroma[pc] + if with_bass { 0.5 * bass[pc] } else { 0.0 });
+            let value = match (with_bass, beat.bass_only) {
+                (false, _) => chroma[pc],
+                (true, false) => chroma[pc] + bass[pc],
+                (true, true) => 2.0 * bass[pc],
+            };
+            sum[pc] += beat.weight * value;
         }
     }
     sum
@@ -217,9 +231,11 @@ fn range_text(beats: &[Beat], spelling: Spelling) -> Option<String> {
 /// Interprets a section. Without any pitched beat (drums, silence) only rhythm is reported.
 pub fn analyze(section: &Section) -> Analysis {
     let beats = section.beats;
-    let pitched = beats.iter().any(|b| b.pitched);
+    let pitched_beats = beats.iter().filter(|b| b.pitched).count();
+    let pitched = pitched_beats > 0;
     let ranges = bar_ranges(beats, section.bars);
-    let estimate = key::estimate(&profile(beats.iter(), true));
+    let enough = pitched_beats >= KEY_MIN_PITCHED && pitched_beats as f32 >= KEY_MIN_PITCHED_SHARE * beats.len() as f32;
+    let estimate = if enough { key::estimate(&profile(beats.iter(), true)) } else { None };
     let key = estimate.map(|e| e.key);
     let spelling = spelling(key);
 
@@ -381,6 +397,19 @@ mod tests {
         assert_eq!(analysis.bars[0].1["bass"], "A");
         assert_eq!(analysis.bars[0].1["range"], "A1–E3");
         assert_eq!(analysis.bars[0].1["rhythm"], "X... .... .... ....");
+    }
+
+    #[test]
+    fn a_few_pitched_hits_in_a_drum_loop_give_no_key() {
+        let mut notes = chord(&[48, 52, 55], 0.0, 0.25);
+        notes.extend(chord(&[50, 53, 57], 4.0, 0.25));
+        let mut beats = beats(&notes, 0.0, 16.0);
+        for b in &mut beats {
+            b.onsets = [1.0, 0.0, 1.0, 0.0];
+        }
+        let bars = bars(4);
+        let analysis = analyze(&Section { bars: &bars, beats: &beats, source: Source::Midi, scale: None });
+        assert_eq!(analysis.summary["key"], Value::Null, "{:?}", analysis.summary);
     }
 
     #[test]
