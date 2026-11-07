@@ -286,12 +286,14 @@ async fn hears_chords_and_clashes_between_tracks() {
     assert_eq!(pad["bars"][0]["chord"], "F", "{pad}");
     let together = &heard["music"];
     assert_eq!(together["tracks"], json!(["1-MIDI", "2-Audio"]), "{together}");
-    assert_eq!(
-        together["clashes"],
-        json!([{"tracks": ["1-MIDI", "2-Audio"], "notes": "F against Gb", "bars": "1–2", "beats": 8}]),
-        "{together}"
-    );
-    assert_eq!(together["scale"]["outside"][0]["pc"], "Gb", "{together}");
+    // The F# is spelled by the key the two make together, which is no clear key: either way.
+    let clashes = together["clashes"].as_array().unwrap();
+    assert_eq!(clashes.len(), 1, "{together}");
+    assert!(["F against Gb", "F against F#"].contains(&clashes[0]["notes"].as_str().unwrap()), "{together}");
+    assert_eq!(clashes[0]["tracks"], json!(["1-MIDI", "2-Audio"]));
+    assert_eq!((clashes[0]["bars"].clone(), clashes[0]["beats"].clone()), (json!("1–2"), json!(8)));
+    assert!(["Gb", "F#"].contains(&together["scale"]["outside"][0]["pc"].as_str().unwrap()), "{together}");
+    assert!(heard["tracks"][0]["music"].get("scale").is_none(), "scale fit is only in the combined music");
     assert_eq!(together["rhythm"]["density"], 0.0, "steady tones have no onsets: {together}");
     assert!(heard.get("masking").is_none(), "focus music leaves masking out");
     for plugin in plugins {

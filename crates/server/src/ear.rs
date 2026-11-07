@@ -794,7 +794,10 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
                 entry["summary"] = summary(&reports);
             }
             if let Some(m) = &music[k] {
-                entry["music"] = Value::Object(m.summary.clone());
+                // Scale fit is about the music as a whole; it is in the combined `music`.
+                let mut summary = m.summary.clone();
+                summary.remove("scale");
+                entry["music"] = Value::Object(summary);
             } else if focus != Focus::Mix && !targets[k].1.hears_music() {
                 entry["music_note"] = json!(OLD_EAR_NOTE);
             }

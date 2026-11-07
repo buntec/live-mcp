@@ -150,6 +150,8 @@ fn retune_bass(beats: &mut [Beat], tuning: f32) {
 /// Of a beat's energy per octave, the share an octave needs before a bass note is believed to
 /// sound in it.
 const RESIDUE_OCTAVE_MIN: f32 = 0.25;
+/// A bass note whose octave (after lifting) holds less than this share is dropped.
+const BASS_NOTE_OCTAVE_MIN: f32 = 0.1;
 
 /// Moves bass notes up an octave (at most two) when hardly any energy is in their octave but the
 /// octave above has more: chords and bright tones make YIN report the residue pitch, the period
@@ -166,7 +168,8 @@ fn lift_residue_octaves(beats: &mut [Beat]) {
             let octave = pitch as i32 / 12 - 2;
             if (0..7).contains(&octave) { octaves[octave as usize] / max } else { 0.0 }
         };
-        for note in beat.bass_line.iter_mut().flatten() {
+        for slot in beat.bass_line.iter_mut() {
+            let Some(note) = slot.as_mut() else { continue };
             for _ in 0..2 {
                 let (here, above) = (energy(note.pitch), energy(note.pitch + 12));
                 // Below the lowest octave measured (C0), any energy above counts.
@@ -176,6 +179,11 @@ fn lift_residue_octaves(beats: &mut [Beat]) {
                 } else {
                     break;
                 }
+            }
+            // A note in an octave with hardly any of the beat's energy is not the part's bass:
+            // mains hum under a guitar, rumble under a pad.
+            if energy(note.pitch) < BASS_NOTE_OCTAVE_MIN {
+                *slot = None;
             }
         }
     }
