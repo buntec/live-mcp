@@ -58,6 +58,10 @@ MAX_REGISTRY = 50000
 # are kept (the oldest are dropped first, and counted).
 MAX_SUBSCRIPTIONS = 500
 MAX_EVENTS = 10000
+# One `events` reply holds at most this many events and about this many bytes of
+# them; the rest stay queued and the reply says `more`.
+MAX_EVENTS_PER_REPLY = 1000
+MAX_EVENT_REPLY_BYTES = 4 * 1024 * 1024
 
 ERR_PARSE = -32700
 ERR_INVALID_REQUEST = -32600
@@ -109,7 +113,7 @@ class _Client(object):
     """One connection: byte buffers in and out, its auth state, and what it observes."""
 
     __slots__ = ("sock", "inbuf", "outbuf", "authed", "eof", "closing",
-                 "subs", "events", "dropped")
+                 "subs", "events", "dropped", "sent_through")
 
     def __init__(self, sock):
         self.sock = sock
@@ -119,8 +123,9 @@ class _Client(object):
         self.eof = False      # peer closed its side; finish buffered requests, then drop
         self.closing = False  # we decided to close; flush the output, then drop
         self.subs = {}        # subscription id -> _Subscription
-        self.events = collections.deque(maxlen=MAX_EVENTS)  # unread, oldest first
-        self.dropped = 0      # events lost to the MAX_EVENTS cap since the last `events`
+        self.events = collections.deque()  # not yet acknowledged, oldest first
+        self.dropped = 0      # events lost to the MAX_EVENTS cap, over the connection's life
+        self.sent_through = 0  # the highest seq sent in an `events` reply
 
     def next_line(self):
         while True:
@@ -226,6 +231,13 @@ def _number_from_text(value):
     if "." in value or "e" in value or "E" in value:
         return float(value)
     return int(value)
+
+
+def _seq_param(params, name, default):
+    value = params.get(name, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise RpcError(ERR_INVALID_PARAMS, "%s must be a non-negative integer" % name)
+    return value
 
 
 def _ok(req_id, result):
@@ -543,7 +555,7 @@ class LiveMCP(ControlSurface):
             return self._m_observe(client, params)
         if method == "unobserve":
             return self._m_unobserve(client, params)
-        return self._m_events(client)
+        return self._m_events(client, params)
 
     def _m_observe(self, client, params):
         """Add a listener for one property of a Live object (`add_<prop>_listener`).
@@ -561,7 +573,9 @@ class LiveMCP(ControlSurface):
         oid = self._remember(obj)
         result = {"object": {"$obj": oid, "type": type(obj).__name__}}
         for sid, sub in client.subs.items():
-            if sub.oid == oid and sub.prop == prop:
+            # Live reuses the address of a deleted object, so a matching oid alone may be a
+            # subscription to the deleted one, whose listener is gone: that one does not count.
+            if sub.oid == oid and sub.prop == prop and self._is_connected(sub):
                 result.update(subscription=sid, existing=True)
                 break
         else:
@@ -598,9 +612,20 @@ class LiveMCP(ControlSurface):
         readable, value = self._observed_value(sub.obj, sub.prop)
         if readable:
             event["value"] = value
-        if len(client.events) == client.events.maxlen:
-            client.dropped += 1
+        if len(client.events) >= MAX_EVENTS:
+            oldest = client.events.popleft()
+            # One already sent was most likely received, and is only waiting for its acknowledgement.
+            if oldest["seq"] > client.sent_through:
+                client.dropped += 1
         client.events.append(event)
+
+    def _is_connected(self, sub):
+        """False once the subscription's listener is gone, e.g. with its deleted object."""
+        try:
+            has = getattr(sub.obj, "%s_has_listener" % sub.prop, None)
+            return not callable(has) or bool(has(sub.callback))
+        except Exception:  # Live raises for an object that no longer exists
+            return False
 
     def _observed_value(self, obj, prop):
         """(readable, encoded value). Some observables, such as a clip's `notes`,
@@ -642,11 +667,33 @@ class LiveMCP(ControlSurface):
         except Exception:
             pass  # the object is gone (e.g. its track was deleted), and its listeners with it
 
-    def _m_events(self, client):
-        events = list(client.events)
-        client.events.clear()
-        dropped, client.dropped = client.dropped, 0
-        return {"events": events, "dropped": dropped}
+    def _m_events(self, client, params):
+        """The connection's queued events with a `seq` above `after`, oldest first.
+
+        Events are kept until the client acknowledges them: `ack` is the highest `seq`
+        it has received, and everything up to it is discarded. A reply that never
+        arrives (the client gave up waiting) loses nothing; the next call asks again.
+        """
+        ack = _seq_param(params, "ack", 0)
+        after = max(_seq_param(params, "after", ack), ack)
+        while client.events and client.events[0]["seq"] <= ack:
+            client.events.popleft()
+        page, size, more = [], 0, False
+        for event in client.events:
+            if event["seq"] <= after:
+                continue
+            if len(page) >= MAX_EVENTS_PER_REPLY:
+                more = True
+                break
+            size += len(_dumps(event))
+            if page and size > MAX_EVENT_REPLY_BYTES:
+                more = True
+                break
+            page.append(event)
+        if page:
+            client.sent_through = max(client.sent_through, page[-1]["seq"])
+        listening = sum(1 for sub in client.subs.values() if self._is_connected(sub))
+        return {"events": page, "more": more, "dropped": client.dropped, "listening": listening}
 
     # ---------------------------------------------------------------- Live API
 

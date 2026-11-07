@@ -304,7 +304,8 @@ class Song(LiveObject):
 
     def delete_track(self, index):
         guard()
-        del self._tracks[index]
+        track = self._tracks.pop(index)
+        track.__dict__.pop("_listeners", None)  # like Live, a deleted object's listeners go with it
         self._notify("tracks")
 
     def slow(self, seconds):

@@ -234,13 +234,31 @@ pub struct Event {
     pub value: Option<Value>,
 }
 
-/// The result of `events`: the connection's unread events, oldest first.
+/// One reply to `events {ack?, after?}`: queued events with a `seq` above `after`, oldest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventsPage {
+    pub events: Vec<Event>,
+    /// More events are queued than fit in one reply: ask again with `after` the last `seq`.
+    #[serde(default)]
+    pub more: bool,
+    /// Events lost because more were queued than the script keeps, over the connection's life.
+    #[serde(default)]
+    pub dropped: u64,
+    /// How many of the connection's subscriptions still have a listener (not those of deleted objects).
+    #[serde(default)]
+    pub listening: u64,
+}
+
+/// The connection's events since the last call, oldest first.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Events {
     pub events: Vec<Event>,
-    /// Events lost because more were queued than the script keeps.
+    /// Events lost since the last call, because more were queued than the script keeps.
     #[serde(default)]
     pub dropped: u64,
+    /// How many subscriptions can still report a change.
+    #[serde(default)]
+    pub listening: u64,
 }
 
 /// Maps a present field to `Some`, even when it is `null`.

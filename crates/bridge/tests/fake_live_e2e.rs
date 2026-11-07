@@ -487,3 +487,71 @@ async fn unobserve_and_connections_keep_subscriptions_apart() {
     assert_eq!(b.unobserve(None).await.unwrap()["removed"], json!([b_tempo, name]));
     assert_eq!(b.status().await.unwrap()["subscriptions"], 0);
 }
+
+#[tokio::test]
+async fn events_survive_a_reply_that_never_arrives() {
+    let Some(fake) = FakeLive::start() else { return };
+    let busy = fake.connect().await;
+    let opts = Options { request_timeout: Duration::from_millis(200), ..fake.options() };
+    let live = Bridge::connect(&opts).await.unwrap();
+    let tempo = live.observe(&path("live_set"), "tempo").await.unwrap()["subscription"].as_u64().unwrap();
+    live.set(&path("live_set"), "tempo", json!(130.0)).await.unwrap();
+    settle(&live).await;
+
+    // Live's main thread is busy for longer than the client waits, so the reply comes too late.
+    let song = path("live_set");
+    let (slow, events) = tokio::join!(busy.call(&song, "slow", vec![json!(0.6)]), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        live.events().await
+    });
+    slow.unwrap();
+    assert!(matches!(events, Err(BridgeError::Timeout { .. })), "{events:?}");
+
+    // The script kept the events, as they were never acknowledged.
+    let events = live.events().await.unwrap();
+    assert_eq!(events.events.len(), 1, "{events:?}");
+    assert_eq!((events.events[0].subscription, events.events[0].value.clone()), (tempo, Some(json!(130.0))));
+    assert_eq!((events.dropped, events.listening), (0, 1));
+    assert!(live.events().await.unwrap().events.is_empty(), "acknowledged events are not repeated");
+}
+
+#[tokio::test]
+async fn events_come_in_pages_and_overflow_is_counted() {
+    let Some(fake) = FakeLive::start() else { return };
+    let live = fake.connect().await;
+    live.observe(&path("live_set"), "tempo").await.unwrap();
+    let tempo_changes = |n: usize| -> Vec<BatchOp> {
+        (0..n)
+            .map(|i| BatchOp {
+                method: "set".into(),
+                params: json!({"target": "live_set", "prop": "tempo", "value": 100 + i % 2}),
+            })
+            .collect()
+    };
+
+    // More than one reply holds.
+    live.batch(&tempo_changes(2500), false, true).await.unwrap();
+    settle(&live).await;
+    let events = live.events().await.unwrap();
+    assert_eq!((events.events.len(), events.dropped), (2500, 0));
+    assert!(events.events.windows(2).all(|w| w[0].seq < w[1].seq), "in order, without repeats");
+
+    // More than the script keeps: the oldest are discarded and counted, once.
+    live.batch(&tempo_changes(10_300), false, true).await.unwrap();
+    settle(&live).await;
+    let events = live.events().await.unwrap();
+    assert_eq!((events.events.len(), events.dropped), (10_000, 300));
+    let events = live.events().await.unwrap();
+    assert_eq!((events.events.len(), events.dropped), (0, 0));
+}
+
+#[tokio::test]
+async fn deleted_objects_are_not_listening() {
+    let Some(fake) = FakeLive::start() else { return };
+    let live = fake.connect().await;
+    assert_eq!(live.events().await.unwrap().listening, 0);
+    live.observe(&path("live_set tracks 1"), "mute").await.unwrap();
+    assert_eq!(live.events().await.unwrap().listening, 1);
+    live.call(&path("live_set"), "delete_track", vec![json!(1)]).await.unwrap();
+    assert_eq!(live.events().await.unwrap().listening, 0);
+}

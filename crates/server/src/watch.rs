@@ -60,6 +60,18 @@ impl Watches {
         }
     }
 
+    /// Records a subscription made on `bridge`. If that connection was replaced while the
+    /// subscription was being made, it ended with it: report it as lost instead.
+    fn record(&self, bridge: &Arc<Bridge>, watch: Watch) {
+        let mut state = self.state.lock().expect("watch state");
+        if Weak::ptr_eq(&state.bridge, &Arc::downgrade(bridge)) {
+            // Keep the first label an existing subscription was given.
+            state.subs.entry(watch.subscription).or_insert(watch);
+        } else {
+            state.lost.push(watch);
+        }
+    }
+
     fn has_lost(&self) -> bool {
         !self.state.lock().expect("watch state").lost.is_empty()
     }
@@ -124,10 +136,16 @@ pub async fn observe(live: &Live, watches: &Watches, p: ObserveParams) -> Result
                 if result["existing"] == true {
                     entry.insert("existing".into(), json!(true));
                 }
-                // Keep the first label an existing subscription was given.
-                watches.state.lock().expect("watch state").subs.entry(subscription).or_insert(watch);
+                watches.record(&bridge, watch);
                 watching.push(Value::Object(entry));
             }
+            Err(e @ BridgeError::Timeout { .. }) => errors.push(json!({
+                "prop": prop,
+                "error": format!(
+                    "{e}. If Live applied it, its changes are reported without a label; observe it again \
+                     to get its subscription (the existing one is returned)"
+                ),
+            })),
             Err(e) => errors.push(json!({"prop": prop, "error": e.to_string()})),
         }
     }
@@ -154,13 +172,14 @@ pub async fn events(live: &Live, watches: &Watches, p: EventsParams) -> Result<V
 
     let mut events = Vec::new();
     let mut dropped = 0;
-    // Waiting for a change makes no sense when nothing is observed (or the observations just ended).
-    let waitable = !watches.has_lost() && !watches.watching().is_empty();
+    // Waiting for a change makes no sense when the observations just ended.
+    let lost_pending = watches.has_lost();
     loop {
-        match bridge.events().await {
+        let listening = match bridge.events().await {
             Ok(batch) => {
                 events.extend(batch.events);
                 dropped += batch.dropped;
+                batch.listening
             }
             Err(BridgeError::Closed) => {
                 // Live went away (e.g. while we waited): the subscriptions went with it.
@@ -169,14 +188,16 @@ pub async fn events(live: &Live, watches: &Watches, p: EventsParams) -> Result<V
                 break;
             }
             Err(e) => return Err(e.into()),
-        }
-        if !events.is_empty() || !waitable || Instant::now() >= deadline {
+        };
+        // Nor when no listener is left that could fire: nothing is observed, or only deleted objects.
+        if !events.is_empty() || lost_pending || listening == 0 || Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()))).await;
     }
 
-    let labels: HashMap<u64, Watch> = watches.watching().into_iter().map(|w| (w.subscription, w)).collect();
+    let watching = watches.watching();
+    let labels: HashMap<u64, &Watch> = watching.iter().map(|w| (w.subscription, w)).collect();
     let now = unix_now();
     let reported: Vec<(Value, u64)> = if p.latest_only {
         // One entry per subscription, at its latest change, in the order of those changes.
@@ -190,10 +211,10 @@ pub async fn events(live: &Live, watches: &Watches, p: EventsParams) -> Result<V
             .iter()
             .enumerate()
             .filter(|(i, e)| last[&e.subscription] == *i)
-            .map(|(_, e)| (describe_event(e, labels.get(&e.subscription), now), changes[&e.subscription]))
+            .map(|(_, e)| (describe_event(e, labels.get(&e.subscription).copied(), now), changes[&e.subscription]))
             .collect()
     } else {
-        events.iter().map(|e| (describe_event(e, labels.get(&e.subscription), now), 1)).collect()
+        events.iter().map(|e| (describe_event(e, labels.get(&e.subscription).copied(), now), 1)).collect()
     };
     let entries: Vec<Value> = reported
         .into_iter()
@@ -207,7 +228,8 @@ pub async fn events(live: &Live, watches: &Watches, p: EventsParams) -> Result<V
 
     // Nothing below can fail, so the loss notices are safe to take now.
     let lost = watches.take_lost();
-    let mut out = json!({"events": [], "watching": watches.watching()});
+    let nothing_observed = labels.is_empty();
+    let mut out = json!({"events": [], "watching": watching});
     if dropped > 0 {
         out["dropped"] = json!(dropped);
     }
@@ -231,7 +253,7 @@ pub async fn events(live: &Live, watches: &Watches, p: EventsParams) -> Result<V
         });
     } else if fitted.elided > 0 {
         out["note"] = json!("some values are too large to list; read those properties with get");
-    } else if lost.is_empty() && labels.is_empty() {
+    } else if lost.is_empty() && nothing_observed {
         out["note"] = json!("nothing is observed; use observe first");
     }
     Ok(out)
@@ -281,7 +303,8 @@ struct Fitted {
 }
 
 /// Keeps the latest of `entries` (oldest first) that fit in `budget` characters of JSON, and at
-/// most `max` of them. An entry too large to fit even on its own is kept without its value.
+/// most `max` of them. An entry too large for the room left is kept without its value, if
+/// that fits, so one large value does not crowd out every older entry.
 fn fit(entries: Vec<Value>, max: usize, budget: usize) -> Fitted {
     let total = entries.len();
     let mut kept = Vec::new();
@@ -293,7 +316,7 @@ fn fit(entries: Vec<Value>, max: usize, budget: usize) -> Fitted {
         }
         let mut size = json_len(&entry) + 1; // and a comma
         let mut without_value = false;
-        if size > budget
+        if used + size > budget
             && let Some(obj) = entry.as_object_mut()
             && let Some(value) = obj.remove("value")
         {
@@ -367,6 +390,26 @@ mod tests {
         assert!(big.get("value").is_none());
         assert!(big["value_omitted"].as_str().unwrap().contains("5002 characters"), "{big}");
         assert!(json_len(&json!(fitted.events)) <= 1000);
+    }
+
+    #[test]
+    fn fit_lists_a_value_too_large_for_the_room_left_without_it() {
+        // Each value fits on its own, but not both: the older is listed without its value,
+        // and the small entries before it are still listed.
+        let small = entry(1, json!(1));
+        let budget = 2 + 2 * (json_len(&small) + 1) + 3000 + 200;
+        let entries = vec![
+            small.clone(),
+            entry(2, json!("x".repeat(2000))),
+            entry(3, json!("y".repeat(2000))),
+            entry(4, json!(4)),
+        ];
+        let fitted = fit(entries.clone(), 500, budget);
+        assert_eq!((fitted.omitted, fitted.elided), (0, 1), "{:?}", fitted.events);
+        assert_eq!(fitted.events[0], small);
+        assert!(fitted.events[1].get("value").is_none() && fitted.events[1].get("value_omitted").is_some());
+        assert_eq!(fitted.events[2..], entries[2..]);
+        assert!(json_len(&json!(fitted.events)) <= budget);
     }
 
     #[test]

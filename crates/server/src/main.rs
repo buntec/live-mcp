@@ -300,7 +300,12 @@ async fn watch(options: &Options, target: &str, props: &[String]) -> Result<()> 
     }
     // Live closes the connection when the control surface goes away, and its listeners with it.
     loop {
-        for event in live.events().await?.events {
+        let batch = live.events().await?;
+        if batch.dropped > 0 {
+            // Listed where they would have been: before the changes that followed them.
+            println!("{}", json!({"dropped": batch.dropped}));
+        }
+        for event in batch.events {
             let mut line = json!({"prop": names.get(&event.subscription), "tick": event.tick});
             if let Some(value) = event.value {
                 line["value"] = value;

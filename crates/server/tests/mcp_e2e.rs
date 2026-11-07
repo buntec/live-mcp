@@ -388,6 +388,18 @@ async fn events_fit_in_one_response() {
 }
 
 #[tokio::test]
+async fn waiting_ends_when_nothing_can_fire() {
+    let Some(h) = Harness::start().await else { return };
+    h.ok("observe", json!({"target": "live_set tracks 1", "props": ["mute"]})).await;
+    h.ok("call", json!({"target": "live_set", "method": "delete_track", "args": [1]})).await;
+    // The only observed object is gone, so no change can come.
+    let started = std::time::Instant::now();
+    let got = h.ok("events", json!({"wait_ms": 5000})).await;
+    assert_eq!(got["events"], json!([]));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "waited {:?}", started.elapsed());
+}
+
+#[tokio::test]
 async fn lost_subscriptions_survive_a_failed_events_call() {
     let Some(mut h) = Harness::start_with(&["--timeout", "0.2"]).await else { return };
     h.ok("observe", json!({"target": "live_set", "props": ["tempo"]})).await;
