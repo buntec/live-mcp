@@ -67,6 +67,8 @@ class Clip(LiveObject):
     start_marker = property(lambda self: (guard(), 0.0)[1])
     end_marker = property(lambda self: (guard(), self._length)[1])
     looping = property(lambda self: (guard(), True)[1])
+    signature_numerator = property(lambda self: (guard(), 4)[1])
+    signature_denominator = property(lambda self: (guard(), 4)[1])
     is_midi_clip = property(lambda self: (guard(), True)[1])
     is_audio_clip = property(lambda self: (guard(), False)[1])
     is_playing = property(lambda self: (guard(), self._is_playing)[1])

@@ -194,7 +194,13 @@ impl LiveServer {
     }
 
     #[tool(
-        description = "Read a clip: name, length, loop and markers, and its MIDI notes.",
+        description = "Read a clip: name, length, loop and markers, and its MIDI notes. For MIDI clips, `music` \
+                       reads the notes that play (the loop, or start to end marker) musically: key with confidence, \
+                       chord progression (\"N\" = no chord), and per bar the chord(s) with confidence and \
+                       alternatives, bass, pitch classes (\"pcs\", weight relative to the bar's strongest), a \
+                       16th-note onset grid (X strong, x weaker, . none; a space between beats), the note range \
+                       (Live's names, C3 = MIDI 60), and pitch classes outside the set's scale. Bars count from the \
+                       clip's start.",
         annotations(read_only_hint = true)
     )]
     async fn read_clip(&self, Parameters(p): Parameters<ReadClipParams>) -> ToolResult {
