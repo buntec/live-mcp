@@ -107,13 +107,13 @@ impl EarHub {
         Ok(port)
     }
 
-    /// The folder `config.json` names as `record_beats`, read on every call so it can be switched
-    /// on and off while the server runs. A relative folder is inside the state folder.
+    /// Where `listen` records beats, per `config.json`'s `record_beats` (see [`recording_dir`]).
+    /// The file is read on every call, so recording can be switched on and off while the server
+    /// runs.
     fn recording_dir(&self) -> Option<PathBuf> {
         let state_dir = self.state_dir.get()?;
         let config: Value = serde_json::from_str(&std::fs::read_to_string(state_dir.join("config.json")).ok()?).ok()?;
-        let dir = PathBuf::from(config.get("record_beats")?.as_str()?);
-        Some(if dir.is_absolute() { dir } else { state_dir.join(dir) })
+        recording_dir(&config, state_dir)
     }
 
     pub fn listening(&self) -> Result<u16, String> {
@@ -222,6 +222,17 @@ impl EarHub {
     async fn changed_or(&self, timeout: Duration) {
         let _ = tokio::time::timeout(timeout, self.changed.notified()).await;
     }
+}
+
+/// `record_beats`: `true` records into `recordings` in the state folder; a string names the folder
+/// (relative to the state folder unless absolute); anything else, or no key, records nothing.
+fn recording_dir(config: &Value, state_dir: &Path) -> Option<PathBuf> {
+    let dir = match config.get("record_beats")? {
+        Value::Bool(true) => PathBuf::from("recordings"),
+        Value::String(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+        _ => return None,
+    };
+    Some(if dir.is_absolute() { dir } else { state_dir.join(dir) })
 }
 
 fn write_endpoint(state_dir: &Path, port: u16) -> Result<()> {
@@ -935,6 +946,19 @@ fn tokens_match(given: &str, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_beats_takes_true_or_a_folder() {
+        let state = Path::new("/state");
+        let dir = |config: Value| recording_dir(&config, state);
+        assert_eq!(dir(json!({"record_beats": true})), Some(PathBuf::from("/state/recordings")));
+        assert_eq!(dir(json!({"record_beats": "mine"})), Some(PathBuf::from("/state/mine")));
+        assert_eq!(dir(json!({"record_beats": "/tmp/x"})), Some(PathBuf::from("/tmp/x")));
+        for off in [json!({}), json!({"record_beats": false}), json!({"record_beats": ""}), json!({"record_beats": 3})]
+        {
+            assert_eq!(dir(off), None);
+        }
+    }
 
     #[test]
     fn tokens_match_only_when_equal() {

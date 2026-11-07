@@ -1,8 +1,9 @@
-//! Replays beats recorded by `listen` (with `record_beats` in `config.json`) through the
-//! interpreter, to tune it on real audio without playing anything:
+//! Replays beats recorded by `listen` (with `"record_beats": true` in `~/.live-mcp/config.json`,
+//! which records into `~/.live-mcp/recordings`) through the interpreter, to tune it on real audio
+//! without playing anything:
 //!
 //! ```text
-//! HEARD=/path/to/recordings cargo test -p live-mcp-server replay -- --ignored --nocapture
+//! HEARD=~/.live-mcp/recordings cargo test -p live-mcp-server replay -- --ignored --nocapture
 //! ```
 //!
 //! Each `<snapshot>.json` holds the bars and beat reports one Ear heard. An optional
