@@ -119,6 +119,19 @@ about 0.7) is a bass line, with no chord; neighbouring beats vote, so labels don
 flicker. On the master, kicks and low pads overlap the bass, so its line gets
 sparser there than on the bass track's own Ear.
 
+Re-recording the bass loops through the new Ear showed three more things, now
+handled. Chords and bright tones make YIN report the residue pitch, the period the
+partials share, an octave or two below the lowest real note (a guitar's A read as
+A0, its B as B-1). Notes are lifted while their octave holds almost no energy and
+the one above holds more. Bass notes are re-rounded against the section's tuning.
+And correlation with key profiles cannot name the tonic of a bass line that leaves
+out the deciding note (a D minor line with no F fits G minor as well), so the
+pitch-class profile weights bass notes by metric position, and each key gets a
+bonus for the share of the bass on the first beat of each bar that sits on its
+tonic. On ten bass and bass-like loops: the bass notes now match the labelled keys'
+tonics, loops of a single repeated note get no key (correctly), and 3 of the 7
+loops with several notes get the labelled key, up from 1 of 10 before the tracker.
+
 **Validation.** Unit tests on synthesized signals, including plucked sawtooth
 bands with kick and hats at +20 cents (Am–F–C–G) and in tune (Dm7–G7–Cmaj7–A7).
 End-to-end tests for `read_clip`, `listen` (single and multi-track, clashes) and

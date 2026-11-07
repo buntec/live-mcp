@@ -132,6 +132,55 @@ fn bass_line(r: &BeatReport) -> [Option<BassNote>; 4] {
     })
 }
 
+/// Re-rounds bass notes against the section's tuning: the plugin rounds to A = 440 Hz, so a
+/// detuned part's notes near a semitone boundary would flip between neighbours.
+fn retune_bass(beats: &mut [Beat], tuning: f32) {
+    for note in beats.iter_mut().flat_map(|b| b.bass_line.iter_mut().flatten()) {
+        let offset = note.cents - tuning;
+        if offset > 50.0 && note.pitch < 127 {
+            note.pitch += 1;
+            note.cents -= 100.0;
+        } else if offset < -50.0 && note.pitch > 0 {
+            note.pitch -= 1;
+            note.cents += 100.0;
+        }
+    }
+}
+
+/// Of a beat's energy per octave, the share an octave needs before a bass note is believed to
+/// sound in it.
+const RESIDUE_OCTAVE_MIN: f32 = 0.25;
+
+/// Moves bass notes up an octave (at most two) when hardly any energy is in their octave but the
+/// octave above has more: chords and bright tones make YIN report the residue pitch, the period
+/// the partials share, an octave or two below the lowest real note (A and E together repeat at A
+/// an octave down).
+fn lift_residue_octaves(beats: &mut [Beat]) {
+    for beat in beats.iter_mut() {
+        let octaves = beat.octaves;
+        let max = octaves.iter().copied().fold(0.0, f32::max);
+        if max <= 0.0 {
+            continue;
+        }
+        let energy = |pitch: u8| -> f32 {
+            let octave = pitch as i32 / 12 - 2;
+            if (0..7).contains(&octave) { octaves[octave as usize] / max } else { 0.0 }
+        };
+        for note in beat.bass_line.iter_mut().flatten() {
+            for _ in 0..2 {
+                let (here, above) = (energy(note.pitch), energy(note.pitch + 12));
+                // Below the lowest octave measured (C0), any energy above counts.
+                let below_range = note.pitch < 24 && above > 0.0;
+                if here < RESIDUE_OCTAVE_MIN && (above > here * 2.0 || below_range) && note.pitch + 12 <= 72 {
+                    note.pitch += 12;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Fixes the pitch tracker's octave slips (common where a kick lands on a new note): of two
 /// neighbouring 16ths with the same pitch class an octave apart, the less confident takes the
 /// other's octave; a 16th an octave away from two neighbours that agree takes their pitch.
@@ -218,6 +267,8 @@ pub fn beats(reports: &[BeatReport]) -> (Vec<Beat>, Option<f32>) {
         })
         .collect();
     beats.sort_by_key(|b| b.index);
+    retune_bass(&mut beats, cents);
+    lift_residue_octaves(&mut beats);
     smooth_octaves(&mut beats);
     smooth_bass_only(&mut beats);
     (beats, tuning)

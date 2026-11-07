@@ -131,6 +131,13 @@ fn replay() {
             rec.id,
             s.get("key").and_then(|k| k.get("confidence")).map_or("-".into(), |c| c.to_string()),
         );
+        if std::env::var("BASS").is_ok() {
+            for (bar, fields) in &analysis.bars {
+                if let Some(line) = fields.get("bass_line").and_then(Value::as_str) {
+                    println!("      bar {bar}: {line}");
+                }
+            }
+        }
     }
     println!("\nkeys right {keys_right}/{keys}, chords right {chords_right}/{chords}");
 }

@@ -178,6 +178,53 @@ fn profile<'a>(beats: impl Iterator<Item = &'a Beat>, with_bass: bool) -> [f32; 
     sum
 }
 
+/// Bass-line notes count this much more towards the key on a bar's downbeat and on other beats
+/// than between beats: the tonic tends to sit there, which pitch counts alone do not show.
+const KEY_DOWNBEAT_WEIGHT: f32 = 3.0;
+const KEY_BEAT_WEIGHT: f32 = 1.5;
+
+/// The pitch-class profile the key is estimated from: like `profile(_, true)`, but bass-line
+/// notes are weighted by where in the bar they fall.
+fn key_profile<'a>(beats: impl Iterator<Item = &'a Beat>, bars: &[BarSpan]) -> [f32; 12] {
+    let mut sum = [0.0f32; 12];
+    for beat in beats.filter(|b| b.pitched) {
+        let downbeat = bars.iter().any(|bar| (beat.index as f64 - bar.start_beat).abs() < 1e-9);
+        let mut line = [0.0f32; 12];
+        for (s, note) in beat.bass_line.iter().enumerate() {
+            if let Some(n) = note {
+                let w = match (s, downbeat) {
+                    (0, true) => KEY_DOWNBEAT_WEIGHT,
+                    (0, false) => KEY_BEAT_WEIGHT,
+                    _ => 1.0,
+                };
+                line[(n.pitch % 12) as usize] += n.confidence * w;
+            }
+        }
+        let has_line = line.iter().any(|v| *v > 0.0);
+        let bass = if has_line { shape(&line) } else { shape(&beat.bass) };
+        let chroma = if beat.bass_only && has_line { bass } else { shape(&beat.chroma) };
+        for pc in 0..12 {
+            let value = if beat.bass_only { 2.0 * bass[pc] } else { chroma[pc] + bass[pc] };
+            sum[pc] += beat.weight * value;
+        }
+    }
+    sum
+}
+
+/// The share of each pitch class in the bass line during the first beat of each bar, or `None`
+/// without any. The whole beat, not just its first 16th: the tracker can still be on the previous
+/// note, or unvoiced, right at the attack.
+fn downbeat_bass<'a>(beats: impl Iterator<Item = &'a Beat>, bars: &[BarSpan]) -> Option<[f32; 12]> {
+    let mut hint = [0.0f32; 12];
+    for beat in beats.filter(|b| bars.iter().any(|bar| (b.index as f64 - bar.start_beat).abs() < 1e-9)) {
+        for n in beat.bass_line.iter().flatten() {
+            hint[(n.pitch % 12) as usize] += n.confidence;
+        }
+    }
+    let total: f32 = hint.iter().sum();
+    (total > 0.0).then(|| hint.map(|v| v / total))
+}
+
 /// A bar's bass line on the 16th grid: a note name where a note starts (the pitch changes, after
 /// silence, or the same note again on a strong onset), `-` while it is held, `.` for no bass; two
 /// spaces between beats. `None` if the bar has no bass line.
@@ -239,7 +286,10 @@ fn key_changes(section: &Section, ranges: &[std::ops::Range<usize>]) -> Vec<(i64
             let from = i.saturating_sub(KEY_WINDOW_BARS / 2 - 1);
             let to = (i + KEY_WINDOW_BARS / 2 + 1).min(n);
             let beats = ranges[from..to].iter().flat_map(|r| &section.beats[r.clone()]);
-            key::estimate(&profile(beats, true)).map(|e| e.key)
+            let beats: Vec<&Beat> = beats.collect();
+            let hint = downbeat_bass(beats.iter().copied(), section.bars);
+            key::estimate_with_tonic_hint(&key_profile(beats.iter().copied(), section.bars), hint.as_ref())
+                .map(|e| e.key)
         })
         .collect();
     let mut changes: Vec<(i64, Key)> = Vec::new();
@@ -307,7 +357,12 @@ pub fn analyze(section: &Section) -> Analysis {
     let pitched = pitched_beats > 0;
     let ranges = bar_ranges(beats, section.bars);
     let enough = pitched_beats >= KEY_MIN_PITCHED && pitched_beats as f32 >= KEY_MIN_PITCHED_SHARE * beats.len() as f32;
-    let estimate = if enough { key::estimate(&profile(beats.iter(), true)) } else { None };
+    let hint = downbeat_bass(beats.iter(), section.bars);
+    let estimate = if enough {
+        key::estimate_with_tonic_hint(&key_profile(beats.iter(), section.bars), hint.as_ref())
+    } else {
+        None
+    };
     let key = estimate.map(|e| e.key);
     let spelling = spelling(key);
 
@@ -486,6 +541,29 @@ mod tests {
         let bars = bars(4);
         let analysis = analyze(&Section { bars: &bars, beats: &beats, source: Source::Midi, scale: None });
         assert_eq!(analysis.summary["key"], Value::Null, "{:?}", analysis.summary);
+    }
+
+    #[test]
+    fn the_bass_on_the_downbeats_names_the_tonic() {
+        // A bass line with D on every downbeat, then A, C, G and a C# leading tone, and no F or
+        // F#: by pitch counts alone G minor fits as well as D minor.
+        let line = [38u8, 38, 45, 48, 43, 45, 49, 38];
+        let mut notes = Vec::new();
+        for bar in 0..4 {
+            for (k, &pitch) in line.iter().enumerate() {
+                notes.push(MidiNote {
+                    pitch,
+                    start: bar as f64 * 4.0 + k as f64 * 0.5,
+                    duration: 0.5,
+                    velocity: 100.0,
+                });
+            }
+        }
+        let beats = beats(&notes, 0.0, 16.0);
+        let bars = bars(4);
+        let analysis = analyze(&Section { bars: &bars, beats: &beats, source: Source::Midi, scale: None });
+        assert_eq!(analysis.summary["key"]["name"], "D minor", "{:?}", analysis.summary);
+        assert_eq!(analysis.bars[0].1["bass_line"], "D1 - D1 -  A1 - C2 -  G1 - A1 -  C#2 - D1 -");
     }
 
     #[test]

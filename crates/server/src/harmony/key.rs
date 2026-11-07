@@ -67,6 +67,16 @@ fn pearson(a: &[f32; 12], b: &[f32; 12]) -> f32 {
 /// The likeliest key for a pitch-class profile, or `None` if the profile is flat, empty, or has
 /// too few pitch classes.
 pub fn estimate(profile: &[f32; 12]) -> Option<KeyEstimate> {
+    estimate_with_tonic_hint(profile, None)
+}
+
+/// Added to a key's correlation in proportion to the hint's share on its tonic.
+const TONIC_HINT_WEIGHT: f32 = 0.12;
+
+/// Like [`estimate`], with evidence for the tonic beyond pitch counts: `tonic_hint` is the share
+/// of each pitch class among the bass notes on bars' downbeats. Correlation alone cannot tell a D
+/// minor bass line without an F from G minor; the D on every downbeat can.
+pub fn estimate_with_tonic_hint(profile: &[f32; 12], tonic_hint: Option<&[f32; 12]>) -> Option<KeyEstimate> {
     let total: f32 = profile.iter().sum();
     let max = profile.iter().copied().fold(0.0, f32::max);
     let present = profile.iter().filter(|w| **w >= PRESENT * max).count();
@@ -81,7 +91,8 @@ pub fn estimate(profile: &[f32; 12]) -> Option<KeyEstimate> {
             for (i, value) in base.iter().enumerate() {
                 rotated[(i + tonic as usize) % 12] = *value;
             }
-            scored.push((Key { tonic, minor }, pearson(profile, &rotated)));
+            let hint = tonic_hint.map_or(0.0, |h| h[tonic as usize]);
+            scored.push((Key { tonic, minor }, pearson(profile, &rotated) + TONIC_HINT_WEIGHT * hint));
         }
     }
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
