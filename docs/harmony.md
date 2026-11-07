@@ -100,15 +100,30 @@ came from running real and synthesized audio through the whole path.
   reading, and `compare` adds key, progression and per-bar chord and rhythm
   differences.
 
-**Validation so far.** Unit tests on synthesized signals, including plucked
-sawtooth bands with kick and hats at +20 cents (Am–F–C–G) and in tune
-(Dm7–G7–Cmaj7–A7). End-to-end tests for `read_clip`, `listen` (single and
-multi-track, clashes) and `analyze_file` with `compare`. Sanity runs on a few
-real WAVs (drum loop: rhythm only; bass and pad loops: plausible notes). Ableton's
-Factory Pack loops, which carry key and tempo in their names, are in a format
-neither symphonia nor Core Audio can decode, so a scored real-world test set is
-still to do. The best way to get one is to render labelled loops from Live, or to
-listen to them through the Ear.
+**Validation.** Unit tests on synthesized signals, including plucked sawtooth
+bands with kick and hats at +20 cents (Am–F–C–G) and in tune (Dm7–G7–Cmaj7–A7).
+End-to-end tests for `read_clip`, `listen` (single and multi-track, clashes) and
+`analyze_file` with `compare`.
+
+On real audio, 36 labelled loops from Live's Loopmasters Mixtape pack were played
+through the Ear (the pack's files decode only inside Live), recorded with
+`record_beats`, and scored offline with `harmony/replay.rs`:
+
+- Chords: 38 of 40 right on the ten string loops whose names list their chords.
+  Misses were Am heard as Cmaj7 (a held B over an A bass, at confidence 0.25) and
+  D as Bm/D.
+- Keys: right for chordal loops (the string loops, guitars, piano, a pad, a lead
+  with chords), mostly wrong for single lines, bass lines and one-note hooks,
+  where the loop alone underdetermines the key (the label is the construction
+  kit's key). Confidence tracks this: every wrong key was at 0.61 or below, and
+  every key at 0.9 or above was right.
+- Telling pitched beats from drums needed the in-tune peak measure (see
+  `audio.rs`): chroma contrast was the same for drum loops and for pads and
+  pianos.
+
+Known weak spots: bass lines (treble chroma is only harmonics; the bass
+sub-bins are too coarse to resolve pitch in the low register), heavily filtered or
+pitch-bending synths, and chord changes where sustained notes overlap.
 
 ## 1. Plugin features (`crates/analysis`)
 
