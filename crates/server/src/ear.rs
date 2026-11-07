@@ -25,7 +25,7 @@ use crate::live::{
     Live, Track, TrackKind, TrackRef, call, default_true, field_f64, field_str, get_fields, get_props, items, set,
 };
 use crate::masking;
-use crate::snapshots::{Kind, SnapshotStore};
+use crate::snapshots::{Kind, SnapshotMusic, SnapshotStore};
 
 /// The plugin's name in Live's browser and device chain.
 pub const EAR_NAME: &str = "LiveMCP Ear";
@@ -427,23 +427,29 @@ fn collect_beats(
     heard
 }
 
-/// What one Ear heard musically.
-struct Music {
-    summary: Map<String, Value>,
-    bars: BTreeMap<i64, Map<String, Value>>,
-    beats: Vec<harmony::Beat>,
+/// What one Ear (or one file) held musically.
+pub(crate) struct Music {
+    pub summary: Map<String, Value>,
+    pub bars: BTreeMap<i64, Map<String, Value>>,
+    pub beats: Vec<harmony::Beat>,
+}
+
+impl Music {
+    pub fn snapshot(&self) -> SnapshotMusic {
+        SnapshotMusic { summary: self.summary.clone(), bars: self.bars.clone() }
+    }
 }
 
 fn spans(reports: &[&BarReport]) -> Vec<BarSpan> {
     reports.iter().map(|r| BarSpan { bar: r.bar, start_beat: r.start_beat, beats: r.beats }).collect()
 }
 
-fn hear_music(reports: &[&BarReport], beats: &BTreeMap<i64, BeatReport>, scale: Option<&SetScale>) -> Option<Music> {
+/// Interprets the beats heard in the given bars.
+pub(crate) fn hear_music(reports: &[&BarReport], beats: &[BeatReport], scale: Option<&SetScale>) -> Option<Music> {
     if reports.is_empty() || beats.is_empty() {
         return None;
     }
-    let reports_list: Vec<BeatReport> = beats.values().copied().collect();
-    let (beats, tuning) = harmony::audio::beats(&reports_list);
+    let (beats, tuning) = harmony::audio::beats(beats);
     let bars = spans(reports);
     let analysis = harmony::analyze(&Section { bars: &bars, beats: &beats, source: Source::Audio, scale });
     let mut summary = analysis.summary;
@@ -453,8 +459,8 @@ fn hear_music(reports: &[&BarReport], beats: &BTreeMap<i64, BeatReport>, scale: 
     Some(Music { summary, bars: analysis.bars.into_iter().collect(), beats })
 }
 
-/// Bars as `listen` reports them: mix measurements, music, or both.
-fn bar_entries(reports: &[&BarReport], focus: Focus, music: Option<&Music>) -> Vec<Value> {
+/// Bars as `listen` and `analyze_file` report them: mix measurements, music, or both.
+pub(crate) fn bar_entries(reports: &[&BarReport], focus: Focus, music: Option<&Music>) -> Vec<Value> {
     reports
         .iter()
         .map(|r| {
@@ -601,7 +607,10 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
     let music: Vec<Option<Music>> = heard
         .iter()
         .zip(&heard_beats)
-        .map(|(bars, beats)| hear_music(&bars.values().collect::<Vec<_>>(), beats, scale.as_ref()))
+        .map(|(bars, beats)| {
+            let beats: Vec<BeatReport> = beats.values().copied().collect();
+            hear_music(&bars.values().collect::<Vec<_>>(), &beats, scale.as_ref())
+        })
         .collect();
 
     if !multi {
@@ -624,7 +633,8 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
                 out["summary"] = summary(&reports);
             }
             let label = format!("listen on {} bars {range} at {tempo} BPM", track.label());
-            out["snapshot"] = json!(store.add(Kind::Listen, label, "bar", heard.values().copied().collect()));
+            let music = music[0].as_ref().map(Music::snapshot);
+            out["snapshot"] = json!(store.add(Kind::Listen, label, "bar", heard.values().copied().collect(), music));
         }
         if !missing.is_empty() {
             out["missing_bars"] = json!(missing);
@@ -751,7 +761,9 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
                 entry["music_note"] = json!(OLD_EAR_NOTE);
             }
             let label = format!("listen on {} ({name}) bars {range} at {tempo} BPM", track.label());
-            entry["snapshot"] = json!(store.add(Kind::Listen, label, "bar", heard[k].values().copied().collect()));
+            let snapshot_music = music[k].as_ref().map(Music::snapshot);
+            entry["snapshot"] =
+                json!(store.add(Kind::Listen, label, "bar", heard[k].values().copied().collect(), snapshot_music));
             entry["bars"] = json!(bar_entries(&reports, focus, music[k].as_ref()));
         }
         let missing: Vec<i64> = wanted.clone().filter(|b| !heard[k].contains_key(b)).collect();

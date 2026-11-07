@@ -14,10 +14,13 @@ pub const OCTAVES: usize = 7;
 /// Notes analysed, as MIDI numbers: C0 to B6 in Live's naming (C1 to B7 in scientific pitch).
 const LOW_NOTE: i32 = 24;
 const HIGH_NOTE: i32 = 107;
-/// The bass chroma takes notes up to here (B2 in Live's naming), the treble chroma from here
-/// (C2) up.
+/// The bass chroma takes notes up to here (B2 in Live's naming, 247 Hz), the treble chroma from
+/// here (E2, 165 Hz) up, so that most bass fundamentals stay out of the chord evidence.
 const BASS_TOP: i32 = 59;
-const TREBLE_BOTTOM: i32 = 48;
+const TREBLE_BOTTOM: i32 = 52;
+/// Bass chroma weight falls linearly from 1 at the lowest note to this at `BASS_TOP`, so the
+/// lowest note of a voicing outweighs chord tones above it in the bass range.
+const BASS_TOP_WEIGHT: f32 = 0.3;
 
 const TARGET_RATE: f64 = 12_000.0;
 const ANTIALIAS_HZ: f64 = 4_500.0;
@@ -154,7 +157,8 @@ impl PitchMeter {
                 frame.treble[index] += compressed;
             }
             if band.note <= BASS_TOP {
-                frame.bass[index] += compressed;
+                let rise = (band.note - LOW_NOTE) as f32 / (BASS_TOP - LOW_NOTE) as f32;
+                frame.bass[index] += compressed * (1.0 - (1.0 - BASS_TOP_WEIGHT) * rise);
             }
             frame.octaves[((band.note - LOW_NOTE) / 12) as usize] += energy;
             frame.power += energy;

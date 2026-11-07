@@ -41,6 +41,12 @@ const TEMPERATURE: f32 = 0.05;
 const ALT_MARGIN: f32 = 0.05;
 /// Harmonic h of a note weighs DECAY^(h−1) in audio templates.
 const HARMONIC_DECAY: f32 = 0.6;
+/// In audio a root's harmonics look much like a major triad, so a single note must beat the
+/// chords by this much before a beat is called no chord.
+const SINGLE_NOTE_MARGIN_AUDIO: f32 = 0.08;
+/// Likewise a power chord (root and fifth) in audio is close to a triad over a strong root; it
+/// must win by this much.
+const POWER_CHORD_MARGIN_AUDIO: f32 = 0.03;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chord {
@@ -154,9 +160,13 @@ pub fn label_beats(beats: &[Beat], change_cost: &[f32], key: Option<Key>, source
                 if in_key[s] {
                     e[s] += KEY_BONUS;
                 }
+                if source == Source::Audio && QUALITIES[s / 12].intervals.len() == 2 {
+                    e[s] -= POWER_CHORD_MARGIN_AUDIO;
+                }
             }
             let single = notes.iter().map(|t| cosine(&beat.chroma, t)).fold(0.0, f32::max);
-            e[NO_CHORD] = NO_CHORD_SCORE.max(single + BASS_BONUS);
+            let margin = if source == Source::Audio { SINGLE_NOTE_MARGIN_AUDIO } else { 0.0 };
+            e[NO_CHORD] = NO_CHORD_SCORE.max(single + BASS_BONUS - margin);
             e
         })
         .collect();

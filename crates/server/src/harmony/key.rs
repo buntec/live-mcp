@@ -1,10 +1,12 @@
-//! Key estimation: correlating a pitch-class profile with the Krumhansl–Kessler key profiles.
+//! Key estimation: correlating a pitch-class profile with Temperley's key profiles.
 
 use super::names::spelling;
 
-/// Krumhansl & Kessler (1982) probe-tone ratings, tonic first.
-const MAJOR_PROFILE: [f32; 12] = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
-const MINOR_PROFILE: [f32; 12] = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+/// Temperley's (2007) profiles from the Kostka–Payne corpus, tonic first. They penalise notes
+/// outside the scale more than Krumhansl & Kessler's probe-tone ratings, which matters for
+/// short loops: one F natural should rule out G major.
+const MAJOR_PROFILE: [f32; 12] = [0.748, 0.060, 0.488, 0.082, 0.670, 0.460, 0.096, 0.715, 0.104, 0.366, 0.057, 0.400];
+const MINOR_PROFILE: [f32; 12] = [0.712, 0.084, 0.474, 0.618, 0.049, 0.460, 0.105, 0.747, 0.404, 0.067, 0.133, 0.330];
 
 /// Softmax temperature over the 24 correlations. A margin of 0.1 in correlation is a factor of
 /// e² ≈ 7 in confidence.

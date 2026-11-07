@@ -6,21 +6,24 @@ use crate::spectrum::Stft;
 const WINDOW_SECONDS: f64 = 0.0213;
 /// Log-magnitude compression, as for chroma.
 const COMPRESSION: f32 = 100.0;
-/// Bins below this are ignored (rumble, DC).
+/// Flux is measured between these frequencies: below is rumble, and above, where pitched sound
+/// has little energy, averaging in many empty bins would dilute its attacks.
 const LOW_HZ: f64 = 30.0;
+const HIGH_HZ: f64 = 6_000.0;
 
 #[derive(Debug)]
 pub struct OnsetMeter {
     stft: Stft,
     previous: Vec<f32>,
-    first_bin: usize,
+    bins: std::ops::Range<usize>,
 }
 
 impl OnsetMeter {
     pub fn new(sample_rate: f64) -> Self {
         let size = ((sample_rate * WINDOW_SECONDS) as usize).next_power_of_two().max(256);
-        let first_bin = ((LOW_HZ * size as f64 / sample_rate).ceil() as usize).max(1);
-        Self { stft: Stft::new(size, size / 4), previous: vec![0.0; size / 2 + 1], first_bin }
+        let bin = |hz: f64| (hz * size as f64 / sample_rate) as usize;
+        let bins = bin(LOW_HZ).max(1)..(bin(HIGH_HZ) + 1).min(size / 2 + 1);
+        Self { stft: Stft::new(size, size / 4), previous: vec![0.0; size / 2 + 1], bins }
     }
 
     /// Forgets the input: the next sound is an onset against silence.
@@ -44,12 +47,13 @@ impl OnsetMeter {
         }
         let power = self.stft.power();
         let mut rise = 0.0f32;
-        for (p, previous) in power.iter().zip(self.previous.iter_mut()).skip(self.first_bin) {
+        let range = self.bins.clone();
+        for (p, previous) in power[range.clone()].iter().zip(&mut self.previous[range.clone()]) {
             let level = (1.0 + COMPRESSION * p.sqrt()).ln();
             rise += (level - *previous).max(0.0);
             *previous = level;
         }
-        Some(rise / (power.len() - self.first_bin) as f32)
+        Some(rise / range.len() as f32)
     }
 }
 

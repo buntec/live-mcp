@@ -1,6 +1,8 @@
 # Hearing harmony and rhythm: design
 
-Status: proposal, 2026-11-07.
+Status: phases 1–4 implemented on branch `hearing-harmony`, 2026-11-07. The
+proposal is kept below; [As built](#as-built) lists where the implementation
+differs and why.
 
 ## Goal
 
@@ -32,15 +34,81 @@ chord recognition on full mixes. Those can come later as an on-request tool (see
 ```
  Ear plugin (audio thread, no alloc)                 MCP server
  ┌─────────────────────────────────────┐   TCP     ┌──────────────────────────────────┐
- │ BarAnalyzer                         │  JSON     │ harmony::interpret               │
- │  ├─ SignalMeter  → BarReport  ──────┼──────────▶│  tuning → chroma12 → key, chords,│
- │  ├─ PitchMeter   ┐                  │           │  pitch classes, rhythm, register,│
- │  └─ OnsetMeter   ┴→ BeatReport ─────┼──────────▶│  scale fit, clashes              │
+ │ BarAnalyzer                         │  JSON     │ harmony::analyze                 │
+ │  └─ SignalMeter  → BarReport  ──────┼──────────▶│  tuning → chroma12 → key, chords,│
+ │ BeatAnalyzer                        │           │  pitch classes, rhythm, register,│
+ │  ├─ PitchMeter   ┐                  │           │  scale fit; harmony::ensemble:   │
+ │  └─ OnsetMeter   ┴→ BeatReport ─────┼──────────▶│  together, clashes, crowding     │
  └─────────────────────────────────────┘           │         ▲              ▲         │
                                                    │ analyze_file      read_clip      │
                                                    │ (same meters)   (notes→chroma)   │
                                                    └──────────────────────────────────┘
 ```
+
+## As built
+
+Where the implementation departs from the proposal below, and why. Most changes
+came from running real and synthesized audio through the whole path.
+
+**Plugin (`crates/analysis`: `pitch.rs`, `onset.rs`, `spectrum.rs`, `beats.rs`)**
+
+- `BeatAnalyzer` is separate from `BarAnalyzer` and follows the transport itself,
+  so the bar code and its API are unchanged. It costs about 0.05% of a core at
+  48 kHz (`examples/throughput.rs`) and never allocates (`tests/no_alloc.rs`).
+- `BeatReport` stores chroma as `[[u8; 3]; 12]` (per pitch class: a third of a
+  semitone flat, in tune, sharp), because serde derives only arrays up to 32.
+- The octaves are Live's octaves 0–6 (C0 = MIDI 24 … B6), and note names
+  everywhere follow Live (C3 = MIDI 60).
+- The treble chroma starts at MIDI 52 (E2 in Live, 165 Hz), not 48, so most bass
+  fundamentals stay out of the chord evidence. The bass chroma is tilted towards
+  low notes (weight 1 at MIDI 24, falling to 0.3 at MIDI 59), so that the lowest
+  note of a voicing beats chord tones above it in the bass range.
+- Onsets come from their own short full-rate STFT (~21 ms window, ~5 ms hop), not
+  from the band filters. The STFT is cheaper and detects attacks better. Flux is
+  averaged over 30 Hz–6 kHz only (pitched attacks were diluted by many empty high
+  bins) and placed on the *nearest* 16th: flux peaks as an attack enters the
+  window, ~10 ms before the frame centre, which floored onto the previous 16th.
+
+**Server (`crates/server/src/harmony/`)**
+
+- Key profiles are Temperley's (Kostka–Payne). Krumhansl–Kessler called a
+  Dm7–G7–Cmaj7–A7 loop G major with 0.9 confidence, because it barely penalises
+  the F natural. A key also needs at least three pitch classes.
+- Tuning comes from parabolic interpolation of the peaks in the 36 treble bins,
+  then a circular mean. A plain circular mean over all bins was too flat after log
+  compression to say anything.
+- Folding to 12 pitch classes assigns each sub-bin to its nearest semitone.
+  Interpolating between two semitones smeared spectral leakage onto neighbours
+  and gave a single sine a key.
+- Each beat's chroma has its median taken out, and a beat counts as pitched only
+  if its strongest pitch class is at least 1.6 × the mean. Swept 808 kicks and
+  noise otherwise came out as "Dm7b5". Subtracting the mean instead of the median
+  pushed triads towards looking like single notes.
+- In audio, a root's harmonics resemble a major triad. So a single note must beat
+  every chord by 0.08 before a beat is called "N", and power chords are
+  handicapped by 0.03. MIDI input stays exact.
+- Audio onsets below 12 (of 255) are ignored: steady tones flutter a little.
+- `pcs` is a compact string ("A 1.0 C 0.8 E 0.7"), ordered by weight; a JSON
+  object would come back sorted by name.
+- `read_clip` on a Drum Rack track reports rhythm only. A clip's bars count from
+  its own beat 0.
+- `listen` takes `focus` ("all", "mix", "music"). Multi-track listens add a
+  `music` section for the counted tracks together (`ensemble.rs`): their key and
+  progression, `clashes`, and `crowded` octaves.
+- `analyze_file` takes `music` (default true). Without a bpm, chords are per
+  quarter of a section and no rhythm grid is given. Snapshots keep their musical
+  reading, and `compare` adds key, progression and per-bar chord and rhythm
+  differences.
+
+**Validation so far.** Unit tests on synthesized signals, including plucked
+sawtooth bands with kick and hats at +20 cents (Am–F–C–G) and in tune
+(Dm7–G7–Cmaj7–A7). End-to-end tests for `read_clip`, `listen` (single and
+multi-track, clashes) and `analyze_file` with `compare`. Sanity runs on a few
+real WAVs (drum loop: rhythm only; bass and pad loops: plausible notes). Ableton's
+Factory Pack loops, which carry key and tempo in their names, are in a format
+neither symphonia nor Core Audio can decode, so a scored real-world test set is
+still to do. The best way to get one is to render labelled loops from Live, or to
+listen to them through the Ear.
 
 ## 1. Plugin features (`crates/analysis`)
 

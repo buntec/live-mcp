@@ -10,12 +10,17 @@ use super::Beat;
 const MIN_TONAL: f32 = 0.3;
 const MIN_LEVEL_DB: f32 = -50.0;
 const MIN_COVERAGE: f32 = 0.25;
+/// A beat's chroma needs its strongest pitch class at least this many times the mean of all 12
+/// to name pitches: sweeps (808 kicks), noise and dense clusters spread energy evenly.
+const MIN_CONTRAST: f32 = 1.6;
 /// Onset strengths below this (on the Ear's 0–255 scale) are the flutter of steady sound, not
 /// attacks.
 pub const ONSET_FLOOR: f32 = 12.0;
 /// Tuning is only reported when the evidence points this consistently one way (resultant
 /// length over total weight, 0–1).
-const MIN_TUNING_AGREEMENT: f32 = 0.2;
+const MIN_TUNING_AGREEMENT: f32 = 0.3;
+/// Treble bins at least this share of the beat's strongest can be peaks for the tuning estimate.
+const PEAK_MIN: f32 = 0.3;
 
 fn amplitude(level_db: f32) -> f32 {
     10f32.powf(level_db / 20.0)
@@ -25,20 +30,30 @@ fn counts(report: &BeatReport) -> bool {
     report.coverage >= MIN_COVERAGE && report.tonal >= MIN_TONAL && report.level_db >= MIN_LEVEL_DB
 }
 
-/// The offset from A = 440 Hz equal temperament, in cents (−50 to 50), from where energy sits
-/// within each semitone: a circular mean over the treble bins of pitched beats.
+/// The offset from A = 440 Hz equal temperament, in cents (−50 to 50). Each peak in the treble
+/// bins (thirds of a semitone, compressed) is located by parabolic interpolation between its
+/// neighbours; the offsets of the peaks within their semitones are then averaged on the circle,
+/// weighted by how strong and pitched the beat is.
 pub fn tuning_cents(reports: &[BeatReport]) -> Option<f32> {
+    const BINS: usize = 12 * SUBBINS;
     let (mut x, mut y, mut total) = (0.0f32, 0.0f32, 0.0f32);
     for report in reports.iter().filter(|r| counts(r)) {
         let weight = amplitude(report.level_db) * report.tonal;
-        for bins in &report.treble {
-            for (j, &v) in bins.iter().enumerate() {
-                let w = weight * v as f32 / 255.0;
-                let angle = 2.0 * std::f32::consts::PI * (j as f32 - 1.0) / SUBBINS as f32;
-                x += w * angle.cos();
-                y += w * angle.sin();
-                total += w;
+        let bins: Vec<f32> = report.treble.iter().flatten().map(|&v| v as f32 / 255.0).collect();
+        for i in 0..BINS {
+            let (before, here, after) = (bins[(i + BINS - 1) % BINS], bins[i], bins[(i + 1) % BINS]);
+            if here < PEAK_MIN || here <= before || here < after {
+                continue;
             }
+            let curve = before - 2.0 * here + after;
+            let shift = if curve < 0.0 { (0.5 * (before - after) / curve).clamp(-0.5, 0.5) } else { 0.0 };
+            // Bin 1 of each semitone is in tune; one bin is a third of a semitone.
+            let cents = (i as f32 + shift - 1.0) * 100.0 / SUBBINS as f32;
+            let angle = 2.0 * std::f32::consts::PI * cents / 100.0;
+            let w = weight * here;
+            x += w * angle.cos();
+            y += w * angle.sin();
+            total += w;
         }
     }
     if total <= 0.0 || (x * x + y * y).sqrt() / total < MIN_TUNING_AGREEMENT {
@@ -61,6 +76,17 @@ fn fold(bins: &[[u8; SUBBINS]; 12], cents: f32) -> [f32; 12] {
     out
 }
 
+/// Chroma with the floor most pitch classes share (the median) taken out, and whether it has clear
+/// peaks at all.
+fn contrast(chroma: [f32; 12]) -> ([f32; 12], bool) {
+    let mean = chroma.iter().sum::<f32>() / 12.0;
+    let max = chroma.iter().copied().fold(0.0, f32::max);
+    let mut sorted = chroma;
+    sorted.sort_by(f32::total_cmp);
+    let median = (sorted[5] + sorted[6]) / 2.0;
+    (chroma.map(|v| (v - median).max(0.0)), max > 0.0 && max >= MIN_CONTRAST * mean)
+}
+
 /// The heard beats, sorted, and the tuning they were folded with.
 pub fn beats(reports: &[BeatReport]) -> (Vec<Beat>, Option<f32>) {
     let tuning = tuning_cents(reports);
@@ -68,14 +94,15 @@ pub fn beats(reports: &[BeatReport]) -> (Vec<Beat>, Option<f32>) {
     let mut beats: Vec<Beat> = reports
         .iter()
         .map(|r| {
-            let chroma = fold(&r.treble, cents);
+            let (chroma, peaked) = contrast(fold(&r.treble, cents));
+            let (bass, _) = contrast(fold(&r.bass, cents));
             Beat {
                 index: r.beat,
                 coverage: r.coverage,
                 weight: amplitude(r.level_db),
-                pitched: counts(r) && chroma.iter().any(|v| *v > 0.0),
+                pitched: counts(r) && peaked,
                 chroma,
-                bass: fold(&r.bass, cents),
+                bass,
                 octaves: r.octaves.map(|v| v as f32 / 255.0),
                 onsets: r.onsets.map(|v| if (v as f32) < ONSET_FLOOR { 0.0 } else { v as f32 }),
                 span: None,
@@ -111,7 +138,7 @@ mod tests {
     #[test]
     fn in_tune_and_sharp_material() {
         let in_tune = [report(0, &[(0, 1), (4, 1), (7, 1)])];
-        assert_eq!(tuning_cents(&in_tune), Some(0.0));
+        assert!(tuning_cents(&in_tune).unwrap().abs() < 0.01);
         let (heard, _) = beats(&in_tune);
         assert_eq!(heard[0].chroma[4], 1.0);
         assert!(heard[0].pitched);
@@ -122,6 +149,102 @@ mod tests {
         assert!((cents - 33.3).abs() < 0.5, "{cents}");
         let (heard, _) = beats(&sharp);
         assert!((heard[0].chroma[7] - 1.0).abs() < 1e-3, "{:?}", heard[0].chroma);
+    }
+
+    /// Four bars at 120 BPM of plucked sawtooth chords (MIDI notes per bar) over a bass an octave
+    /// down, kicks on every beat and hats on the off-beats, detuned by `cents`, through the real
+    /// beat analyzer and the interpreter.
+    fn band(chords: [&[f64]; 4], roots: [f64; 4], cents: f64) -> (crate::harmony::Analysis, Option<f32>) {
+        use std::f64::consts::PI;
+
+        use live_mcp_analysis::{BeatAnalyzer, Transport};
+
+        use crate::harmony::{BarSpan, Section, Source, analyze};
+
+        let sr = 48_000.0f64;
+        let detune = 2f64.powf(cents / 1200.0);
+        let hz = |midi: f64| 440.0 * 2f64.powf((midi - 69.0) / 12.0) * detune;
+        let saw = |f: f64, t: f64| {
+            (1..=16)
+                .filter(|h| f * *h as f64 * 2.0 < sr)
+                .map(|h| (2.0 * PI * f * h as f64 * t).sin() / h as f64)
+                .sum::<f64>()
+        };
+        let mut noise = 0x2545_f491u32;
+        let samples: Vec<f32> = (0..(8.0 * sr) as usize)
+            .map(|n| {
+                let t = n as f64 / sr;
+                let bar = (t / 2.0) as usize;
+                let in_beat = t % 0.5;
+                let pluck = (-in_beat * 4.0).exp();
+                let chord: f64 = chords[bar].iter().map(|&m| saw(hz(m), t)).sum::<f64>() * 0.06 * pluck;
+                let bass = saw(hz(roots[bar]), t) * 0.12 * pluck;
+                let kick = if in_beat < 0.12 {
+                    let f = 50.0 + 70.0 * (-in_beat * 40.0).exp();
+                    (2.0 * PI * f * in_beat).sin() * 0.5 * (-in_beat * 25.0).exp()
+                } else {
+                    0.0
+                };
+                noise ^= noise << 13;
+                noise ^= noise >> 17;
+                noise ^= noise << 5;
+                let hat =
+                    if (0.25..0.265).contains(&in_beat) { (noise as f64 / u32::MAX as f64 - 0.5) * 0.15 } else { 0.0 };
+                (chord + bass + kick + hat) as f32
+            })
+            .collect();
+        let mut analyzer = BeatAnalyzer::new(sr as f32);
+        let mut reports = Vec::new();
+        for (k, block) in samples.chunks(512).enumerate() {
+            let beat = (k * 512) as f64 / sr * 2.0;
+            let t = Transport { playing: true, beat: Some(beat), tempo: Some(120.0), time_signature: Some((4, 4)) };
+            analyzer.process(block, block, &t, &mut |r| reports.push(r));
+        }
+        analyzer.flush(&mut |r| reports.push(r));
+        let (heard, tuning) = beats(&reports);
+        let spans: Vec<BarSpan> =
+            (0..4).map(|i| BarSpan { bar: i + 1, start_beat: i as f64 * 4.0, beats: 4.0 }).collect();
+        (analyze(&Section { bars: &spans, beats: &heard, source: Source::Audio, scale: None }), tuning)
+    }
+
+    #[test]
+    fn a_band_through_the_whole_audio_path() {
+        let chords: [&[f64]; 4] = [&[57.0, 60.0, 64.0], &[53.0, 57.0, 60.0], &[55.0, 60.0, 64.0], &[55.0, 59.0, 62.0]];
+        let (analysis, tuning) = band(chords, [45.0, 41.0, 48.0, 43.0], 20.0);
+        let cents = tuning.expect("a tuning");
+        assert!((cents - 20.0).abs() < 8.0, "tuning {cents}");
+        let s = &analysis.summary;
+        assert_eq!(s["progression"], "Am | F | C | G", "{s:?}");
+        assert!(["C major", "A minor"].contains(&s["key"]["name"].as_str().unwrap()), "{s:?}");
+        let basses: Vec<&str> = analysis.bars.iter().map(|(_, f)| f["bass"].as_str().unwrap()).collect();
+        assert_eq!(basses, ["A", "F", "C", "G"], "{:?}", analysis.bars);
+        // Every beat starts with a pluck and a kick; the hats sit on the off-beat 8ths.
+        let grid = analysis.bars[1].1["rhythm"].as_str().unwrap();
+        assert!(grid.split(' ').all(|beat| beat.starts_with('X')), "{grid}");
+        assert!(grid.split(' ').all(|beat| beat.as_bytes()[2] != b'.'), "{grid}");
+    }
+
+    #[test]
+    fn seventh_chords_through_the_whole_audio_path() {
+        // Dm7 | G7 | Cmaj7 | A7, in tune.
+        let chords: [&[f64]; 4] = [
+            &[57.0, 60.0, 62.0, 65.0],
+            &[53.0, 55.0, 59.0, 62.0],
+            &[55.0, 59.0, 60.0, 64.0],
+            &[55.0, 57.0, 61.0, 64.0],
+        ];
+        let (analysis, tuning) = band(chords, [38.0, 43.0, 36.0, 45.0], 0.0);
+        assert!(tuning.is_none_or(|c| c.abs() < 8.0), "{tuning:?}");
+        let s = &analysis.summary;
+        assert_eq!(s["progression"], "Dm7 | G7 | Cmaj7 | A7", "{s:?} {:?}", analysis.bars);
+        assert!(["C major", "A minor", "D minor"].contains(&s["key"]["name"].as_str().unwrap()), "{s:?}");
+    }
+
+    #[test]
+    fn evenly_spread_chroma_is_not_pitched() {
+        let all: Vec<(usize, usize)> = (0..12).map(|pc| (pc, 1)).collect();
+        let (heard, _) = beats(&[report(0, &all)]);
+        assert!(!heard[0].pitched);
     }
 
     #[test]
