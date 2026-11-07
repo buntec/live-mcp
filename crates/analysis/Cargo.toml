@@ -11,4 +11,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+realfft = "3.5.1"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -2,7 +2,9 @@
 //! rhythm, register and fit with the set's scale. Pure functions over [`Beat`]s, so `read_clip`
 //! (from notes) and the Ear (from audio) share them.
 
+pub mod audio;
 pub mod chords;
+pub mod ensemble;
 pub mod key;
 pub mod midi;
 pub mod names;
@@ -64,7 +66,6 @@ pub struct BarSpan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // `Audio` comes with the Ear's beat reports
 pub enum Source {
     Audio,
     Midi,
@@ -105,6 +106,9 @@ pub struct Analysis {
     pub summary: Map<String, Value>,
     /// Per heard bar: chord(s), bass, pitch classes, rhythm grid, range, tonalness.
     pub bars: Vec<(i64, Map<String, Value>)>,
+    /// The chord on each beat (by beat index), after smoothing.
+    pub chords: std::collections::BTreeMap<i64, Option<chords::Chord>>,
+    pub spelling: Spelling,
 }
 
 fn shape(values: &[f32; 12]) -> [f32; 12] {
@@ -314,7 +318,9 @@ pub fn analyze(section: &Section) -> Analysis {
     if let Some(scale) = section.scale.filter(|_| pitched) {
         summary.insert("scale".into(), scale_fit(section, scale, &ranges, spelling));
     }
-    Analysis { summary, bars }
+    let chords =
+        beats.iter().enumerate().map(|(t, b)| (b.index, if pitched { labels.chord(t) } else { None })).collect();
+    Analysis { summary, bars, chords, spelling }
 }
 
 fn scale_fit(section: &Section, scale: &SetScale, ranges: &[std::ops::Range<usize>], spelling: Spelling) -> Value {
@@ -328,7 +334,7 @@ fn scale_fit(section: &Section, scale: &SetScale, ranges: &[std::ops::Range<usiz
                 .bars
                 .iter()
                 .zip(&bar_profiles)
-                .filter(|(_, p)| p[pc as usize] >= PCS_MIN)
+                .filter(|(_, p)| p[pc as usize] >= OUTSIDE_SCALE_MIN)
                 .map(|(bar, _)| bar.bar)
                 .collect();
             json!({"pc": spelling[pc as usize], "weight": round2(whole[pc as usize]), "bars": bars})

@@ -267,6 +267,14 @@ pub async fn read_clip(live: &Live, params: ReadClipParams) -> Result<Value> {
     Ok(out)
 }
 
+/// The set's scale (Live 12), or `None` if Live has none.
+pub(crate) async fn set_scale(live: &Live) -> Option<SetScale> {
+    let song = Target::path("live_set");
+    let results = live.batch_lenient(vec![get_props(&song, &["root_note", "scale_name", "scale_intervals"])]).await;
+    let props = results.ok()?.into_iter().next()?.ok()?;
+    SetScale::from_song(props.get("root_note"), props.get("scale_name"), props.get("scale_intervals"))
+}
+
 /// The set's scale (Live 12; `None` if Live has none), and whether the track plays a Drum Rack,
 /// whose pitches are pads rather than notes.
 async fn music_context(live: &Live, track: &Target) -> (Option<SetScale>, bool) {

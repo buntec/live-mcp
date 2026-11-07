@@ -114,7 +114,6 @@ pub struct Labels {
 }
 
 impl Labels {
-    #[cfg(test)]
     pub fn chord(&self, beat: usize) -> Option<Chord> {
         Chord::from_state(self.states[beat])
     }

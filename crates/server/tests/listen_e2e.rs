@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use common::Harness;
-use live_mcp_analysis::{BarAnalyzer, BarReport, Transport};
+use live_mcp_analysis::{BarAnalyzer, BarReport, BeatAnalyzer, BeatReport, Transport};
 use live_mcp_bridge::{Bridge, GetOptions};
 use live_mcp_protocol::Target;
 use live_mcp_protocol::ear::{EAR_PROTOCOL_VERSION, EarEndpoint, EarMessage, TAG_MAX};
@@ -34,6 +34,23 @@ fn synthetic_bar(bar: i64, partials: &[(f64, f64)]) -> BarReport {
     let t = Transport { playing: true, beat: Some(start), tempo: Some(120.0), time_signature: Some((4, 4)) };
     analyzer.process(&samples, &samples, &t, &mut |r| out = Some(r));
     out.expect("a full bar")
+}
+
+/// One beat of the sum of sines, as the real analyzer would report it. The sound is steady, so
+/// every beat reads the same apart from its number.
+fn synthetic_beat(partials: &[(f64, f64)]) -> BeatReport {
+    let sr = 48_000.0;
+    let mut analyzer = BeatAnalyzer::new(sr as f32);
+    let samples: Vec<f32> = (0..72_000)
+        .map(|i| {
+            partials.iter().map(|(f, db)| 10f64.powf(db / 20.0) * (2.0 * PI * f * i as f64 / sr).sin()).sum::<f64>()
+                as f32
+        })
+        .collect();
+    let mut reports = Vec::new();
+    let t = Transport { playing: true, beat: Some(0.0), tempo: Some(120.0), time_signature: Some((4, 4)) };
+    analyzer.process(&samples, &samples, &t, &mut |r| reports.push(r));
+    reports.into_iter().find(|r| r.beat == 1).expect("beat 1 of 3")
 }
 
 async fn send(socket: &mut TcpStream, message: &EarMessage) {
@@ -63,6 +80,7 @@ async fn fake_plugin(
         sample_rate: 48_000.0,
     };
     send(&mut socket, &hello).await;
+    let beat_report = synthetic_beat(partials);
     let mut reported: Option<f64> = None;
     loop {
         let value = live.get(&Target::path(tag_param), GetOptions::default()).await.unwrap();
@@ -81,6 +99,9 @@ async fn fake_plugin(
             let first = (start / 4.0).floor() as i64 + 1;
             for bar in first..first + 8 {
                 send(&mut socket, &EarMessage::Bar { tag, report: synthetic_bar(bar, partials) }).await;
+                for beat in (bar - 1) * 4..bar * 4 {
+                    send(&mut socket, &EarMessage::Beat { tag, report: BeatReport { beat, ..beat_report } }).await;
+                }
             }
         }
         reported = from;
@@ -128,6 +149,19 @@ async fn listen_through_an_ear_on_the_master_track() {
     assert_eq!(bar["correlation"], 1.0);
     assert!(bar.get("coverage").is_none(), "full bars carry no coverage field");
     assert_eq!(heard["summary"]["peak"], -12.0);
+    // A single A is no chord and no key, but its pitch class, register and attack are heard.
+    assert_eq!(bar["chord"], "N", "{bar}");
+    assert_eq!(bar["pcs"], "A 1.0", "{bar}");
+    assert_eq!(bar["range"], "C2–B2", "{bar}"); // 220 Hz is A2 in Live
+    assert!(bar["tonal"].as_f64().unwrap() > 0.9, "{bar}");
+    assert_eq!(heard["music"]["key"], Value::Null, "{heard}");
+    assert_eq!(heard["music"]["scale"], json!({"set": "C Major", "outside": []}));
+    // focus "mix" leaves the music out, focus "music" the mix measurements.
+    let mix = h.ok("listen", json!({"start_bar": 20, "bars": 1, "focus": "mix"})).await;
+    assert!(mix.get("music").is_none() && mix["bars"][0].get("chord").is_none(), "{mix}");
+    let music = h.ok("listen", json!({"start_bar": 30, "bars": 1, "focus": "music"})).await;
+    assert!(music.get("summary").is_none() && music["bars"][0].get("lufs").is_none(), "{music}");
+    assert_eq!(music["bars"][0]["pcs"], "A 1.0", "{music}");
     // Each listen is kept as a snapshot; a snapshot compared with itself shows no differences.
     let snapshot = heard["snapshot"].as_str().unwrap().to_owned();
     let same = h.ok("compare", json!({"a": snapshot, "b": snapshot})).await;
@@ -221,6 +255,43 @@ async fn listens_to_several_tracks_and_finds_shared_bands() {
     assert!(heard.get("masking").is_none() && heard["masking_note"].is_string());
     let e = h.err("listen", json!({"tracks": [0, "Nope"]})).await;
     assert!(e.contains("no track named"), "{e}");
+    for plugin in plugins {
+        plugin.abort();
+    }
+}
+
+#[tokio::test]
+async fn hears_chords_and_clashes_between_tracks() {
+    let Some(h) = Harness::start().await else { return };
+    // An F major triad on one track, F# on the other: the F and F# rub a semitone apart in the
+    // same octave. (In F major the F# is spelled Gb.)
+    const PAD: &[(f64, f64)] = &[(174.61, -18.0), (220.0, -18.0), (261.63, -18.0)];
+    const RUB: &[(f64, f64)] = &[(185.0, -18.0)];
+    let ear = json!(["plugins", "live-mcp", "LiveMCP Ear"]);
+    for track in [0, 1] {
+        h.ok("load_device", json!({"track": track, "path": ear})).await;
+    }
+    let mut plugins = Vec::new();
+    for (param, instance, partials) in [
+        ("live_set tracks 0 devices 1 parameters 1 value", 1, PAD),
+        ("live_set tracks 1 devices 0 parameters 1 value", 2, RUB),
+    ] {
+        plugins.push(tokio::spawn(fake_plugin(h.state_dir(), h.fake.connect().await, param, instance, partials)));
+    }
+    let heard = h.ok("listen", json!({"tracks": [0, 1], "start_bar": 1, "bars": 2, "focus": "music"})).await;
+    let pad = &heard["tracks"][0];
+    assert_eq!(pad["music"]["progression"], "F | F", "{pad}");
+    assert_eq!(pad["bars"][0]["chord"], "F", "{pad}");
+    let together = &heard["music"];
+    assert_eq!(together["tracks"], json!(["1-MIDI", "2-Audio"]), "{together}");
+    assert_eq!(
+        together["clashes"],
+        json!([{"tracks": ["1-MIDI", "2-Audio"], "notes": "F against Gb", "bars": "1–2", "beats": 8}]),
+        "{together}"
+    );
+    assert_eq!(together["scale"]["outside"][0]["pc"], "Gb", "{together}");
+    assert_eq!(together["rhythm"]["density"], 0.0, "steady tones have no onsets: {together}");
+    assert!(heard.get("masking").is_none(), "focus music leaves masking out");
     for plugin in plugins {
         plugin.abort();
     }

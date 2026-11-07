@@ -1,6 +1,7 @@
-//! Per-block work, independent of the plugin framework: measure bars and emit heartbeats.
+//! Per-block work, independent of the plugin framework: measure bars and beats, and emit
+//! heartbeats.
 
-use live_mcp_analysis::{BarAnalyzer, BarReport, Transport};
+use live_mcp_analysis::{BarAnalyzer, BarReport, BeatAnalyzer, BeatReport, Transport};
 use live_mcp_protocol::ear::EarMessage;
 
 /// Heartbeats per second. They tell the server the instance is alive and which tag it has.
@@ -11,6 +12,7 @@ const HEARTBEATS_PER_SECOND: f64 = 4.0;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EarTask {
     Bar { tag: u32, report: BarReport },
+    Beat { tag: u32, report: BeatReport },
     Heartbeat { tag: u32, playing: bool, beat: Option<f64> },
 }
 
@@ -18,6 +20,7 @@ impl EarTask {
     pub fn into_message(self) -> EarMessage {
         match self {
             EarTask::Bar { tag, report } => EarMessage::Bar { tag, report },
+            EarTask::Beat { tag, report } => EarMessage::Beat { tag, report },
             EarTask::Heartbeat { tag, playing, beat } => EarMessage::Heartbeat { tag, playing, beat },
         }
     }
@@ -25,6 +28,7 @@ impl EarTask {
 
 pub struct EarCore {
     analyzer: BarAnalyzer,
+    beats: BeatAnalyzer,
     heartbeat_every: usize,
     since_heartbeat: usize,
     last_tag: Option<u32>,
@@ -34,6 +38,7 @@ impl EarCore {
     pub fn new(sample_rate: f32) -> Self {
         Self {
             analyzer: BarAnalyzer::new(sample_rate),
+            beats: BeatAnalyzer::new(sample_rate),
             heartbeat_every: (sample_rate as f64 / HEARTBEATS_PER_SECOND) as usize,
             since_heartbeat: usize::MAX, // send one straight away
             last_tag: None,
@@ -42,6 +47,7 @@ impl EarCore {
 
     pub fn reset(&mut self) {
         self.analyzer.reset();
+        self.beats.reset();
         self.since_heartbeat = usize::MAX;
     }
 
@@ -55,6 +61,7 @@ impl EarCore {
         emit: &mut impl FnMut(EarTask),
     ) {
         self.analyzer.process(left, right, transport, &mut |report| emit(EarTask::Bar { tag, report }));
+        self.beats.process(left, right, transport, &mut |report| emit(EarTask::Beat { tag, report }));
         self.since_heartbeat = self.since_heartbeat.saturating_add(left.len());
         if self.since_heartbeat >= self.heartbeat_every || self.last_tag != Some(tag) {
             self.since_heartbeat = 0;
@@ -89,6 +96,7 @@ mod tests {
     fn bars_carry_the_current_tag() {
         let mut core = EarCore::new(48_000.0);
         let mut bars = Vec::new();
+        let mut beats = Vec::new();
         let block = [0.1f32; 4_800];
         for k in 0..20 {
             // 240 BPM: a 4/4 bar lasts 1 s, 10 blocks.
@@ -98,12 +106,14 @@ mod tests {
                 tempo: Some(240.0),
                 time_signature: Some((4, 4)),
             };
-            core.process(&block, &block, &t, 3, &mut |task| {
-                if let EarTask::Bar { tag, report } = task {
-                    bars.push((tag, report.bar));
-                }
+            core.process(&block, &block, &t, 3, &mut |task| match task {
+                EarTask::Bar { tag, report } => bars.push((tag, report.bar)),
+                EarTask::Beat { tag, report } => beats.push((tag, report.beat)),
+                EarTask::Heartbeat { .. } => {}
             });
         }
         assert_eq!(bars, [(3, 1), (3, 2)]);
+        // Each beat once its spectrum frames are in; the last one or two are still open.
+        assert_eq!(beats[..6], [(3, 0), (3, 1), (3, 2), (3, 3), (3, 4), (3, 5)]);
     }
 }
