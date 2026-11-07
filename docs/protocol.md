@@ -149,7 +149,7 @@ property that takes a string, such as a track name, keeps the string.
 | `batch` | `ops: [{method, params}]`, `stop_on_error?` (default true), `undo_step?` | `{"results": [{"ok": true, "result"} \| {"ok": false, "error"}]}` |
 | `observe` | `target`, `prop` | `{subscription, object, value?, existing?}` |
 | `unobserve` | `subscriptions?` (default: all) | `{removed, unknown}` |
-| `events` | | `{events: [{subscription, seq, tick, time, value?, own?}], dropped}` |
+| `events` | | `{events: [{subscription, seq, tick, time, value?}], dropped}` |
 
 `batch` runs all of its ops in one main-thread job, back to back. With
 `undo_step: true`, they are wrapped in `song.begin_undo_step()` /
@@ -169,11 +169,15 @@ with `events`:
   encoded like a `get` result. `value` is absent when the observable has no
   property of that name: a clip's `notes` has a listener but no `notes`
   property, so read the notes yourself.
-- **Own changes.** `own: true` marks a listener that fired while one of this
-  connection's own requests was running, as when a `set` of `tempo` fires the
-  `tempo` listener. Live applies some changes on a later tick, such as
-  `start_playing` or setting `current_song_time`. Their listeners fire outside
-  the request, so the event has no `own`.
+- **Timing.** Live calls listeners on a later tick, not during the change.
+  Measured on Live 12.4.16, a `set` of `tempo` or of a track's `name` fires its
+  listener on the next tick, after the response has been sent. The value is
+  read at that moment, so changes made within one tick may be reported with
+  the latest value.
+- **No sender.** Events include every change, whoever made it: the user,
+  automation, playback, this connection or another one. Nothing in Live's
+  notification says who caused it, and the timing rules out inferring it from
+  the running request.
 - **Objects, not paths.** A listener is attached to the object the target
   resolved to. If tracks are reordered, it keeps watching the same track. When
   the object is deleted, its listeners go with it and fire no more. `unobserve`
@@ -181,9 +185,8 @@ with `events`:
 - **Duplicates.** Observing the same property of the same object again on the
   same connection returns the existing subscription with `existing: true`.
 - **Scope.** Subscriptions belong to the connection. They end when it closes,
-  and a new connection, even one from the same client, starts with none. Other
-  connections' changes are not `own`. `observe`, `unobserve` and `events` can't
-  run inside a `batch`.
+  and a new connection, even one from the same client, starts with none.
+  `observe`, `unobserve` and `events` can't run inside a `batch`.
 - **Limits.** A connection can hold at most 500 subscriptions (beyond that,
   `-32004`) and 10 000 unread events. Past that, the oldest events are discarded
   and counted in `dropped`. `seq` increases across all events, so a gap within

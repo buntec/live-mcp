@@ -231,9 +231,6 @@ pub struct Event {
     /// the observable has no property of that name (a clip's `notes`); `Some(Null)` is a null value.
     #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub value: Option<Value>,
-    /// The listener fired while one of this connection's own requests was running.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub own: bool,
 }
 
 /// The result of `events`: the connection's unread events, oldest first.
@@ -304,13 +301,11 @@ mod tests {
     fn event_distinguishes_null_from_absent_values() {
         let events: Events = serde_json::from_value(json!({"events": [
             {"subscription": 1, "seq": 1, "tick": 5, "time": 1.5, "value": null},
-            {"subscription": 2, "seq": 2, "tick": 5, "time": 1.5, "own": true},
+            {"subscription": 2, "seq": 2, "tick": 5, "time": 1.5},
         ]}))
         .unwrap();
         assert_eq!(events.events[0].value, Some(Value::Null));
-        assert!(!events.events[0].own);
         assert_eq!(events.events[1].value, None);
-        assert!(events.events[1].own);
         assert_eq!(events.dropped, 0);
     }
 

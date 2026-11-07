@@ -345,7 +345,17 @@ async fn batch_ops_can_target_earlier_results() {
     assert_eq!(err.code(), Some(codes::INVALID_PARAMS), "result targets only work inside a batch");
 }
 
-/// Polls `events` until at least `n` events arrived (they can fire on a later tick).
+/// Waits until Live's main thread has ticked twice. Like Live, the fake calls listeners on
+/// the tick after a change, so by then every earlier change has been queued.
+async fn settle(live: &Bridge) {
+    let ticks = |status: Value| status["ticks"].as_u64().unwrap();
+    let start = ticks(live.status().await.unwrap());
+    while ticks(live.status().await.unwrap()) < start + 2 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Polls `events` until at least `n` events arrived.
 async fn wait_for_events(live: &Bridge, n: usize) -> Vec<live_mcp_protocol::Event> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut events = Vec::new();
@@ -382,22 +392,24 @@ async fn observe_reports_changes_with_values() {
     live.set(&path("live_set"), "tempo", json!(128.0)).await.unwrap();
     live.set(&path("live_set"), "tempo", json!(128.0)).await.unwrap(); // unchanged: no event
     live.set(&path("live_set tracks 1"), "mute", json!(true)).await.unwrap();
+    settle(&live).await;
     let events = live.events().await.unwrap().events;
     assert_eq!(events.len(), 2, "{events:?}");
-    assert_eq!((events[0].subscription, events[0].value.clone(), events[0].own), (tempo_sub, Some(json!(128.0)), true));
+    assert_eq!((events[0].subscription, events[0].value.clone()), (tempo_sub, Some(json!(128.0))));
     assert_eq!((events[1].subscription, events[1].value.clone()), (mute, Some(json!(true))));
     assert!(events[0].seq < events[1].seq);
     assert!(live.events().await.unwrap().events.is_empty(), "events are taken once");
 
-    // Transport changes apply on a later tick, outside the request that asked for them.
+    // Transport changes apply on a later tick, and their listeners fire after that.
     live.call(&path("live_set"), "start_playing", vec![]).await.unwrap();
     let events = wait_for_events(&live, 1).await;
     assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!((events[0].subscription, events[0].value.clone(), events[0].own), (playing, Some(json!(true)), false));
+    assert_eq!((events[0].subscription, events[0].value.clone()), (playing, Some(json!(true))));
 
     // A listener follows the object, not the path it was found by.
     live.call(&path("live_set"), "create_midi_track", vec![json!(0)]).await.unwrap();
     live.set(&path("live_set tracks 2"), "mute", json!(false)).await.unwrap();
+    settle(&live).await;
     let events = live.events().await.unwrap().events;
     assert_eq!(events.iter().map(|e| e.subscription).collect::<Vec<_>>(), [mute]);
 }
@@ -414,6 +426,7 @@ async fn observables_without_a_property_and_errors() {
     assert!(notes.get("value").is_none(), "{notes}");
     let note = new_live_object("Clip.MidiNoteSpecification", json!({"pitch": 60, "start_time": 0.0, "duration": 1.0}));
     live.call(&clip, "add_new_notes", vec![tuple(vec![note])]).await.unwrap();
+    settle(&live).await;
     let events = live.events().await.unwrap().events;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].value, None);
@@ -443,18 +456,20 @@ async fn unobserve_and_connections_keep_subscriptions_apart() {
     let b_tempo = b.observe(&path("live_set"), "tempo").await.unwrap()["subscription"].as_u64().unwrap();
     assert_ne!(a_tempo, b_tempo, "each connection gets its own subscription");
 
+    // Both connections see the change, whichever made it.
     b.set(&path("live_set"), "tempo", json!(100.0)).await.unwrap();
-    let seen_by_a = a.events().await.unwrap().events;
-    assert_eq!(seen_by_a.len(), 1);
-    assert!(!seen_by_a[0].own, "b's request is not a's own");
-    assert!(b.events().await.unwrap().events[0].own);
+    settle(&b).await;
+    assert_eq!(a.events().await.unwrap().events.len(), 1);
+    assert_eq!(b.events().await.unwrap().events.len(), 1);
 
     // Unobserving discards unread events of that subscription.
     a.set(&path("live_set tracks 0"), "name", json!("Lead")).await.unwrap();
+    settle(&a).await;
     let removed = a.unobserve(Some(&[a_name, 999])).await.unwrap();
     assert_eq!(removed, json!({"removed": [a_name], "unknown": [999]}));
     assert!(a.events().await.unwrap().events.is_empty());
     a.set(&path("live_set tracks 0"), "name", json!("Keys")).await.unwrap();
+    settle(&a).await;
     assert!(a.events().await.unwrap().events.is_empty());
 
     // A closed connection's listeners are removed.

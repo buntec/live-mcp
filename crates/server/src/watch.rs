@@ -249,9 +249,6 @@ fn describe_event(event: &Event, watch: Option<&Watch>, now: f64) -> Value {
         out.insert("value".into(), value.clone());
     }
     out.insert("ago_ms".into(), json!(((now - event.time) * 1000.0).max(0.0).round() as u64));
-    if event.own {
-        out.insert("own".into(), json!(true));
-    }
     Value::Object(out)
 }
 

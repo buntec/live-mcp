@@ -254,7 +254,6 @@ class LiveMCP(ControlSurface):
         self._code_hash = _CODE_HASH
         self._registry = collections.OrderedDict()
         self._batch_results = None  # results so far while a batch runs
-        self._handling = None  # the client whose request is running, if any
         self._next_subscription = 1
         self._event_seq = 0
         self._server = None
@@ -486,7 +485,6 @@ class LiveMCP(ControlSurface):
         params = request.get("params")
         if params is None:
             params = {}
-        self._handling = client
         try:
             if not isinstance(params, dict):
                 raise RpcError(ERR_INVALID_PARAMS, "params must be an object")
@@ -511,8 +509,6 @@ class LiveMCP(ControlSurface):
         except Exception as exc:
             self._queue(client, {"jsonrpc": "2.0", "id": req_id,
                                  "error": self._live_error(exc, params)})
-        finally:
-            self._handling = None
 
     def _hello(self, params):
         token = params.get("token")
@@ -602,8 +598,6 @@ class LiveMCP(ControlSurface):
         readable, value = self._observed_value(sub.obj, sub.prop)
         if readable:
             event["value"] = value
-        if self._handling is client:
-            event["own"] = True  # fired while this connection's own request was running
         if len(client.events) == client.events.maxlen:
             client.dropped += 1
         client.events.append(event)

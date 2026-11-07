@@ -47,6 +47,7 @@ def main():
     song = c_instance.song()
     while not stop.is_set():
         song._tick()
+        Live.fire_listeners()
         script.update_display()
         time.sleep(0.01)
     script.disconnect()

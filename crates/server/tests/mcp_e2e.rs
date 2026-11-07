@@ -320,13 +320,14 @@ async fn observe_and_events() {
 
     h.ok("set", json!({"target": "live_set", "prop": "tempo", "value": 125})).await;
     h.ok("set", json!({"target": "live_set", "prop": "tempo", "value": 126})).await;
+    // Like Live, the fake calls listeners on a later tick.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let got = h.ok("events", json!({})).await;
     let events = got["events"].as_array().unwrap();
     assert_eq!(events.len(), 2, "{got}");
     assert_eq!(events[1]["target"], "live_set");
     assert_eq!(events[1]["prop"], "tempo");
     assert_eq!(events[1]["value"], 126.0);
-    assert_eq!(events[1]["own"], true);
     assert!(events[1]["ago_ms"].as_u64().is_some());
     assert_eq!(got["watching"].as_array().unwrap().len(), 2);
 
@@ -334,12 +335,13 @@ async fn observe_and_events() {
     for bpm in [90, 91, 92] {
         h.ok("set", json!({"target": "live_set", "prop": "tempo", "value": bpm})).await;
     }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let got = h.ok("events", json!({"latest_only": true})).await;
     assert_eq!(
         got["events"],
         json!([{
             "subscription": tempo, "target": "live_set", "prop": "tempo", "value": 92.0,
-            "ago_ms": got["events"][0]["ago_ms"], "own": true, "changes": 3
+            "ago_ms": got["events"][0]["ago_ms"], "changes": 3
         }])
     );
 

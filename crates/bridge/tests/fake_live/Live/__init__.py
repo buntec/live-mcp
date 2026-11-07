@@ -32,7 +32,19 @@ class LiveObject(object):
         return id(self)
 
     def _notify(self, prop):
-        for callback in list(getattr(self, "_listeners", {}).get(prop, ())):
+        # Live 12.4 calls listeners on a later tick, not during the change: queue it.
+        _pending.append((self, prop))
+
+
+_pending = []
+
+
+def fire_listeners():
+    """Called by the test runner once per tick: calls the listeners of the changes
+    queued since the last tick, as connected now, reading values as they are now."""
+    while _pending:
+        obj, prop = _pending.pop(0)
+        for callback in list(obj.__dict__.get("_listeners", {}).get(prop, ())):
             callback()
 
 
@@ -40,7 +52,8 @@ def observable(cls, *props):
     """Give `cls` Live's add_/remove_/<prop>_has_listener methods for each prop.
 
     Like Live, adding the same callable twice or removing one that is not
-    connected raises. `LiveObject._notify(prop)` calls the listeners.
+    connected raises. `LiveObject._notify(prop)` queues a call to the listeners
+    for the next tick.
     """
     for prop in props:
         def add(self, callback, prop=prop):

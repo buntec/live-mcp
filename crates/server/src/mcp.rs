@@ -53,7 +53,7 @@ e.g. a section before and after an edit, or your mix against a reference.
 To notice changes made in Live (by the user, automation or playback), `observe` properties that \
 `describe` lists as observable, such as live_set's tempo and is_playing or a track's mute and name, \
 then call `events` for what changed since the last call (`wait_ms` waits for the next change). \
-Changes that fired during your own calls are marked own: true.
+Events include changes your own calls made; nothing marks who made a change.
 
 Live answers on its UI ticks (about 10 per second). The first call after a pause waits up to \
 ~100 ms; calls that follow quickly are fast. A call that times out may still have been applied: \
@@ -305,8 +305,7 @@ impl LiveServer {
 
     #[tool(
         description = "Changes to observed properties since the last call, oldest first: the value after each change \
-                       and how long ago it happened. own: true marks changes that fired during one of this server's \
-                       own requests. wait_ms waits for the first change if there is none yet; latest_only keeps one \
+                       and how long ago it happened, including changes this server made. wait_ms waits for the first change if there is none yet; latest_only keeps one \
                        entry per subscription (useful for fast-changing values such as current_song_time)."
     )]
     async fn events(&self, Parameters(p): Parameters<EventsParams>) -> ToolResult {
