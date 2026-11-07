@@ -19,7 +19,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
 use crate::live::{
-    Live, Track, TrackRef, call, default_true, field_bool, field_f64, field_str, get_fields, get_props, items, set,
+    Live, Track, TrackKind, TrackRef, call, default_true, field_f64, field_str, get_fields, get_props, items, set,
 };
 use crate::masking;
 use crate::snapshots::{Kind, SnapshotStore};
@@ -486,37 +486,113 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
         return Ok(out);
     }
 
-    // Several tracks: names, mute state and fader gain (the Ear hears the signal before the fader).
-    let mut ops = Vec::new();
-    for (track, _) in &targets {
-        ops.push(get_fields(&track.target, &["name", "mute"]));
-        ops.push(get_fields(&track.target.join("mixer_device volume"), &["value"]));
-    }
-    let info = live.batch_lenient(ops).await?;
-    let volumes: Vec<Option<f64>> =
-        info.iter().skip(1).step_by(2).map(|v| v.as_ref().ok().and_then(|v| field_f64(v, "value"))).collect();
-    let ops = targets
-        .iter()
-        .zip(&volumes)
-        .map(|((track, _), value)| {
-            call(&track.target.join("mixer_device volume"), "str_for_value", vec![json!(value.unwrap_or(0.85))])
+    // Several tracks. How each reaches the mix: mute and solo, where its audio goes, and the
+    // faders after the Ear (its own and those of the tracks its audio passes through).
+    const SWITCHES: &[&str] = &["name", "mute", "solo", "muted_via_solo", "group_track", "is_foldable"];
+    let layout = live
+        .batch_lenient(vec![
+            get_fields(&Target::path("live_set tracks"), SWITCHES),
+            get_fields(&Target::path("live_set return_tracks"), SWITCHES),
+            get_fields(&Target::path("live_set master_track"), &["name"]),
+        ])
+        .await?;
+    let listed = |k: usize| layout.get(k).and_then(|r| r.as_ref().ok()).cloned().unwrap_or_default();
+    let (tracks, returns) = (listed(0), listed(1));
+    let regular = items(&tracks).len();
+    let strip_target = |k: usize| {
+        if k < regular { Track::regular(k).target } else { Track::return_track(k - regular).target }
+    };
+    let ops = (0..regular + items(&returns).len())
+        .map(|k| {
+            get_props(&strip_target(k).join("output_routing_type"), &["display_name", "category", "attached_object"])
         })
         .collect();
-    let displays = live.batch_lenient(ops).await?;
+    let routes: Vec<Value> = live.batch_lenient(ops).await?.into_iter().map(|r| r.unwrap_or_default()).collect();
+    let mixer = masking::Mixer::from_live(&tracks, &returns, &routes, &listed(2));
+    let master_name = field_str(&listed(2), "name").to_owned();
+    let strip_of = |track: &Track| match track.kind {
+        TrackKind::Regular(i) => Some(i),
+        TrackKind::Return(r) => Some(regular + r),
+        TrackKind::Master => None,
+    };
+    // Faders by strip index; MASTER stands for the master track's.
+    const MASTER: usize = usize::MAX;
+    let strip_target = |k: usize| if k == MASTER { Track::master().target } else { strip_target(k) };
+    let strips: Vec<Option<usize>> = targets.iter().map(|(t, _)| strip_of(t)).collect();
+    // Every fader between a listened-to Ear and the mix.
+    let mut faders: Vec<usize> = Vec::new();
+    for k in &strips {
+        let chain = match k {
+            Some(k) => mixer.route(*k).0,
+            None => vec![MASTER],
+        };
+        for f in chain {
+            if !faders.contains(&f) {
+                faders.push(f);
+            }
+        }
+    }
+    let ops = faders.iter().map(|&f| get_fields(&strip_target(f).join("mixer_device volume"), &["value"])).collect();
+    let values = live.batch_lenient(ops).await?;
+    let ops = faders
+        .iter()
+        .zip(&values)
+        .map(|(&f, value)| {
+            let value = value.as_ref().ok().and_then(|v| field_f64(v, "value")).unwrap_or(0.85);
+            call(&strip_target(f).join("mixer_device volume"), "str_for_value", vec![json!(value)])
+        })
+        .collect();
+    let displays: HashMap<usize, String> = faders
+        .iter()
+        .zip(live.batch_lenient(ops).await?)
+        .map(|(&f, d)| (f, d.ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| "0 dB".into())))
+        .collect();
+
+    let heard_bars: Vec<Vec<BarReport>> = heard.iter().map(|h| h.values().copied().collect()).collect();
+    // Gain from a track's Ear to the mix: its fader and those of the tracks it plays through.
+    let gain_of = |s: usize| -> Option<f64> {
+        mixer.route(s).0.iter().map(|f| displays.get(f).map_or(Some(0.0), |d| parse_db(d))).sum()
+    };
+    // The tracks whose Ears heard something that reaches the mix.
+    let voices: Vec<usize> = strips
+        .iter()
+        .enumerate()
+        .filter_map(|(k, s)| s.map(|s| (k, s)))
+        .filter(|&(k, s)| {
+            mixer.silenced(s).is_none() && gain_of(s).is_some() && masking::heard_anything(&heard_bars[k])
+        })
+        .map(|(_, s)| s)
+        .collect();
 
     let mut entries = Vec::new();
     let mut hearings = Vec::new();
     let mut missing_any = Vec::new();
     for (k, (track, _)) in targets.iter().enumerate() {
-        let props = info[2 * k].as_ref().ok().cloned().unwrap_or_default();
-        let name = field_str(&props, "name").to_owned();
-        let muted = field_bool(&props, "mute") == Some(true);
-        let display = displays[k].as_ref().ok().and_then(|v| v.as_str()).unwrap_or("0 dB").to_owned();
-        let gain_db = parse_db(&display);
+        let strip = strips[k].and_then(|s| mixer.strips.get(s).map(|strip| (s, strip)));
+        let name = strip.map_or(master_name.clone(), |(_, strip)| strip.name.clone());
+        let fader = strips[k].unwrap_or(MASTER);
         let reports: Vec<&BarReport> = heard[k].values().collect();
-        let mut entry = json!({"track": track.label(), "name": name, "volume": display});
-        if muted {
-            entry["muted"] = json!(true);
+        let mut entry = json!({
+            "track": track.label(),
+            "name": name,
+            "volume": displays.get(&fader).map_or("0 dB", String::as_str),
+        });
+        if let Some((_, strip)) = strip {
+            for (flag, on) in [("muted", strip.mute), ("solo", strip.solo)] {
+                if on {
+                    entry[flag] = json!(true);
+                }
+            }
+            if let Some(g) = strip.group {
+                entry["group"] = json!(mixer.strips[g].name);
+            }
+            // Where the audio goes, unless it is the usual place (its group, or Main).
+            match &strip.out {
+                masking::Out::Strip(j) if Some(*j) != strip.group => entry["output"] = json!(mixer.strips[*j].name),
+                masking::Out::Main if strip.group.is_some() => entry["output"] = json!(master_name),
+                masking::Out::Elsewhere(name) => entry["output"] = json!(name),
+                _ => {}
+            }
         }
         if !reports.is_empty() {
             entry["summary"] = summary(&reports);
@@ -530,14 +606,21 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
         }
         entries.push(entry);
         // The master Ear hears the sum of everything; it is not one of the voices.
-        if track.kind != crate::live::TrackKind::Master {
-            hearings.push((track.label(), name, gain_db, muted, k));
-        }
+        let Some((s, _)) = strip else { continue };
+        // Muted, silenced by solo, or not reaching Main; then −∞ and nothing heard (which
+        // `analyze` reports); then a signal another Ear already counts.
+        let left_out = mixer.silenced(s).or_else(|| voices.contains(&s).then(|| mixer.overlap(s, &voices)).flatten());
+        hearings.push((track.label(), name, gain_of(s), left_out, k));
     }
-    let heard_bars: Vec<Vec<BarReport>> = heard.iter().map(|h| h.values().copied().collect()).collect();
     let voices: Vec<masking::Heard<'_>> = hearings
         .into_iter()
-        .map(|(label, name, gain_db, muted, k)| masking::Heard { label, name, gain_db, muted, bars: &heard_bars[k] })
+        .map(|(label, name, gain_db, left_out, k)| masking::Heard {
+            label,
+            name,
+            gain_db,
+            left_out,
+            bars: &heard_bars[k],
+        })
         .collect();
 
     let mut out = json!({"tempo": tempo, "bars": range, "tracks": entries});

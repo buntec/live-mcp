@@ -73,6 +73,23 @@ class ClipSlot(LiveObject):
             self._clip._is_playing = False
 
 
+class RoutingType(LiveObject):
+    """Where a track's output goes, like Live's Track.RoutingType. Categories as in Live's
+    RoutingTypeCategory: 0 external, 3 master, 4 track, 5 parent group track, 6 none."""
+
+    def __init__(self, display_name, category, attached_object=None):
+        self._display_name = display_name
+        self._category = category
+        self._attached_object = attached_object
+
+    display_name = property(lambda self: (guard(), self._display_name)[1])
+    category = property(lambda self: (guard(), self._category)[1])
+    attached_object = property(lambda self: (guard(), self._attached_object)[1])
+
+    def _key(self):
+        return (self._display_name, self._category, id(self._attached_object))
+
+
 class Track(LiveObject):
     class View(LiveObject):
         """Nested class, like Live's Track.View."""
@@ -88,6 +105,9 @@ class Track(LiveObject):
         self._clip_slots = [ClipSlot(self) for _ in range(slots)] if kind == "track" else []
         self._arrangement_clips = []
         self._mixer_device = MixerDevice()
+        self._group = None  # the group Track this one is in
+        self._song = None  # set by the Song that holds this track
+        self._output = None  # a chosen RoutingType; None for the default (its group, or Main)
 
     name = _prop("name", True, _str)
     mute = _prop("mute", True, _bool)
@@ -109,7 +129,91 @@ class Track(LiveObject):
 
     has_midi_input = property(lambda self: (guard(), self._is_midi and self._kind == "track")[1])
     has_audio_input = property(lambda self: (guard(), not self._is_midi and self._kind == "track")[1])
-    is_foldable = property(lambda self: (guard(), False)[1])
+    is_foldable = property(lambda self: (guard(), self._kind == "group")[1])
+    is_grouped = property(lambda self: (guard(), self._group is not None)[1])
+    group_track = property(lambda self: (guard(), self._group)[1])
+
+    def _default_output(self):
+        if self._group is not None:
+            return RoutingType("Group", 5)
+        return RoutingType("Main", 3, self._song._master_track)
+
+    def _output_types(self):
+        song = self._song
+        types = [RoutingType("Ext. Out", 0), RoutingType("Main", 3, song._master_track)]
+        if self._group is not None:
+            types.append(RoutingType("Group", 5))
+        if self._kind != "return":
+            types += [RoutingType(t._name, 4, t) for t in song._tracks if t is not self and t is not self._group]
+        types.append(RoutingType("Sends Only", 6))
+        return types
+
+    def _no_master(self):
+        if self._kind == "master":
+            raise RuntimeError("Not available on the master track")
+
+    @property
+    def output_routing_type(self):
+        guard()
+        self._no_master()
+        return self._output or self._default_output()
+
+    @output_routing_type.setter
+    def output_routing_type(self, value):
+        guard()
+        self._no_master()
+        if not isinstance(value, RoutingType) or value._key() not in [t._key() for t in self._output_types()]:
+            raise ValueError("Invalid routing type")
+        self._output = None if value._key() == self._default_output()._key() else value
+
+    @property
+    def available_output_routing_types(self):
+        guard()
+        self._no_master()
+        return tuple(self._output_types())
+
+    def _destination(self):
+        """The track this one's audio flows into, or None for Main or nowhere."""
+        output = self._output or self._default_output()
+        if output._category == 5:
+            return self._group
+        if output._category == 4:
+            return output._attached_object
+        return None
+
+    @property
+    def muted_via_solo(self):
+        # Solo in Place, as Live does by default: a track plays if it is soloed, sits in a
+        # soloed group, or carries the signal of a soloed track; the returns play on unless a
+        # return is soloed.
+        guard()
+        if self._kind == "master":
+            return False
+        song = self._song
+        everything = song._tracks + song._return_tracks
+        if not any(t._solo for t in everything):
+            return False
+        if self._kind == "return":
+            return not self._solo and any(t._solo for t in song._return_tracks)
+
+        def ancestors(track):
+            out, at = [], track._group
+            while at is not None and at not in out:
+                out.append(at)
+                at = at._group
+            return out
+
+        def downstream(track):
+            out, at = [], track._destination()
+            while at is not None and at not in out:
+                out.append(at)
+                at = at._destination()
+            return out
+
+        if self._solo or any(g._solo for g in ancestors(self)):
+            return False
+        return not any(t._solo and self in downstream(t) for t in song._tracks)
+
     devices = property(lambda self: (guard(), tuple(self._devices))[1])
     mixer_device = property(lambda self: (guard(), self._mixer_device)[1])
     clip_slots = property(lambda self: (guard(), tuple(self._clip_slots))[1])
@@ -171,6 +275,8 @@ class Song(LiveObject):
         self._return_tracks = [Track("A-Reverb", is_midi=False, kind="return")]
         self._return_tracks[0]._devices.append(Device.effect("Reverb"))
         self._master_track = Track("Main", is_midi=False, kind="master")
+        for track in self._tracks + self._return_tracks + [self._master_track]:
+            track._song = self
         self._scenes = [Scene(""), Scene("Drop")]
         self._view = SongView(self)
         self._tempo = 120.0
@@ -264,9 +370,12 @@ class Song(LiveObject):
     def create_return_track(self):
         guard()
         letter = chr(ord("A") + len(self._return_tracks))
-        self._return_tracks.append(Track("%s-Return" % letter, is_midi=False, kind="return"))
+        track = Track("%s-Return" % letter, is_midi=False, kind="return")
+        track._song = self
+        self._return_tracks.append(track)
 
     def _insert(self, track, index):
+        track._song = self
         if index < 0:
             self._tracks.append(track)
         elif index > len(self._tracks):
@@ -307,6 +416,16 @@ class Song(LiveObject):
         track = self._tracks.pop(index)
         track.__dict__.pop("_listeners", None)  # like Live, a deleted object's listeners go with it
         self._notify("tracks")
+
+    def fake_group_tracks(self, first, count):
+        """Test only (Live's API cannot group tracks): puts a new group track at `first` and
+        moves the `count` tracks from there into it."""
+        guard()
+        group = Track("%d-Group" % (first + 1), is_midi=False, kind="group")
+        group._group = self._tracks[first]._group if first < len(self._tracks) else None
+        for track in self._tracks[first:first + count]:
+            track._group = group
+        self._insert(group, first)
 
     def slow(self, seconds):
         """Blocks the main thread, to test timeouts."""
