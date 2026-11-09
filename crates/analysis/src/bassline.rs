@@ -18,8 +18,11 @@ pub const NOTES: usize = (HIGHEST_NOTE - LOWEST_NOTE + 1) as usize;
 const WINDOW: usize = 128;
 const HOP: usize = 32;
 /// YIN's absolute threshold on the cumulative mean normalised difference: the first dip below it
-/// is the period. Above it everywhere, the frame is unvoiced.
-const THRESHOLD: f32 = 0.15;
+/// is the period. Above it everywhere, the frame is unvoiced. Chords over a bass make its period
+/// less clean, and YIN's usual 0.1–0.15 left many such 16ths without a note or on a subharmonic.
+/// 0.2 was the highest that changed no key on the test set (0.25 caught a drum loop's falling
+/// kick well enough to give the loop a key).
+const THRESHOLD: f32 = 0.2;
 /// Frames quieter than this mean square (about −60 dBFS) are unvoiced.
 const SILENCE: f32 = 1e-6;
 
