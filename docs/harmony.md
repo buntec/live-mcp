@@ -242,6 +242,17 @@ What this shows:
   arpeggio in the bass tracker's range, which is taken for a bass line and given
   no chord. Low chords on a piano and palm-muted guitar chugs are read as bass
   lines too, and a chord that has decayed (piano, pluck) reads as "N".
+- Loops' audio can be heard offline exactly as the Ear hears it in Live:
+  `testset.rs`'s `score_audio` feeds WAV files to the plugin's analyzers in
+  512-sample blocks (on the 32 rendered loops recorded from Live, the same bass
+  note on all 1960 16ths, and no difference in level or chroma). Raising the bass
+  tracker's YIN threshold from 0.15 to 0.25, measured that way, took the rendered
+  loops' bass pitch class from 61% to 70% on the tune split (65% to 71% on
+  holdout) and the exact note from 46% to 55% (41% to 46%), with chords unchanged
+  and a synthetic bass line with a kick still tracked note for note; one tune key
+  changed (an organ Em C D B7 heard in G major). Lowering the tracker's low-pass
+  (350 Hz) helped under chords but hurt a bass with a kick, and a wider window
+  hurt both. The pack loops' bass lines are still to be checked through the Ear.
 - The bass line under chords was poor, though a bass loop alone is tracked well:
   octave errors, a note heard at two thirds of its frequency (A1 as D1), and many
   16ths with no note when the bass decays or is short. Correcting subharmonics

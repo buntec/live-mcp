@@ -531,6 +531,66 @@ mod tests {
         assert_eq!(corrected(31, guitar, g_hum), None, "hum");
     }
 
+    /// The bass tracker on the synthetic bass line with a kick (as in the test above), every 16th of
+    /// its 4 bars against the notes played: a check of a bass alone, for tuning the plugin's tracker
+    /// (the test set's rendered loops have chords over the bass).
+    #[test]
+    #[ignore = "measurement"]
+    fn synthetic_bass_line_accuracy() {
+        use std::f64::consts::PI;
+
+        use live_mcp_analysis::{BeatAnalyzer, Transport};
+        let sr = 48_000.0f64;
+        let bars: [[u8; 8]; 4] = [
+            [38, 38, 41, 38, 45, 38, 48, 38],
+            [43, 43, 46, 43, 45, 45, 38, 38],
+            [38, 38, 41, 38, 45, 38, 48, 38],
+            [34, 34, 45, 45, 43, 41, 40, 38],
+        ];
+        let samples: Vec<f32> = (0..(8.0 * sr) as usize)
+            .map(|n| {
+                let t = n as f64 / sr;
+                let eighth = (t / 0.25) as usize;
+                let note = bars[eighth / 8][eighth % 8] as f64;
+                let f = 440.0 * 2f64.powf((note - 69.0) / 12.0);
+                let pluck = (-(t % 0.25) * 6.0).exp();
+                let bass = (1..=12).map(|h| (2.0 * PI * f * h as f64 * t).sin() / h as f64).sum::<f64>() * 0.25 * pluck;
+                let in_beat = t % 0.5;
+                let kick = if in_beat < 0.1 {
+                    (2.0 * PI * (50.0 + 60.0 * (-in_beat * 40.0).exp()) * in_beat).sin() * 0.4 * (-in_beat * 30.0).exp()
+                } else {
+                    0.0
+                };
+                (bass + kick) as f32
+            })
+            .collect();
+        let mut analyzer = BeatAnalyzer::new(sr as f32);
+        let mut reports = Vec::new();
+        for (k, block) in samples.chunks(512).enumerate() {
+            let beat = (k * 512) as f64 / sr * 2.0;
+            let t = Transport { playing: true, beat: Some(beat), tempo: Some(120.0), time_signature: Some((4, 4)) };
+            analyzer.process(block, block, &t, &mut |r| reports.push(r));
+        }
+        analyzer.flush(&mut |r| reports.push(r));
+        let (heard, _) = beats(&reports);
+        let (mut right, mut wrong, mut none) = (0, 0, 0);
+        for b in &heard {
+            for (s, n) in b.bass_line.iter().enumerate() {
+                let sixteenth = b.index as usize * 4 + s;
+                if sixteenth >= 64 {
+                    continue;
+                }
+                let want = bars[sixteenth / 16][(sixteenth % 16) / 2];
+                match n {
+                    Some(n) if n.pitch == want => right += 1,
+                    Some(_) => wrong += 1,
+                    None => none += 1,
+                }
+            }
+        }
+        println!("synthetic bass line: {right} right, {wrong} wrong, {none} none of 64");
+    }
+
     #[test]
     fn evenly_spread_chroma_is_not_pitched() {
         // Energy in every third of a semitone, as from noise or an 808's pitch sweep.
