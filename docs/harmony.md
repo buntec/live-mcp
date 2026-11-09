@@ -74,6 +74,15 @@ came from running real and synthesized audio through the whole path.
 - Key profiles are Temperley's (Kostka–Payne). Krumhansl–Kessler called a
   Dm7–G7–Cmaj7–A7 loop G major with 0.9 confidence, because it barely penalises
   the F natural. A key also needs at least three pitch classes.
+- Pitch counts cannot tell a key from its subdominant (C G Am F fits F major's
+  scale nearly as well as C major's) or a minor key from its relative major when
+  the leading tone is brief. So keys are estimated twice: from the pitch profile
+  and the downbeat bass, then again with the chords that labelling found, scored
+  by function (`key::harmony_fit`: tonic 1.0, dominant 0.7, subdominant 0.6, ii
+  and vi 0.4, iii, VII and diminished 0.3, any other chord −0.4; sus and power
+  chords half, by their root). The fit is weighted 0.7 against the profile's
+  correlation, the first weight at the best of a broad plateau (0.3–1.2) on the
+  test set's tune split. If the key changes, the chords are labelled again.
 - Tuning comes from parabolic interpolation of the peaks in the 36 treble bins,
   then a circular mean. A plain circular mean over all bins was too flat after log
   compression to say anything.
@@ -185,19 +194,29 @@ inversions, two chords per bar, sustained chords, stabs and arpeggios, 3/4, 6/8,
 "tune". The same rendered loops read from their MIDI give a ceiling for what can
 be heard of them.
 
-First scores (2026-11-09), per beat for chords and per 16th for the bass:
+Scores (2026-11-09), per beat for chords and per 16th for the bass; keys before
+and after the chords' fit was added:
 
-| | loops | key | chord root | root and third | bass line |
-| --- | --- | --- | --- | --- | --- |
-| Pack loops | 115 | 21/52 where the label is the loop's own; 14/43 the kit's | 87% | 77% | - |
-| Rendered, heard | 32 | 24/30 | 89% | 87% | 46% pitch class, 26% exact note |
-| Rendered, from MIDI | 32 | 22/30 | 100% | 100% | 100% |
+| | loops | key, before | key, with chords | chord root | root and third | bass line |
+| --- | --- | --- | --- | --- | --- | --- |
+| Pack loops, loop's own key | 115 | 21/52 | 25/52 | 87% | 77% | - |
+| Pack loops, kit's key | | 14/43 | 15/43 | | | |
+| Rendered, heard | 32 | 24/30 | 28/30 | 89% | 87% | 46% pitch class, 26% exact note |
+| Rendered, from MIDI | 32 | 22/30 | 30/30 | 100% | 100% | 100% |
+
+Of the holdout split, which the weight was not chosen on, the pack loops' own
+keys went from 13 to 16 of 30 and the rendered ones from 11 to 13 of 14.
 
 What this shows:
 
-- Keys are the weakest part, even on exact input: from their MIDI, 8 of 30
-  rendered progressions get the wrong key (C G Am F is heard in F major, Eb Cm Ab
-  Bb in Ab major). The pack loops get 40% where the label is the loop's own key.
+- Keys were the weakest part, even on exact input: from their MIDI, 8 of 30
+  rendered progressions got the wrong key (C G Am F was heard in F major, Eb Cm
+  Ab Bb in Ab major). The chords' fit fixed all eight, four of the rendered
+  recordings and six pack loops, and broke one (a horn line whose stray Dm7b5
+  chords fit C minor). Pack loops are still
+  right on only half of their own keys; many of the misses hear pitches the label
+  does not explain (a loop a quarter tone off, horns a whole tone above their
+  "C major"), and melodies and bass lines have no chords to help.
 - Chords are good on sustained sounds: pads, electric piano, guitar and brass are
   at 88–100% of beats by root. They fail on a drawbar organ, whose harmonics add
   sevenths and move roots (C/E heard as Em7, Bdim as Bm7), and on a pluck

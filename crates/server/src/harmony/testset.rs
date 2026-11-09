@@ -707,10 +707,11 @@ fn the_test_set_is_well_formed() {
 }
 
 /// The rendered progressions, read back from their own MIDI by `read_clip`'s interpreter: a check
-/// of the notes written.
+/// of the notes written, and of the keys.
 #[test]
 fn rendered_loops_read_back_from_their_midi() {
     let mut wrong = Vec::new();
+    let mut wrong_keys = Vec::new();
     let mut total = Tally::default();
     for l in load_set().iter().filter(|l| l.render.is_some()) {
         let notes = notes(l);
@@ -735,7 +736,15 @@ fn rendered_loops_read_back_from_their_midi() {
                 }
             }
         }
+        if let Some(Expect::Key(want)) = l.key.as_deref().and_then(expected_key) {
+            let got = analysis.summary.get("key").and_then(|k| k.get("name")).and_then(Value::as_str);
+            if got.and_then(heard_key) != Some(want) {
+                wrong_keys.push(format!("{}: {got:?}, want {}", l.id, want.name()));
+            }
+        }
     }
+    // Every rendered progression's key, from its exact notes.
+    assert!(wrong_keys.is_empty(), "keys wrong:\n{}", wrong_keys.join("\n"));
     // Not every beat: a chord whose bass note is not its root can read as another chord on exact
     // input too. Keys are left to the scores.
     assert!(
@@ -825,4 +834,144 @@ fn renders_each_style() {
     let arp = notes(&l(Style::Arp));
     assert_eq!(arp.iter().filter(|n| n.pitch != 40).count(), 16);
     assert!(arp.iter().all(|n| n.start + n.duration <= 4.0 + 1e-9));
+}
+
+/// For each loop with a key label: where the labelled key ranks, and by how much it trails the
+/// winner (pitch profile, downbeat bass and the chords heard), from the audio of its latest take
+/// and (rendered loops) from its MIDI.
+#[test]
+#[ignore = "needs recordings: HEARD=<run folder>[:<run folder>…]"]
+fn key_diagnostics() {
+    let Ok(dirs) = std::env::var("HEARD") else { return };
+    let set = load_set();
+    let mut latest: BTreeMap<String, Recording> = BTreeMap::new();
+    for dir in dirs.split(':') {
+        let dir = Path::new(dir);
+        let takes: BTreeMap<String, String> = std::fs::read_to_string(dir.join("takes.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        for rec in load(dir) {
+            if let Some(id) = takes.get(&rec.id) {
+                latest.insert(id.clone(), rec);
+            }
+        }
+    }
+    for l in &set {
+        let Some(Expect::Key(want)) = l.key.as_deref().and_then(expected_key) else { continue };
+        let mut sources: Vec<(&str, Vec<BarSpan>, Vec<super::Beat>)> = Vec::new();
+        if l.render.is_some() {
+            let bars: Vec<BarSpan> = (0..l.bars as i64)
+                .map(|k| BarSpan { bar: k + 1, start_beat: k as f64 * l.beats_per_bar(), beats: l.beats_per_bar() })
+                .collect();
+            sources.push(("midi", bars, midi::beats(&notes(l), 0.0, l.bars as f64 * l.beats_per_bar())));
+        }
+        if let Some(rec) = latest.get(&l.id) {
+            sources.push(("audio", rec.bars.clone(), audio::beats(&rec.beats).0));
+        }
+        for (source, bars, beats) in &sources {
+            let kind = if *source == "midi" { Source::Midi } else { Source::Audio };
+            let analysis = analyze(&Section { bars, beats, source: kind, scale: None });
+            let chords: Vec<Chord> = beats
+                .iter()
+                .filter(|b| b.pitched && !b.bass_only)
+                .filter_map(|b| analysis.chords.get(&b.index).copied().flatten())
+                .collect();
+            let profile = super::key_profile(beats.iter(), bars);
+            let hint = super::downbeat_bass(beats.iter(), bars);
+            let Some(ranked) = super::key::ranking(&profile, hint.as_ref(), &chords) else {
+                println!("{:30} {source:5} want {:9} -> no key", l.id, want.name());
+                continue;
+            };
+            let rank = ranked.iter().position(|(k, _)| *k == want).unwrap();
+            let gap = ranked[0].1 - ranked[rank].1;
+            let top: Vec<String> = ranked.iter().take(3).map(|(k, s)| format!("{} {s:.3}", k.name())).collect();
+            println!(
+                "{:30} {source:5} {} want {:9} rank {:2} gap {gap:.3} | {}",
+                l.id,
+                if rank == 0 { "ok " } else { "XX " },
+                want.name(),
+                rank + 1,
+                top.join(", ")
+            );
+        }
+    }
+}
+
+/// Key accuracy for a range of weights of the chords' harmonic fit (`key::HARMONY_WEIGHT`), by
+/// group and split: choose on "tune", report "holdout".
+#[test]
+#[ignore = "needs recordings: HEARD=<run folder>[:<run folder>…]"]
+fn key_weight_search() {
+    let Ok(dirs) = std::env::var("HEARD") else { return };
+    let set = load_set();
+    let mut latest: BTreeMap<String, Recording> = BTreeMap::new();
+    for dir in dirs.split(':') {
+        let dir = Path::new(dir);
+        let takes: BTreeMap<String, String> = std::fs::read_to_string(dir.join("takes.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        for rec in load(dir) {
+            if let Some(id) = takes.get(&rec.id) {
+                latest.insert(id.clone(), rec);
+            }
+        }
+    }
+    let weights: Vec<f32> = (0..=12).map(|k| k as f32 * 0.1).collect();
+    // (group, split) → right answers per weight, and tries.
+    let mut tally: BTreeMap<(String, Split), (Vec<usize>, usize)> = BTreeMap::new();
+    for l in &set {
+        let Some(want) = l.key.as_deref().and_then(expected_key) else { continue };
+        if want == Expect::NoKey {
+            continue;
+        }
+        let mut sources: Vec<(String, Vec<BarSpan>, Vec<super::Beat>, Source)> = Vec::new();
+        if l.render.is_some() {
+            let bars: Vec<BarSpan> = (0..l.bars as i64)
+                .map(|k| BarSpan { bar: k + 1, start_beat: k as f64 * l.beats_per_bar(), beats: l.beats_per_bar() })
+                .collect();
+            let beats = midi::beats(&notes(l), 0.0, l.bars as f64 * l.beats_per_bar());
+            sources.push(("rendered midi".into(), bars, beats, Source::Midi));
+        }
+        if let Some(rec) = latest.get(&l.id) {
+            let group = match (l.render.is_some(), l.key_source.unwrap_or(KeySource::Loop)) {
+                (true, _) => "rendered audio",
+                (false, KeySource::Loop) => "pack, own key",
+                (false, KeySource::Kit) => "pack, kit key",
+            };
+            sources.push((group.into(), rec.bars.clone(), audio::beats(&rec.beats).0, Source::Audio));
+        }
+        for (group, bars, beats, source) in &sources {
+            let analysis = analyze(&Section { bars, beats, source: *source, scale: None });
+            let entry = tally.entry((group.clone(), l.split)).or_insert((vec![0; weights.len()], 0));
+            entry.1 += 1;
+            if analysis.summary.get("key").is_none_or(Value::is_null) {
+                continue; // no key at any weight
+            }
+            let profile = super::key_profile(beats.iter(), bars);
+            let hint = super::downbeat_bass(beats.iter(), bars);
+            let chords: Vec<Chord> = beats
+                .iter()
+                .filter(|b| b.pitched && !b.bass_only)
+                .filter_map(|b| analysis.chords.get(&b.index).copied().flatten())
+                .collect();
+            for (k, &w) in weights.iter().enumerate() {
+                let Some(ranked) = super::key::ranking_weighted(&profile, hint.as_ref(), &chords, w) else { continue };
+                let got = ranked[0].0;
+                let right = match want {
+                    Expect::Key(key) => got == key,
+                    Expect::Tonic(t) => got.tonic == t,
+                    Expect::NoKey => unreachable!(),
+                };
+                entry.0[k] += right as usize;
+            }
+        }
+    }
+    let header: Vec<String> = weights.iter().map(|w| format!("{w:>5.1}")).collect();
+    println!("{:28} {:>4} {}", "group (split)", "of", header.join(""));
+    for ((group, split), (right, of)) in &tally {
+        let cells: Vec<String> = right.iter().map(|r| format!("{r:>5}")).collect();
+        println!("{:28} {of:>4} {}", format!("{group} ({split:?})").to_lowercase(), cells.join(""));
+    }
 }
