@@ -608,8 +608,14 @@ fn score_recordings() {
             }
         }
     }
+    report(&set, &latest, verbose);
+}
+
+/// Scores each loop that has a recording, rendered loops also from their MIDI, and prints the
+/// scores per family, split and group.
+fn report(set: &[Loop], latest: &BTreeMap<&str, (String, Recording)>, verbose: bool) {
     let mut by_category: BTreeMap<(String, Split), Score> = BTreeMap::new();
-    for l in &set {
+    for l in set {
         let Some((dir, rec)) = latest.get(l.id.as_str()) else { continue };
         println!("[{}/{}]", Path::new(dir).file_name().and_then(|n| n.to_str()).unwrap_or(dir), rec.id);
         let s = score(l, rec, verbose);
@@ -652,6 +658,80 @@ fn score_recordings() {
          and inversion where a rendered bass part gives it). bars: labelled chords heard in their bar. \
          bass: pitch class and exact note per 16th (rendered loops)."
     );
+}
+
+/// Host buffer size for hearing audio files: what Live typically gives a plugin.
+const BLOCK: usize = 512;
+
+/// A loop's audio file heard as the Ear plugin would hear it in Live: the plugin's analyzers fed in
+/// host-sized blocks with a transport playing from beat 0 at the loop's tempo and meter.
+fn hear_audio_file(l: &Loop, path: &Path) -> anyhow::Result<Recording> {
+    let decoded = crate::audio_file::decode(path)?;
+    let sr = decoded.sample_rate as f64;
+    let mut bar_analyzer = live_mcp_analysis::BarAnalyzer::new(decoded.sample_rate as f32);
+    let mut beat_analyzer = live_mcp_analysis::BeatAnalyzer::new(decoded.sample_rate as f32);
+    let (mut bar_reports, mut beats) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < decoded.left.len() {
+        let end = (i + BLOCK).min(decoded.left.len());
+        let transport = live_mcp_analysis::Transport {
+            playing: true,
+            beat: Some(i as f64 / sr * l.tempo / 60.0),
+            tempo: Some(l.tempo),
+            time_signature: Some((l.meter[0], l.meter[1])),
+        };
+        bar_analyzer.process(&decoded.left[i..end], &decoded.right[i..end], &transport, &mut |r| bar_reports.push(r));
+        beat_analyzer.process(&decoded.left[i..end], &decoded.right[i..end], &transport, &mut |r| beats.push(r));
+        i = end;
+    }
+    // As listen does: the bars asked for, heard at least half.
+    let bars = bar_reports
+        .iter()
+        .filter(|r| r.coverage >= 0.5 && (1..=l.bars as i64).contains(&r.bar))
+        .map(|r| BarSpan { bar: r.bar, start_beat: r.start_beat, beats: r.beats })
+        .collect();
+    let length = l.bars as f64 * l.beats_per_bar();
+    beats.retain(|b: &BeatReport| (b.beat as f64) < length);
+    Ok(Recording { id: path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_owned(), bars, beats })
+}
+
+/// Scores loops from their audio files (`<loop id>.wav` in AUDIO), heard offline as the Ear would
+/// hear them: for trying changes to the plugin's analysis without rebuilding or reinstalling it.
+///
+/// ```text
+/// AUDIO=~/.live-mcp/recordings/run5/audio cargo test -p live-mcp-server --bins score_audio -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs audio files: AUDIO=<folder of <loop id>.wav>"]
+fn score_audio() {
+    let Ok(dir) = std::env::var("AUDIO") else { return };
+    // AUDIO_OUT: also write what was heard as recordings (and takes.json), for the other tools.
+    let out = std::env::var("AUDIO_OUT").ok();
+    let set = load_set();
+    let mut latest: BTreeMap<&str, (String, Recording)> = BTreeMap::new();
+    let mut takes = BTreeMap::new();
+    for l in &set {
+        let path = Path::new(&dir).join(format!("{}.wav", l.id));
+        if path.exists() {
+            let rec = hear_audio_file(l, &path).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+            if let Some(out) = &out {
+                let bars: Vec<Value> = rec
+                    .bars
+                    .iter()
+                    .map(|b| json!({"bar": b.bar, "start_beat": b.start_beat, "beats": b.beats, "coverage": 1.0}))
+                    .collect();
+                let body = json!({"label": format!("{} heard offline", l.id), "tempo": l.tempo, "bars": bars, "beats": rec.beats});
+                std::fs::create_dir_all(out).unwrap();
+                std::fs::write(Path::new(out).join(format!("{}.json", l.id)), body.to_string()).unwrap();
+                takes.insert(l.id.clone(), l.id.clone());
+            }
+            latest.insert(l.id.as_str(), ("audio".into(), rec));
+        }
+    }
+    if let Some(out) = &out {
+        std::fs::write(Path::new(out).join("takes.json"), serde_json::to_string_pretty(&takes).unwrap()).unwrap();
+    }
+    report(&set, &latest, std::env::var("BASS").is_ok());
 }
 
 #[test]
