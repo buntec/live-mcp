@@ -142,7 +142,7 @@ End-to-end tests for `read_clip`, `listen` (single and multi-track, clashes) and
 
 On real audio, 36 labelled loops from Live's Loopmasters Mixtape pack were played
 through the Ear (the pack's files decode only inside Live), recorded with
-`record_beats`, and scored offline with `harmony/replay.rs`:
+`record_beats`, and scored offline (now with `harmony/testset.rs`):
 
 - Chords: 38 of 40 right on the ten string loops whose names list their chords.
   Misses were Am heard as Cmaj7 (a held B over an A bass, at confidence 0.25) and
@@ -169,11 +169,54 @@ through the Ear (the pack's files decode only inside Live), recorded with
   chords into G inversions (Cmaj7/G, G7) at 0 dB; at −30 dB the combined reading
   is the strings' own (Am/C | C | Gsus4 G | F Fsus2), with no clash.
 
+**The test set.** `crates/server/testdata/hearing-set.json` lists 147 labelled
+loops, and `harmony/testset.rs` scores recordings of them (how to record and
+score is at the top of that file). 115 come from Live's packs: the loops above,
+with fuller chord labels from their file names, and 75 more across piano, organ
+and electric piano, synths, pads, guitars, strings, choirs and vocals, horns,
+bells, bass, drums (labelled "no key") and ten single chords, 13 of them in major
+keys. A key from a file name is marked as the construction kit's, which the loop
+may not be in. 32 are rendered: MIDI progressions written by `testset.rs` and
+played through eight of Live's instruments, so their chords, keys and bass are
+exact. They cover major and minor keys, sevenths, sus and diminished chords,
+inversions, two chords per bar, sustained chords, stabs and arpeggios, 3/4, 6/8,
+5/8, 7/8 and 3/8, and three without a bass part. Each loop is in a "tune" or a
+"holdout" split; the earlier loops, which the interpreter was tuned on, are all
+"tune". The same rendered loops read from their MIDI give a ceiling for what can
+be heard of them.
+
+First scores (2026-11-09), per beat for chords and per 16th for the bass:
+
+| | loops | key | chord root | root and third | bass line |
+| --- | --- | --- | --- | --- | --- |
+| Pack loops | 115 | 21/52 where the label is the loop's own; 14/43 the kit's | 87% | 77% | - |
+| Rendered, heard | 32 | 24/30 | 89% | 87% | 46% pitch class, 26% exact note |
+| Rendered, from MIDI | 32 | 22/30 | 100% | 100% | 100% |
+
+What this shows:
+
+- Keys are the weakest part, even on exact input: from their MIDI, 8 of 30
+  rendered progressions get the wrong key (C G Am F is heard in F major, Eb Cm Ab
+  Bb in Ab major). The pack loops get 40% where the label is the loop's own key.
+- Chords are good on sustained sounds: pads, electric piano, guitar and brass are
+  at 88–100% of beats by root. They fail on a drawbar organ, whose harmonics add
+  sevenths and move roots (C/E heard as Em7, Bdim as Bm7), and on a pluck
+  arpeggio in the bass tracker's range, which is taken for a bass line and given
+  no chord. Low chords on a piano and palm-muted guitar chugs are read as bass
+  lines too, and a chord that has decayed (piano, pluck) reads as "N".
+- The bass line under chords is poor, though a bass loop alone is tracked well:
+  octave errors, a note heard at two thirds of its frequency (A1 as D1), and many
+  16ths with no note when the bass decays or is short.
+- Sus chords are called too readily in sparse textures, and loops tuned a quarter
+  tone off (±48 cents) fall between two keys. Of four drum loops, three get no
+  key; one with tuned kicks gets F# minor at 0.31.
+
 Known weak spots: heavily filtered or pitch-bending synths, chord changes where
 sustained notes overlap, and single-note hooks, where the loop alone does not
 determine the key. Keys from a bass line alone remain weak: the downbeat bonus
 does not outweigh a strong scale fit, as with the F walking bass heard in Bb
-major at 0.93.
+major at 0.93. The test set adds organ-like timbres, decaying chords, mid-register
+arpeggios and the bass line under chords.
 
 Meters with an odd number of eighths (3/8, 5/8, 7/8): pitch is measured per
 quarter note, so a bar line inside a quarter puts that quarter in both bars. The
