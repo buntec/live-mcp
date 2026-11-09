@@ -101,6 +101,25 @@ pub struct BarSpan {
     pub beats: f64,
 }
 
+impl BarSpan {
+    /// Whether beat (quarter note) `index` sounds in this bar. In 3/8, 5/8 … a bar line can fall
+    /// inside a beat, which then belongs to both bars: what it holds cannot be split at the line.
+    pub fn holds(&self, index: i64) -> bool {
+        (index + 1) as f64 > self.start_beat + 1e-9 && (index as f64) < self.start_beat + self.beats - 1e-9
+    }
+
+    /// The bar's first 16th, counted from the song start, if the bar starts on one.
+    fn first_sixteenth(&self) -> Option<i64> {
+        let sixteenth = self.start_beat * 4.0;
+        ((sixteenth - sixteenth.round()).abs() < 1e-6).then_some(sixteenth.round() as i64)
+    }
+}
+
+/// Whether the 16th `slot` of beat `index` starts a bar.
+fn is_downbeat(bars: &[BarSpan], index: i64, slot: usize) -> bool {
+    bars.iter().any(|bar| bar.first_sixteenth() == Some(index * 4 + slot as i64))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Audio,
@@ -188,14 +207,15 @@ const KEY_BEAT_WEIGHT: f32 = 1.5;
 fn key_profile<'a>(beats: impl Iterator<Item = &'a Beat>, bars: &[BarSpan]) -> [f32; 12] {
     let mut sum = [0.0f32; 12];
     for beat in beats.filter(|b| b.pitched) {
-        let downbeat = bars.iter().any(|bar| (beat.index as f64 - bar.start_beat).abs() < 1e-9);
         let mut line = [0.0f32; 12];
         for (s, note) in beat.bass_line.iter().enumerate() {
             if let Some(n) = note {
-                let w = match (s, downbeat) {
-                    (0, true) => KEY_DOWNBEAT_WEIGHT,
-                    (0, false) => KEY_BEAT_WEIGHT,
-                    _ => 1.0,
+                let w = if is_downbeat(bars, beat.index, s) {
+                    KEY_DOWNBEAT_WEIGHT
+                } else if s == 0 {
+                    KEY_BEAT_WEIGHT
+                } else {
+                    1.0
                 };
                 line[(n.pitch % 12) as usize] += n.confidence * w;
             }
@@ -211,14 +231,20 @@ fn key_profile<'a>(beats: impl Iterator<Item = &'a Beat>, bars: &[BarSpan]) -> [
     sum
 }
 
-/// The share of each pitch class in the bass line during the first beat of each bar, or `None`
-/// without any. The whole beat, not just its first 16th: the tracker can still be on the previous
-/// note, or unvoiced, right at the attack.
+/// The share of each pitch class in the bass line during the first beat (four 16ths) of each bar,
+/// or `None` without any. The whole beat, not just its first 16th: the tracker can still be on the
+/// previous note, or unvoiced, right at the attack.
 fn downbeat_bass<'a>(beats: impl Iterator<Item = &'a Beat>, bars: &[BarSpan]) -> Option<[f32; 12]> {
+    let starts: Vec<i64> = bars.iter().filter_map(BarSpan::first_sixteenth).collect();
     let mut hint = [0.0f32; 12];
-    for beat in beats.filter(|b| bars.iter().any(|bar| (b.index as f64 - bar.start_beat).abs() < 1e-9)) {
-        for n in beat.bass_line.iter().flatten() {
-            hint[(n.pitch % 12) as usize] += n.confidence;
+    for beat in beats {
+        for (s, note) in beat.bass_line.iter().enumerate() {
+            let sixteenth = beat.index * 4 + s as i64;
+            if let Some(n) = note
+                && starts.iter().any(|&start| (start..start + 4).contains(&sixteenth))
+            {
+                hint[(n.pitch % 12) as usize] += n.confidence;
+            }
         }
     }
     let total: f32 = hint.iter().sum();
@@ -257,11 +283,12 @@ fn bass_line_text(beats: &[Beat], bar: &BarSpan, onset_reference: f32, spelling:
     any.then_some(out)
 }
 
-/// Positions in `beats` that fall in each bar.
+/// Positions in `beats` that sound in each bar (see [`BarSpan::holds`]: a beat a bar line falls
+/// inside is in both bars' ranges).
 fn bar_ranges(beats: &[Beat], bars: &[BarSpan]) -> Vec<std::ops::Range<usize>> {
     bars.iter()
         .map(|bar| {
-            let from = beats.partition_point(|b| (b.index as f64) < bar.start_beat - 1e-9);
+            let from = beats.partition_point(|b| ((b.index + 1) as f64) <= bar.start_beat + 1e-9);
             let to = beats.partition_point(|b| (b.index as f64) < bar.start_beat + bar.beats - 1e-9);
             from..to.max(from)
         })
@@ -285,8 +312,10 @@ fn key_changes(section: &Section, ranges: &[std::ops::Range<usize>]) -> Vec<(i64
         .map(|i| {
             let from = i.saturating_sub(KEY_WINDOW_BARS / 2 - 1);
             let to = (i + KEY_WINDOW_BARS / 2 + 1).min(n);
-            let beats = ranges[from..to].iter().flat_map(|r| &section.beats[r.clone()]);
-            let beats: Vec<&Beat> = beats.collect();
+            // Once each, though a beat a bar line falls inside is in two bars' ranges.
+            let first = ranges[from..to].iter().map(|r| r.start).min().unwrap_or(0);
+            let last = ranges[from..to].iter().map(|r| r.end).max().unwrap_or(first);
+            let beats: Vec<&Beat> = section.beats[first..last.max(first)].iter().collect();
             let hint = downbeat_bass(beats.iter().copied(), section.bars);
             key::estimate_with_tonic_hint(&key_profile(beats.iter().copied(), section.bars), hint.as_ref())
                 .map(|e| e.key)
@@ -411,7 +440,8 @@ pub fn analyze(section: &Section) -> Analysis {
                 .iter()
                 .map(|s| {
                     let mut entry = Map::new();
-                    let position = beats[s.first].index as f64 - bar.start_beat + 1.0;
+                    // A chord from a beat the bar line falls inside starts the bar.
+                    let position = (beats[s.first].index as f64 - bar.start_beat + 1.0).max(1.0);
                     entry.insert("beat".into(), json!(position));
                     chord_json(s, &mut entry);
                     Value::Object(entry)
@@ -564,6 +594,24 @@ mod tests {
         let analysis = analyze(&Section { bars: &bars, beats: &beats, source: Source::Midi, scale: None });
         assert_eq!(analysis.summary["key"]["name"], "D minor", "{:?}", analysis.summary);
         assert_eq!(analysis.bars[0].1["bass_line"], "D1 - D1 -  A1 - C2 -  G1 - A1 -  C#2 - D1 -");
+    }
+
+    #[test]
+    fn a_bar_line_inside_a_beat_keeps_the_notes_after_it() {
+        // 3/8: bar 2 starts halfway through beat 1, where a C sounds until the end of the beat.
+        let notes = [MidiNote { pitch: 60, start: 1.5, duration: 0.5, velocity: 100.0 }];
+        let beats = beats(&notes, 0.0, 4.5);
+        let bars: Vec<BarSpan> =
+            (0..3).map(|i| BarSpan { bar: i + 1, start_beat: i as f64 * 1.5, beats: 1.5 }).collect();
+        let analysis = analyze(&Section { bars: &bars, beats: &beats, source: Source::Midi, scale: None });
+        let bar2 = &analysis.bars[1].1;
+        assert_eq!(bar2["pcs"], "C 1.0", "{bar2:?}");
+        assert_eq!(bar2["range"], "C3", "{bar2:?}");
+        assert_eq!(bar2["bass_line"], "C3 - . .  . .", "{bar2:?}");
+        assert!(analysis.bars[2].1.get("pcs").is_none(), "{:?}", analysis.bars[2]);
+        // Bar 1 shares the beat, so its pitch classes cannot rule the C out; its bass line, on the
+        // 16th grid, can.
+        assert!(analysis.bars[0].1.get("bass_line").is_none(), "{:?}", analysis.bars[0]);
     }
 
     #[test]

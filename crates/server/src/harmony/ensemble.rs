@@ -7,12 +7,13 @@ use serde_json::{Value, json};
 
 use super::chords::Chord;
 use super::names::Spelling;
-use super::{BarSpan, Beat};
+use super::{BarSpan, BassNote, Beat};
 
 /// Pitch classes at least this share of a track's strongest in the beat count as sounding.
 const STRONG: f32 = 0.5;
-/// A track this far below the beat's loudest counted track is too quiet to clash.
-const CLASH_RANGE_DB: f32 = 20.0;
+/// A track this far below the beat's loudest pitched track is too quiet to clash, or to be heard
+/// as the bass.
+const AUDIBLE_RANGE_DB: f32 = 20.0;
 /// Two tracks share an octave when each has at least this share of its strongest octave there.
 const SHARED_OCTAVE: f32 = 0.25;
 /// A track carries an octave with at least this share of the octave's energy (−6 dB).
@@ -33,8 +34,20 @@ fn shape<const N: usize>(values: &[f32; N]) -> [f32; N] {
     if max > 0.0 { values.map(|v| v / max) } else { [0.0; N] }
 }
 
+fn audible_floor() -> f32 {
+    10f32.powf(-AUDIBLE_RANGE_DB / 20.0)
+}
+
 /// The voices summed beat by beat, as if one Ear heard only them.
 pub fn combined(voices: &[Voice]) -> Vec<Beat> {
+    // The loudest pitched voice per beat, in the mix: a voice far below it is not heard as the bass.
+    let mut loudest: BTreeMap<i64, f32> = BTreeMap::new();
+    for voice in voices {
+        for beat in voice.beats.iter().filter(|b| b.pitched) {
+            let top = loudest.entry(beat.index).or_default();
+            *top = top.max(beat.weight * voice.gain);
+        }
+    }
     let mut by_index: BTreeMap<i64, Beat> = BTreeMap::new();
     for voice in voices {
         for beat in voice.beats {
@@ -57,12 +70,17 @@ pub fn combined(voices: &[Voice]) -> Vec<Beat> {
             for (s, v) in sum.onsets.iter_mut().zip(&beat.onsets) {
                 *s = s.max(*v);
             }
-            // The lowest confident note any voice plays is the bass line.
-            for (slot, note) in sum.bass_line.iter_mut().zip(&beat.bass_line) {
-                if let Some(n) = note
-                    && slot.is_none_or(|s| n.pitch < s.pitch)
-                {
-                    *slot = Some(*n);
+            // The lowest note any audible voice plays is the bass line, counting (by its
+            // confidence) as much as the voice is loud next to the loudest.
+            let top = loudest.get(&beat.index).copied().unwrap_or(0.0);
+            if w >= top * audible_floor() {
+                let relative = if top > 0.0 { (w / top).min(1.0) } else { 1.0 };
+                for (slot, note) in sum.bass_line.iter_mut().zip(&beat.bass_line) {
+                    if let Some(n) = note
+                        && slot.is_none_or(|s| n.pitch < s.pitch)
+                    {
+                        *slot = Some(BassNote { confidence: n.confidence * relative, ..*n });
+                    }
                 }
             }
             let tonal = beat.tonal.unwrap_or(0.0);
@@ -70,10 +88,6 @@ pub fn combined(voices: &[Voice]) -> Vec<Beat> {
         }
     }
     by_index.into_values().collect()
-}
-
-fn bar_of(bars: &[BarSpan], beat: i64) -> Option<&BarSpan> {
-    bars.iter().find(|b| b.start_beat <= beat as f64 + 1e-9 && (beat as f64) < b.start_beat + b.beats - 1e-9)
 }
 
 /// "5" or "5–6".
@@ -110,7 +124,7 @@ pub fn clashes(
         if loudest <= 0.0 {
             continue;
         }
-        let floor = loudest * 10f32.powf(-CLASH_RANGE_DB / 20.0);
+        let floor = loudest * audible_floor();
         let tones: Vec<u8> = chord.map(|c| c.tones().collect()).unwrap_or_default();
         for a in 0..voices.len() {
             for b in a + 1..voices.len() {
@@ -141,7 +155,8 @@ pub fn clashes(
     let mut list: Vec<(usize, Value)> = found
         .into_iter()
         .map(|((a, b, p, q), beats)| {
-            let bar_numbers: BTreeSet<i64> = beats.iter().filter_map(|&i| bar_of(bars, i).map(|b| b.bar)).collect();
+            let bar_numbers: BTreeSet<i64> =
+                beats.iter().flat_map(|&i| bars.iter().filter(move |b| b.holds(i)).map(|b| b.bar)).collect();
             let entry = json!({
                 "tracks": [voices[a].name, voices[b].name],
                 "notes": format!("{} against {}", spelling[p as usize], spelling[q as usize]),
@@ -164,7 +179,7 @@ pub fn crowded(voices: &[Voice], bars: &[BarSpan]) -> Value {
             .iter()
             .map(|v| {
                 let mut e = [0.0f32; 7];
-                for beat in v.beats.iter().filter(|b| bar_of(std::slice::from_ref(bar), b.index).is_some()) {
+                for beat in v.beats.iter().filter(|b| bar.holds(b.index)) {
                     let total: f32 = beat.octaves.iter().sum();
                     if total > 0.0 {
                         let level = beat.weight * v.gain;
@@ -234,6 +249,25 @@ mod tests {
         let fmaj7 = Chord { root: 5, quality: 3, bass: None };
         let chords: BTreeMap<i64, Option<Chord>> = (0..4).map(|i| (i, Some(fmaj7))).collect();
         assert_eq!(clashes(&voices, &chords, &bars, spelling(None)), json!([]));
+    }
+
+    #[test]
+    fn a_bass_too_quiet_to_hear_is_not_the_bass_line() {
+        let note = |pitch| Some(BassNote { pitch, cents: 0.0, confidence: 1.0 });
+        let pad: Vec<Beat> = (0..4).map(|i| Beat { bass_line: [note(48); 4], ..beat(i, &[0, 4, 7], 3) }).collect();
+        let low: Vec<Beat> = (0..4).map(|i| Beat { bass_line: [note(40); 4], ..beat(i, &[4], 2) }).collect();
+        let bass_line = |gain: f32| {
+            let voices = [
+                Voice { name: "Pad".into(), gain: 1.0, beats: &pad },
+                Voice { name: "Bass".into(), gain, beats: &low },
+            ];
+            combined(&voices)[0].bass_line[0].unwrap()
+        };
+        // −60 dB: inaudible under the pad, so the pad's C is the bass.
+        assert_eq!(bass_line(0.001).pitch, 48);
+        // −6 dB: the E is heard as the bass, counting half as much as a note at the pad's level.
+        let e = bass_line(0.5);
+        assert_eq!((e.pitch, e.confidence), (40, 0.5));
     }
 
     #[test]

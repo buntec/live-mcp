@@ -4,10 +4,12 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
 use anyhow::{Result, bail};
-use live_mcp_analysis::{BAND_EDGES_HZ, BAND_NAMES, BarReport};
+use live_mcp_analysis::{BAND_EDGES_HZ, BAND_NAMES, BarReport, BeatReport};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+
+use crate::harmony::BarSpan;
 
 /// Snapshots kept per server session; the oldest are dropped first.
 const KEEP: usize = 100;
@@ -36,11 +38,13 @@ pub struct Snapshot {
     pub music: Option<SnapshotMusic>,
 }
 
-/// The musical reading that came with a snapshot: section summary and per-bar fields.
+/// The musical reading that came with a snapshot: section summary and per-bar fields, and the beat
+/// reports it was heard from (to hear a selection of the bars again).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SnapshotMusic {
     pub summary: Map<String, Value>,
     pub bars: BTreeMap<i64, Map<String, Value>>,
+    pub beats: Vec<BeatReport>,
 }
 
 #[derive(Default)]
@@ -275,7 +279,8 @@ pub fn compare(store: &SnapshotStore, params: CompareParams) -> Result<Value> {
         out["per_bar_bands"] = json!(BAND_NAMES);
     }
     if let (Some(ma), Some(mb)) = (&a.music, &b.music) {
-        let (music, music_notes) = compare_music(an, ma, &a_bars, bn, mb, &b_bars);
+        let (sa, sb) = (selected_summary(&a, ma, &a_bars), selected_summary(&b, mb, &b_bars));
+        let (music, music_notes) = compare_music(an, ma, &sa, &a_bars, bn, mb, &sb, &b_bars);
         out["music"] = music;
         if let Value::Array(list) = &mut out["notes"] {
             if !music_notes.is_empty() && list.len() == 1 && list[0].as_str().is_some_and(|n| n.starts_with("no large"))
@@ -301,17 +306,54 @@ fn bar_chords(fields: &Map<String, Value>) -> Option<String> {
     Some(list.iter().filter_map(|c| c.get("chord").and_then(Value::as_str)).collect::<Vec<_>>().join(" "))
 }
 
-/// Key, progression and rhythm of two snapshots side by side, with notes on what changed.
+/// A bar's chords with the beat each starts on, so that moving a change shows: "Am", or "C@1 G@3"
+/// when the bar has several.
+fn bar_chords_timed(fields: &Map<String, Value>) -> Option<String> {
+    if let Some(chord) = text(fields, "chord") {
+        return Some(chord.to_owned());
+    }
+    let list = fields.get("chords")?.as_array()?;
+    let timed = list.iter().filter_map(|c| {
+        let chord = c.get("chord").and_then(Value::as_str)?;
+        Some(format!("{chord}@{}", c.get("beat").and_then(Value::as_f64).unwrap_or(1.0)))
+    });
+    Some(timed.collect::<Vec<_>>().join(" "))
+}
+
+/// The musical summary of the selected bars. A snapshot's own summary covers all of its bars, so
+/// for part of them the bars are heard again from the snapshot's beat reports.
+fn selected_summary(snapshot: &Snapshot, music: &SnapshotMusic, bars: &[&BarReport]) -> Map<String, Value> {
+    if bars.len() == snapshot.bars.iter().filter(|r| r.coverage >= MIN_COVERAGE).count() {
+        return music.summary.clone();
+    }
+    let spans: Vec<BarSpan> =
+        bars.iter().map(|r| BarSpan { bar: r.bar, start_beat: r.start_beat, beats: r.beats }).collect();
+    let beats: Vec<BeatReport> =
+        music.beats.iter().filter(|b| spans.iter().any(|s| s.holds(b.beat))).copied().collect();
+    let Some(heard) = crate::ear::hear_music(bars, &beats, None) else { return Map::new() };
+    let mut summary = heard.summary;
+    if snapshot.unit == "section" {
+        // As analyze_file does: without the tempo the 16th grid means nothing.
+        summary.remove("rhythm");
+    }
+    summary
+}
+
+/// Key, progression and rhythm of two snapshots side by side, with notes on what changed. The
+/// summaries are those of the selected bars.
+#[allow(clippy::too_many_arguments)]
 fn compare_music(
     an: &str,
     ma: &SnapshotMusic,
+    sa: &Map<String, Value>,
     a_bars: &[&BarReport],
     bn: &str,
     mb: &SnapshotMusic,
+    sb: &Map<String, Value>,
     b_bars: &[&BarReport],
 ) -> (Value, Vec<String>) {
     let key =
-        |m: &SnapshotMusic| m.summary.get("key").and_then(|k| k.get("name")).and_then(Value::as_str).map(str::to_owned);
+        |m: &Map<String, Value>| m.get("key").and_then(|k| k.get("name")).and_then(Value::as_str).map(str::to_owned);
     let progression = |m: &SnapshotMusic, bars: &[&BarReport]| {
         bars.iter()
             .map(|r| m.bars.get(&r.bar).and_then(bar_chords).unwrap_or_else(|| "-".into()))
@@ -319,22 +361,22 @@ fn compare_music(
             .join(" | ")
     };
     let rhythm =
-        |m: &SnapshotMusic, metric: &str| m.summary.get("rhythm").and_then(|r| r.get(metric)).and_then(Value::as_f64);
+        |m: &Map<String, Value>, metric: &str| m.get("rhythm").and_then(|r| r.get(metric)).and_then(Value::as_f64);
     let mut notes = Vec::new();
-    let (ka, kb) = (key(ma), key(mb));
+    let (ka, kb) = (key(sa), key(sb));
     if ka != kb {
         let name = |k: &Option<String>| k.clone().unwrap_or_else(|| "no clear key".into());
         notes.push(format!("{an} is in {}, {bn} in {}", name(&ka), name(&kb)));
     }
-    let tuning = |m: &SnapshotMusic| m.summary.get("tuning_cents").and_then(Value::as_f64).unwrap_or(0.0);
-    if (tuning(ma) - tuning(mb)).abs() >= 10.0 {
-        notes.push(format!("{an} is tuned {:+.0} cents, {bn} {:+.0}", tuning(ma), tuning(mb)));
+    let tuning = |m: &Map<String, Value>| m.get("tuning_cents").and_then(Value::as_f64).unwrap_or(0.0);
+    if (tuning(sa) - tuning(sb)).abs() >= 10.0 {
+        notes.push(format!("{an} is tuned {:+.0} cents, {bn} {:+.0}", tuning(sa), tuning(sb)));
     }
     let mut changed = Vec::new();
     if a_bars.len() == b_bars.len() {
         for (x, y) in a_bars.iter().zip(b_bars) {
             let (fa, fb) = (ma.bars.get(&x.bar), mb.bars.get(&y.bar));
-            let (ca, cb) = (fa.and_then(bar_chords), fb.and_then(bar_chords));
+            let (ca, cb) = (fa.and_then(bar_chords_timed), fb.and_then(bar_chords_timed));
             let (ra, rb) = (fa.and_then(|f| text(f, "rhythm")), fb.and_then(|f| text(f, "rhythm")));
             let mut entry = json!({"a": x.bar, "b": y.bar});
             if ca != cb {
@@ -356,17 +398,17 @@ fn compare_music(
             notes.push(format!("the onset grid differs in {rhythm_changes} of {} paired bars", a_bars.len()));
         }
     }
-    if let (Some(da), Some(db)) = (rhythm(ma, "density"), rhythm(mb, "density"))
+    if let (Some(da), Some(db)) = (rhythm(sa, "density"), rhythm(sb, "density"))
         && (da - db).abs() >= DENSITY_NOTE
     {
         let word = if da > db { "busier" } else { "sparser" };
         notes.push(format!("{an} is rhythmically {word}: {da:.1} vs {db:.1} onsets per beat"));
     }
-    if let (Some(sa), Some(sb)) = (rhythm(ma, "syncopation"), rhythm(mb, "syncopation"))
-        && (sa - sb).abs() >= SYNCOPATION_NOTE
+    if let (Some(ya), Some(yb)) = (rhythm(sa, "syncopation"), rhythm(sb, "syncopation"))
+        && (ya - yb).abs() >= SYNCOPATION_NOTE
     {
-        let word = if sa > sb { "more" } else { "less" };
-        notes.push(format!("{an} is {word} syncopated: {sa:.2} vs {sb:.2}"));
+        let word = if ya > yb { "more" } else { "less" };
+        notes.push(format!("{an} is {word} syncopated: {ya:.2} vs {yb:.2}"));
     }
     let mut music = json!({
         "key": {"a": ka, "b": kb},
@@ -486,6 +528,67 @@ mod tests {
         let listed = list(&store);
         assert_eq!(listed["snapshots"][0]["range"], json!([1, 2]));
         assert_eq!(listed["snapshots"][1]["kind"], "file");
+    }
+
+    /// Steady beat reports of the sum of sines (Hz, amplitude) for beats `from..to`.
+    fn beats(from: i64, to: i64, partials: &[(f64, f64)]) -> Vec<BeatReport> {
+        let sr = 48_000.0;
+        let mut analyzer = live_mcp_analysis::BeatAnalyzer::new(sr as f32);
+        let samples: Vec<f32> = (0..72_000)
+            .map(|i| partials.iter().map(|(f, a)| a * (2.0 * PI * f * i as f64 / sr).sin()).sum::<f64>() as f32)
+            .collect();
+        let mut reports = Vec::new();
+        let t = Transport { playing: true, beat: Some(0.0), tempo: Some(120.0), time_signature: None };
+        analyzer.process(&samples, &samples, &t, &mut |r| reports.push(r));
+        let one = reports.into_iter().find(|r| r.beat == 1).unwrap();
+        (from..to).map(|beat| BeatReport { beat, ..one }).collect()
+    }
+
+    fn fields(pairs: Value) -> Map<String, Value> {
+        pairs.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn music_of_part_of_a_snapshot_is_heard_again() {
+        let tone = [(440.0, 0.3)];
+        let c_major = [(261.63, 0.2), (329.63, 0.2), (392.0, 0.2)];
+        let a_minor = [(220.0, 0.2), (261.63, 0.2), (329.63, 0.2)];
+        let store = SnapshotStore::default();
+        // The same C major first bar; the stored summaries (of both bars) name different keys.
+        for (key, second) in [("C major", c_major), ("A minor", a_minor)] {
+            let mut heard = beats(0, 4, &c_major);
+            heard.extend(beats(4, 8, &second));
+            let music = SnapshotMusic {
+                summary: fields(json!({"key": {"name": key}})),
+                bars: BTreeMap::from([(1, fields(json!({"chord": "C"}))), (2, fields(json!({"chord": "?"})))]),
+                beats: heard,
+            };
+            store.add(Kind::Listen, key.into(), "bar", vec![bar(1, &tone), bar(2, &tone)], Some(music));
+        }
+        let whole = compare(&store, params(None, None)).unwrap();
+        assert_eq!(whole["music"]["key"], json!({"a": "C major", "b": "A minor"}), "{whole}");
+        let first = compare(&store, params(Some([1, 1]), Some([1, 1]))).unwrap();
+        let key = &first["music"]["key"];
+        assert!(key["a"].is_string() && key["a"] == key["b"], "the first bars are heard again, alike: {first}");
+        assert!(!first["notes"].to_string().contains(" is in "), "{first}");
+    }
+
+    #[test]
+    fn moving_a_chord_change_changes_the_bar() {
+        let tone = [(440.0, 0.3)];
+        let store = SnapshotStore::default();
+        for change in [2.0, 3.0] {
+            let bar_fields = fields(json!({"chords": [{"beat": 1.0, "chord": "C"}, {"beat": change, "chord": "F"}]}));
+            let music = SnapshotMusic {
+                bars: BTreeMap::from([(1, bar_fields.clone()), (2, bar_fields)]),
+                ..SnapshotMusic::default()
+            };
+            store.add(Kind::Listen, String::new(), "bar", vec![bar(1, &tone), bar(2, &tone)], Some(music));
+        }
+        let out = compare(&store, params(None, None)).unwrap();
+        assert_eq!(out["music"]["progression"]["a"], out["music"]["progression"]["b"], "{out}");
+        assert_eq!(out["music"]["per_bar"][0]["chords"], json!(["C@1 F@2", "C@1 F@3"]), "{out}");
+        assert!(out["notes"].to_string().contains("the chords differ in 2 of 2 paired bars"), "{out}");
     }
 
     #[test]

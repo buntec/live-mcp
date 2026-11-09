@@ -6,9 +6,10 @@
 //! HEARD=~/.live-mcp/recordings cargo test -p live-mcp-server replay -- --ignored --nocapture
 //! ```
 //!
-//! Each `<snapshot>.json` holds the bars and beat reports one Ear heard. An optional
-//! `labels.json` in the same folder maps snapshot ids to {"name", "key", "chords"} (chords as
-//! "Am C G F", one per bar) to score against.
+//! Each `<session>-<snapshot>.json` (the server's start time in Unix milliseconds, then the snapshot id;
+//! older recordings are plain `<snapshot>.json`) holds the bars and beat reports one Ear heard. An
+//! optional `labels.json` in the same folder maps recording ids (the file names without `.json`) to
+//! {"name", "key", "chords"} (chords as "Am C G F", one per bar) to score against.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -49,8 +50,18 @@ pub fn load(dir: &Path) -> Vec<Recording> {
         let beats = serde_json::from_value(body["beats"].clone()).unwrap_or_default();
         out.push(Recording { id, bars, beats });
     }
-    out.sort_by_key(|r| r.id.trim_start_matches('s').parse::<u64>().unwrap_or(u64::MAX));
+    out.sort_by_key(|r| order(&r.id));
     out
+}
+
+/// Recordings in the order they were made: by session (older plain `s<N>` names first), then by
+/// snapshot number.
+fn order(id: &str) -> (u64, u64, String) {
+    let (session, snapshot) = match id.split_once('-') {
+        Some((session, snapshot)) => (session.parse().unwrap_or(u64::MAX), snapshot),
+        None => (0, id),
+    };
+    (session, snapshot.trim_start_matches('s').parse().unwrap_or(u64::MAX), id.to_owned())
 }
 
 fn tonic(name: &str) -> Option<(u8, Option<bool>)> {
@@ -60,10 +71,10 @@ fn tonic(name: &str) -> Option<(u8, Option<bool>)> {
             || ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"].iter().position(|n| *n == note),
         )?;
     let rest = rest.trim();
-    let minor = if rest.starts_with('m') {
-        Some(true)
-    } else if rest == "major" || rest == "maj" {
+    let minor = if rest == "major" || rest == "maj" {
         Some(false)
+    } else if rest.starts_with('m') {
+        Some(true)
     } else {
         None
     };
@@ -140,4 +151,21 @@ fn replay() {
         }
     }
     println!("\nkeys right {keys_right}/{keys}, chords right {chords_right}/{chords}");
+}
+
+#[test]
+fn key_labels_name_their_mode() {
+    assert_eq!(tonic("C major"), Some((0, Some(false))));
+    assert_eq!(tonic("C maj"), Some((0, Some(false))));
+    assert_eq!(tonic("Cmaj"), Some((0, Some(false))));
+    assert_eq!(tonic("Cm"), Some((0, Some(true))));
+    assert_eq!(tonic("C minor"), Some((0, Some(true))));
+    assert_eq!(tonic("Bb"), Some((10, None)));
+}
+
+#[test]
+fn recordings_sort_by_session_then_snapshot() {
+    let mut ids = vec!["1700000100-s2", "s10", "1700000100-s10", "s2", "1700000000-s5"];
+    ids.sort_by_key(|id| order(id));
+    assert_eq!(ids, ["s2", "s10", "1700000000-s5", "1700000100-s2", "1700000100-s10"]);
 }

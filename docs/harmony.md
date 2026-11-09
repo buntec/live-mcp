@@ -94,11 +94,14 @@ came from running real and synthesized audio through the whole path.
   its own beat 0.
 - `listen` takes `focus` ("all", "mix", "music"). Multi-track listens add a
   `music` section for the counted tracks together (`ensemble.rs`): their key and
-  progression, `clashes`, and `crowded` octaves.
+  progression, `clashes`, and `crowded` octaves. The combined bass line is the
+  lowest note of any track within 20 dB (after faders) of the loudest pitched one,
+  so a pulled-down fader cannot decide the inversion.
 - `analyze_file` takes `music` (default true). Without a bpm, chords are per
   quarter of a section and no rhythm grid is given. Snapshots keep their musical
-  reading, and `compare` adds key, progression and per-bar chord and rhythm
-  differences.
+  reading and beat reports, and `compare` adds key, progression and per-bar chord
+  (with where each chord starts) and rhythm differences. For part of a snapshot,
+  key, tuning and rhythm are heard again from just the selected bars.
 
 **Bass line (protocol 3).** Chroma cannot name bass notes: a low note's harmonics
 outweigh it, and a third of a semitone at 40 Hz is narrower than any usable FFT bin.
@@ -158,6 +161,11 @@ sustained notes overlap, and single-note hooks, where the loop alone does not
 determine the key. Bass lines were weak too until the bass-line tracker; it has
 been validated on synthetic bass lines with kicks, and still needs a re-run on the
 real bass loops.
+
+Meters with an odd number of eighths (3/8, 5/8, 7/8): pitch is measured per
+quarter note, so a bar line inside a quarter puts that quarter in both bars. The
+later bar keeps its notes, but the earlier one may also list them in `pcs`,
+`range` and its chords. The bass line and rhythm grid are per 16th and split exactly.
 
 ## 1. Plugin features (`crates/analysis`)
 

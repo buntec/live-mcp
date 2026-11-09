@@ -301,6 +301,41 @@ async fn hears_chords_and_clashes_between_tracks() {
     }
 }
 
+#[tokio::test]
+async fn records_every_listen_without_replacing_earlier_sessions() {
+    let Some(first) = Harness::start().await else { return };
+    let Some(second) = Harness::start().await else { return };
+    // Both servers record into the first one's folder, as a restarted server would.
+    let dir = first.state_dir().join("recordings");
+    for (h, bars) in [(&first, [1, 2]), (&second, [20, 21])] {
+        let config = json!({"port": 0, "ear_port": 0, "record_beats": dir});
+        std::fs::write(h.state_dir().join("config.json"), config.to_string()).unwrap();
+        h.ok("load_device", json!({"track": "master", "path": ["plugins", "live-mcp", "LiveMCP Ear"]})).await;
+        let param = "live_set master_track devices 0 parameters 1 value";
+        let plugin = tokio::spawn(fake_plugin(h.state_dir(), h.fake.connect().await, param, 7, TONE_220));
+        let one = h.ok("listen", json!({"start_bar": bars[0], "bars": 1})).await;
+        let several = h.ok("listen", json!({"tracks": ["master"], "start_bar": bars[1], "bars": 1})).await;
+        assert_eq!((one["snapshot"].as_str(), several["tracks"][0]["snapshot"].as_str()), (Some("s1"), Some("s2")));
+        plugin.abort();
+    }
+    let mut recorded: Vec<(String, i64)> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let body: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let name = path.file_stem().unwrap().to_str().unwrap().to_owned();
+            (name, body["bars"][0]["bar"].as_i64().unwrap())
+        })
+        .collect();
+    recorded.sort();
+    let bars: Vec<i64> = recorded.iter().map(|(_, bar)| *bar).collect();
+    assert_eq!(bars, [1, 2, 20, 21], "{recorded:?}");
+    let session = |name: &str| name.split_once('-').unwrap().0.to_owned();
+    assert_eq!(session(&recorded[0].0), session(&recorded[1].0));
+    assert_ne!(session(&recorded[0].0), session(&recorded[2].0), "{recorded:?}");
+    assert!(recorded.iter().all(|(name, _)| name.ends_with("-s1") || name.ends_with("-s2")), "{recorded:?}");
+}
+
 /// Routes `track`'s output to the routing type Live lists under `name`.
 async fn route(h: &Harness, track: usize, name: &str) {
     let types = h

@@ -2,9 +2,10 @@
 //! instances to tracks, and the `listen` and `ears` tools.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use live_mcp_analysis::{BAND_NAMES, BarReport, BeatReport};
@@ -73,6 +74,9 @@ pub struct EarHub {
     changed: Notify,
     listening: OnceLock<Result<u16, String>>,
     state_dir: OnceLock<PathBuf>,
+    /// When this server started (Unix milliseconds): recordings are named by it, because snapshot ids
+    /// start again at s1 in every server.
+    session: OnceLock<u64>,
 }
 
 impl EarHub {
@@ -80,6 +84,8 @@ impl EarHub {
     /// the port in `ear.json`. Failure is recorded, not fatal: the other tools still work.
     pub async fn start(self: &Arc<Self>, state_dir: &Path) {
         let _ = self.state_dir.set(state_dir.to_owned());
+        let started = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let _ = self.session.set(started);
         let result = self.bind(state_dir).await;
         let _ = self.listening.set(result.map_err(|e| format!("{e:#}")));
     }
@@ -454,11 +460,13 @@ pub(crate) struct Music {
     pub summary: Map<String, Value>,
     pub bars: BTreeMap<i64, Map<String, Value>>,
     pub beats: Vec<harmony::Beat>,
+    /// The beat reports it was heard from, so `compare` can hear a selection of bars again.
+    pub heard: Vec<BeatReport>,
 }
 
 impl Music {
     pub fn snapshot(&self) -> SnapshotMusic {
-        SnapshotMusic { summary: self.summary.clone(), bars: self.bars.clone() }
+        SnapshotMusic { summary: self.summary.clone(), bars: self.bars.clone(), beats: self.heard.clone() }
     }
 }
 
@@ -467,16 +475,23 @@ fn spans(reports: &[&BarReport]) -> Vec<BarSpan> {
 }
 
 /// With `record_beats` set in `config.json`, saves what one Ear heard (bars and beat reports) as
-/// `<snapshot>.json`, for tuning and regression tests. Failures are ignored: it is a debugging aid.
+/// `<session>-<snapshot>.json`, for tuning and regression tests. An existing file is never
+/// replaced. Failures are ignored: it is a debugging aid.
 fn record(hub: &EarHub, snapshot: &str, label: &str, tempo: f64, bars: &[BarReport], beats: &[BeatReport]) {
     let Some(dir) = hub.recording_dir() else { return };
+    let id = format!("{}-{snapshot}", hub.session.get().copied().unwrap_or(0));
     let spans: Vec<Value> = bars
         .iter()
         .map(|r| json!({"bar": r.bar, "start_beat": r.start_beat, "beats": r.beats, "coverage": r.coverage}))
         .collect();
-    let body = json!({"label": label, "tempo": tempo, "bars": spans, "beats": beats});
-    let _ = std::fs::create_dir_all(&dir)
-        .and_then(|_| std::fs::write(dir.join(format!("{snapshot}.json")), body.to_string()));
+    let body = json!({"snapshot": snapshot, "label": label, "tempo": tempo, "bars": spans, "beats": beats});
+    let _ = std::fs::create_dir_all(&dir).and_then(|_| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(format!("{id}.json")))?
+            .write_all(body.to_string().as_bytes())
+    });
 }
 
 /// Interprets the beats heard in the given bars.
@@ -484,6 +499,7 @@ pub(crate) fn hear_music(reports: &[&BarReport], beats: &[BeatReport], scale: Op
     if reports.is_empty() || beats.is_empty() {
         return None;
     }
+    let reports_heard = beats.to_vec();
     let (beats, tuning) = harmony::audio::beats(beats);
     let bars = spans(reports);
     let analysis = harmony::analyze(&Section { bars: &bars, beats: &beats, source: Source::Audio, scale });
@@ -491,7 +507,7 @@ pub(crate) fn hear_music(reports: &[&BarReport], beats: &[BeatReport], scale: Op
     if let Some(cents) = tuning.filter(|c| c.abs() >= TUNING_NOTE_CENTS && summary.contains_key("key")) {
         summary.insert("tuning_cents".into(), json!(cents.round()));
     }
-    Some(Music { summary, bars: analysis.bars.into_iter().collect(), beats })
+    Some(Music { summary, bars: analysis.bars.into_iter().collect(), beats, heard: reports_heard })
 }
 
 /// Bars as `listen` and `analyze_file` report them: mix measurements, music, or both.
@@ -604,10 +620,14 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
         crate::transport::play_from(live, (start_bar - 1) as f64 * beats_per_bar).await?;
     }
     let wanted = start_bar..start_bar + bars;
-    // Beats wholly inside the wanted bars; music needs them, and they arrive ~0.25 s after each
-    // beat ends.
-    let wanted_beats = ((start_bar - 1) as f64 * beats_per_bar).ceil() as i64
-        ..((start_bar - 1 + bars) as f64 * beats_per_bar + 1e-9).floor() as i64;
+    // Beats (quarter notes) that overlap the wanted bars; music needs them, and they arrive ~0.25 s
+    // after each beat ends. In 3/8, 5/8 … a bar can start or end inside one, which is then heard
+    // only in part.
+    let (first_beat, end_beat) =
+        ((start_bar - 1) as f64 * beats_per_bar, (start_bar - 1 + bars) as f64 * beats_per_bar);
+    let wanted_beats = (first_beat + 1e-9).floor() as i64..(end_beat - 1e-9).ceil() as i64;
+    // The share of a beat inside the wanted bars: all that playing from start_bar can hear of it.
+    let inside = |beat: i64| ((beat + 1) as f64).min(end_beat) - (beat as f64).max(first_beat);
     let focus = params.focus;
     let music_from = |i: &Instance| focus != Focus::Mix && i.hears_music();
     let deadline = Instant::now() + Duration::from_secs_f64(seconds + if params.play { 1.5 } else { seconds.max(2.0) });
@@ -621,7 +641,8 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
         let bars_done = heard.iter().all(|h| h.len() as i64 == bars && h.values().all(|r| r.coverage >= 0.95));
         let beats_done = targets.iter().zip(&beats).all(|((_, i), b)| {
             !music_from(i)
-                || (b.len() as i64 == wanted_beats.end - wanted_beats.start && b.values().all(|r| r.coverage >= 0.95))
+                || (b.len() as i64 == wanted_beats.end - wanted_beats.start
+                    && b.values().all(|r| r.coverage as f64 >= 0.95 * inside(r.beat)))
         });
         if (bars_done && beats_done) || Instant::now() >= deadline {
             break (heard, beats);
@@ -803,8 +824,10 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
             }
             let label = format!("listen on {} ({name}) bars {range} at {tempo} BPM", track.label());
             let snapshot_music = music[k].as_ref().map(Music::snapshot);
-            entry["snapshot"] =
-                json!(store.add(Kind::Listen, label, "bar", heard[k].values().copied().collect(), snapshot_music));
+            let id = store.add(Kind::Listen, label.clone(), "bar", heard_bars[k].clone(), snapshot_music);
+            let beats: Vec<BeatReport> = heard_beats[k].values().copied().collect();
+            record(hub, &id, &label, tempo, &heard_bars[k], &beats);
+            entry["snapshot"] = json!(id);
             entry["bars"] = json!(bar_entries(&reports, focus, music[k].as_ref()));
         }
         let missing: Vec<i64> = wanted.clone().filter(|b| !heard[k].contains_key(b)).collect();
