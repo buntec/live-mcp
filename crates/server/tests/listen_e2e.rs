@@ -316,6 +316,10 @@ async fn records_every_listen_without_replacing_earlier_sessions() {
         let one = h.ok("listen", json!({"start_bar": bars[0], "bars": 1})).await;
         let several = h.ok("listen", json!({"tracks": ["master"], "start_bar": bars[1], "bars": 1})).await;
         assert_eq!((one["snapshot"].as_str(), several["tracks"][0]["snapshot"].as_str()), (Some("s1"), Some("s2")));
+        // listen names the recording it made, so a caller can tie it to what was played.
+        let recording = one["recording"].as_str().unwrap();
+        assert!(recording.ends_with("-s1") && dir.join(format!("{recording}.json")).exists(), "{one}");
+        assert!(several["tracks"][0]["recording"].as_str().unwrap().ends_with("-s2"), "{several}");
         plugin.abort();
     }
     let mut recorded: Vec<(String, i64)> = std::fs::read_dir(&dir)
