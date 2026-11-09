@@ -83,6 +83,18 @@ came from running real and synthesized audio through the whole path.
   chords half, by their root). The fit is weighted 0.7 against the profile's
   correlation, the first weight at the best of a broad plateau (0.3–1.2) on the
   test set's tune split. If the key changes, the chords are labelled again.
+- A beat's bass counts towards the key as 0.75 its spectral bass chroma and 0.25
+  its bass-line notes (`KEY_SPECTRAL_BASS`). On the notes alone, one 16th the
+  tracker missed or heard a fifth low could tip a close key: MJ BottomLine went
+  from F minor to Bb major on two 16ths. `key_stability` in `testset.rs` hears
+  each loop again with 15% of its bass 16ths dropped, or moved a fifth down, and
+  against another tracker's hearing of the same audio. With the mix, keys held in
+  98% and 95% of those hearings, up from 96% and 90%; the two trackers agreed on
+  118 of 121 loops instead of 108. Accuracy stayed about the same: 31 of 76 pack
+  tonics instead of 32 with today's tracker, and 32 instead of 29 with the
+  reverted tracker (below), which then loses no key. Whether a loop has a key at
+  all is still judged from the notes alone: a kick's chroma spreads over several
+  pitch classes, and would give drum loops and one-note bass lines a key.
 - Tuning comes from parabolic interpolation of the peaks in the 36 treble bins,
   then a circular mean. A plain circular mean over all bins was too flat after log
   compression to say anything.
