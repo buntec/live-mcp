@@ -18,11 +18,8 @@ pub const NOTES: usize = (HIGHEST_NOTE - LOWEST_NOTE + 1) as usize;
 const WINDOW: usize = 128;
 const HOP: usize = 32;
 /// YIN's absolute threshold on the cumulative mean normalised difference: the first dip below it
-/// is the period. Above it everywhere, the frame is unvoiced. Chords over a bass make its period
-/// less clean; at 0.15 (YIN's usual 0.1–0.15) the tracker missed or skipped to a subharmonic on
-/// many such 16ths. 0.25 was the best on the test set's rendered loops (0.3 began to cost keys),
-/// with a bass alone still tracked note for note.
-const THRESHOLD: f32 = 0.25;
+/// is the period. Above it everywhere, the frame is unvoiced.
+const THRESHOLD: f32 = 0.15;
 /// Frames quieter than this mean square (about −60 dBFS) are unvoiced.
 const SILENCE: f32 = 1e-6;
 
