@@ -267,6 +267,11 @@ What this shows:
   not help) and one rendered key was lost, and the fallback heard a drum loop's
   kicks as notes and gave it a key. Keys turned on as little as two 16ths of
   bass line, so a better tracker first needs keys that are steadier against it.
+  With keys steadied (`KEY_SPECTRAL_BASS`, above), the threshold alone was tried
+  again: at 0.2 no key changes, drum loops included, and the rendered loops' bass
+  pitch class rises from 61% to 66% on the tune split (65% to 71% on holdout),
+  the exact note from 46% to 50% (41% to 44%). 0.25 gained four more points on
+  tune but caught a drum loop's falling kick well enough to give it a key.
 - Sus chords are called too readily in sparse textures, and loops tuned a quarter
   tone off (±48 cents) fall between two keys. Of four drum loops, three get no
   key; one with tuned kicks gets F# minor at 0.31.
