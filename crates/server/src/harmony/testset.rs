@@ -1094,6 +1094,8 @@ fn bass_diagnostics() {
     let mut missing: BTreeMap<&str, usize> = BTreeMap::new();
     // (raw − played, kept − played) in semitones → 16ths.
     let mut moves: BTreeMap<(String, String), usize> = BTreeMap::new();
+    // 16ths with no bass note played, and those of them with a note kept anyway.
+    let (mut silent, mut invented) = (0, 0);
     println!("{:26} {:>4}  raw: {}  |  kept: {}", "loop", "16ths", classes.join(" "), classes.join(" "));
     for l in set.iter().filter(|l| l.render.as_ref().is_some_and(|r| r.bass)) {
         let Some(rec) = latest.get(&l.id) else { continue };
@@ -1107,7 +1109,12 @@ fn bass_diagnostics() {
         for r in &rec.beats {
             let Some(want) = truth.get(&r.beat) else { continue };
             for s in 0..4 {
-                let Some(w) = want.bass_line[s] else { continue };
+                let Some(w) = want.bass_line[s] else {
+                    // No bass note played here: a kept note is invented.
+                    silent += 1;
+                    invented += kept.get(&r.beat).is_some_and(|b| b.bass_line[s].is_some()) as usize;
+                    continue;
+                };
                 n += 1;
                 let raw = (r.bass_notes[s] > 0).then_some(r.bass_notes[s]);
                 *raw_counts.entry(class(raw, w.pitch)).or_default() += 1;
@@ -1146,6 +1153,7 @@ fn bass_diagnostics() {
     };
     println!("{:26} {:>4}  raw: {}  |  kept: {}", "ALL", "", cells(&total_raw), cells(&total_kept));
     println!("why kept notes are missing: {missing:?}");
+    println!("16ths with no bass played: {silent}, with a note kept anyway: {invented}");
     let mut moves: Vec<_> = moves.into_iter().collect();
     moves.sort_by_key(|m| std::cmp::Reverse(m.1));
     println!("raw → kept (semitones from the note played), commonest first:");

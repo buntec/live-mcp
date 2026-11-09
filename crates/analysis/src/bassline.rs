@@ -23,6 +23,10 @@ const HOP: usize = 32;
 /// many such 16ths. 0.25 was the best on the test set's rendered loops (0.3 began to cost keys),
 /// with a bass alone still tracked note for note.
 const THRESHOLD: f32 = 0.25;
+/// With no dip below `THRESHOLD`, the deepest dip is taken if it is below this (YIN's own fallback,
+/// with the lower confidence its depth gives). On the test set's rendered loops it raised the bass
+/// pitch class from 70% to 76% on the tune split (71% to 75% on holdout); gains stopped there.
+const FALLBACK: f32 = 0.45;
 /// Frames quieter than this mean square (about −60 dBFS) are unvoiced.
 const SILENCE: f32 = 1e-6;
 
@@ -153,6 +157,10 @@ impl BassTracker {
                 break;
             }
             tau += 1;
+        }
+        if chosen.is_none() {
+            let deepest = (self.tau_min..=self.tau_max).min_by(|&a, &b| d[a].total_cmp(&d[b]));
+            chosen = deepest.filter(|&t| d[t] < FALLBACK);
         }
         let Some(tau) = chosen else { return BassFrame { hz: 0.0, confidence: 0.0 } };
         // Parabolic interpolation around the dip.

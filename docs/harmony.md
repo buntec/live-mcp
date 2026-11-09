@@ -250,7 +250,9 @@ What this shows:
   loops' bass pitch class from 61% to 70% on the tune split (65% to 71% on
   holdout) and the exact note from 46% to 55% (41% to 46%), with chords unchanged
   and a synthetic bass line with a kick still tracked note for note; one tune key
-  changed (an organ Em C D B7 heard in G major). Lowering the tracker's low-pass
+  changed (an organ Em C D B7 heard in G major). YIN's own fallback when no dip
+  passes the threshold, the deepest one below 0.45, raised the pitch class further
+  to 76% (75% on holdout) and the exact note to 59% (47%). Lowering the tracker's low-pass
   (350 Hz) helped under chords but hurt a bass with a kick, and a wider window
   hurt both. The pack loops' bass lines are still to be checked through the Ear.
 - The bass line under chords was poor, though a bass loop alone is tracked well:
