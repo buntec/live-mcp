@@ -150,17 +150,30 @@ through the Ear (the pack's files decode only inside Live), recorded with
 - Keys: right for chordal loops (the string loops, guitars, piano, a pad, a lead
   with chords), mostly wrong for single lines, bass lines and one-note hooks,
   where the loop alone underdetermines the key (the label is the construction
-  kit's key). Confidence tracks this: every wrong key was at 0.61 or below, and
-  every key at 0.9 or above was right.
+  kit's key). Confidence mostly tracks this: in these runs every wrong key was at
+  0.61 or below and every key at 0.9 or above was right, but the bass-loop re-run
+  below has a wrong key at 0.93.
 - Telling pitched beats from drums needed the in-tune peak measure (see
   `audio.rs`): chroma contrast was the same for drum loops and for pads and
   pianos.
+- Bass loops, re-run with the bass-line tracker (nine loops, four of them from
+  the earlier runs, which gave the same results again). The bass line was right
+  on every one, including a walking line tracked note for note. Keys: one-note
+  loops get no key (correctly), and a loop labelled D# that plays only a square-wave
+  Ab0 gets none either (the label is the kit's key). Of the five with several
+  notes, one gets the labelled tonic and one has it as the alternative. The others
+  are wrong: G major at 0.45 and E minor at 0.84 for two A minor lines, and
+  Bb major at 0.93 for an F walking bass whose Eb fits Bb major's scale, though F
+  is on every downbeat.
+- Multi-track: a one-note G bass under the Am–C–G–F string loop turns the combined
+  chords into G inversions (Cmaj7/G, G7) at 0 dB; at −30 dB the combined reading
+  is the strings' own (Am/C | C | Gsus4 G | F Fsus2), with no clash.
 
 Known weak spots: heavily filtered or pitch-bending synths, chord changes where
 sustained notes overlap, and single-note hooks, where the loop alone does not
-determine the key. Bass lines were weak too until the bass-line tracker; it has
-been validated on synthetic bass lines with kicks, and still needs a re-run on the
-real bass loops.
+determine the key. Keys from a bass line alone remain weak: the downbeat bonus
+does not outweigh a strong scale fit, as with the F walking bass heard in Bb
+major at 0.93.
 
 Meters with an odd number of eighths (3/8, 5/8, 7/8): pitch is measured per
 quarter note, so a bar line inside a quarter puts that quarter in both bars. The
