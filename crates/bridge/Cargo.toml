@@ -17,7 +17,7 @@ testkit = ["dep:tempfile"]
 tempfile = { version = "3.27.0", optional = true }
 getrandom = "0.4.3"
 hex = "0.4.3"
-live-mcp-protocol = { version = "0.1.0", path = "../protocol" }
+live-mcp-protocol = { version = "0.2.0", path = "../protocol" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.0"

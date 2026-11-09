@@ -23,7 +23,7 @@ music-specific logic lives on the Rust side.
 The first request on every connection must be:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"hello","params":{"token":"…","protocol":1,"client":"live-mcp 0.1.0"}}
+{"jsonrpc":"2.0","id":1,"method":"hello","params":{"token":"…","protocol":1,"client":"live-mcp 0.2.0"}}
 ```
 
 The token is the content of `~/.live-mcp/token`: 64 hex characters, mode

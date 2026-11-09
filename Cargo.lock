@@ -700,7 +700,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "live-mcp-analysis"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "realfft",
  "serde",
@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "live-mcp-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures",
  "getrandom",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "live-mcp-ear"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "getrandom",
  "live-mcp-analysis",
@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "live-mcp-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "live-mcp-analysis",
  "serde",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "live-mcp-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2096,7 +2096,7 @@ checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nice-plug-xtask",
 ]
