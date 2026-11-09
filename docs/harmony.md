@@ -247,6 +247,14 @@ What this shows:
   16ths with no note when the bass decays or is short. Correcting subharmonics
   (above) fixed most of the octave and fifth errors; the 16ths with no note at all
   (487 of 1746, where the tracker reports nothing) remain, and need the plugin.
+  Tried and reverted, measured on all 147 loops' audio with `score_audio`:
+  raising YIN's threshold from 0.15 to 0.25, and taking the deepest dip when
+  none passes it, took the rendered loops' bass pitch class from 63% to 75% and
+  the exact note from 44% to 53%, but the pack loops' tonics fell from 32 to 29
+  of 76 (mostly kit-keyed bass and synth loops; refitting the key weights did
+  not help) and one rendered key was lost, and the fallback heard a drum loop's
+  kicks as notes and gave it a key. Keys turned on as little as two 16ths of
+  bass line, so a better tracker first needs keys that are steadier against it.
 - Sus chords are called too readily in sparse textures, and loops tuned a quarter
   tone off (±48 cents) fall between two keys. Of four drum loops, three get no
   key; one with tuned kicks gets F# minor at 0.31.
