@@ -81,6 +81,39 @@ pub fn label(chord: Option<Chord>, spelling: Spelling) -> String {
     chord.map_or_else(|| "N".to_owned(), |c| c.name(spelling))
 }
 
+/// A pitch class from its name, sharp or flat: "C" → 0, "F#" and "Gb" → 6.
+#[cfg(test)]
+pub fn pitch_class(name: &str) -> Option<u8> {
+    const SHARPS: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    const FLATS: [&str; 12] = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
+    let pc = SHARPS.iter().position(|n| *n == name).or_else(|| FLATS.iter().position(|n| *n == name))?;
+    Some(pc as u8)
+}
+
+/// Reads a chord name as [`label`] writes it ("Am7", "C/E", "F#m7b5", "N"): `Some(None)` is no
+/// chord, `None` a name it does not know. The bass of an inversion must be a chord tone.
+#[cfg(test)]
+pub fn parse(name: &str) -> Option<Option<Chord>> {
+    let name = name.trim();
+    if name == "N" {
+        return Some(None);
+    }
+    let (body, bass) = match name.split_once('/') {
+        Some((body, bass)) => (body, Some(pitch_class(bass)?)),
+        None => (name, None),
+    };
+    let root_len = if body.len() > 1 && matches!(&body[1..2], "#" | "b") { 2 } else { 1 };
+    let root = pitch_class(body.get(..root_len)?)?;
+    let quality = QUALITIES.iter().position(|q| q.suffix == &body[root_len..])?;
+    let chord = Chord { root, quality, bass: None };
+    match bass {
+        Some(b) if b == root => Some(Some(chord)),
+        Some(b) if chord.tones().any(|t| t == b) => Some(Some(Chord { bass: Some(b), ..chord })),
+        Some(_) => None,
+        None => Some(Some(chord)),
+    }
+}
+
 /// Pitch-class weights of a set of notes, normalised to unit length. Audio templates include
 /// each note's first six harmonics, as heard in a real spectrum.
 fn template(root: u8, intervals: &[u8], source: Source) -> [f32; 12] {

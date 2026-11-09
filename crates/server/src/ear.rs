@@ -475,23 +475,34 @@ fn spans(reports: &[&BarReport]) -> Vec<BarSpan> {
 }
 
 /// With `record_beats` set in `config.json`, saves what one Ear heard (bars and beat reports) as
-/// `<session>-<snapshot>.json`, for tuning and regression tests. An existing file is never
-/// replaced. Failures are ignored: it is a debugging aid.
-fn record(hub: &EarHub, snapshot: &str, label: &str, tempo: f64, bars: &[BarReport], beats: &[BeatReport]) {
-    let Some(dir) = hub.recording_dir() else { return };
+/// `<session>-<snapshot>.json`, for tuning and regression tests, and returns the recording's id
+/// (the file name without `.json`). An existing file is never replaced. Failures only mean no id:
+/// it is a debugging aid.
+fn record(
+    hub: &EarHub,
+    snapshot: &str,
+    label: &str,
+    tempo: f64,
+    bars: &[BarReport],
+    beats: &[BeatReport],
+) -> Option<String> {
+    let dir = hub.recording_dir()?;
     let id = format!("{}-{snapshot}", hub.session.get().copied().unwrap_or(0));
     let spans: Vec<Value> = bars
         .iter()
         .map(|r| json!({"bar": r.bar, "start_beat": r.start_beat, "beats": r.beats, "coverage": r.coverage}))
         .collect();
     let body = json!({"snapshot": snapshot, "label": label, "tempo": tempo, "bars": spans, "beats": beats});
-    let _ = std::fs::create_dir_all(&dir).and_then(|_| {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dir.join(format!("{id}.json")))?
-            .write_all(body.to_string().as_bytes())
-    });
+    std::fs::create_dir_all(&dir)
+        .and_then(|_| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.join(format!("{id}.json")))?
+                .write_all(body.to_string().as_bytes())
+        })
+        .ok()
+        .map(|_| id)
 }
 
 /// Interprets the beats heard in the given bars.
@@ -692,7 +703,11 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
             let music = music[0].as_ref().map(Music::snapshot);
             let id = store.add(Kind::Listen, label.clone(), "bar", heard.values().copied().collect(), music);
             let beats: Vec<BeatReport> = heard_beats[0].values().copied().collect();
-            record(hub, &id, &label, tempo, &heard.values().copied().collect::<Vec<_>>(), &beats);
+            if let Some(recording) =
+                record(hub, &id, &label, tempo, &heard.values().copied().collect::<Vec<_>>(), &beats)
+            {
+                out["recording"] = json!(recording);
+            }
             out["snapshot"] = json!(id);
         }
         if !missing.is_empty() {
@@ -826,7 +841,9 @@ pub async fn listen(live: &Live, hub: &EarHub, store: &SnapshotStore, params: Li
             let snapshot_music = music[k].as_ref().map(Music::snapshot);
             let id = store.add(Kind::Listen, label.clone(), "bar", heard_bars[k].clone(), snapshot_music);
             let beats: Vec<BeatReport> = heard_beats[k].values().copied().collect();
-            record(hub, &id, &label, tempo, &heard_bars[k], &beats);
+            if let Some(recording) = record(hub, &id, &label, tempo, &heard_bars[k], &beats) {
+                entry["recording"] = json!(recording);
+            }
             entry["snapshot"] = json!(id);
             entry["bars"] = json!(bar_entries(&reports, focus, music[k].as_ref()));
         }
