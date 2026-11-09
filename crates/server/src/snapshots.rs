@@ -541,7 +541,14 @@ mod tests {
         let t = Transport { playing: true, beat: Some(0.0), tempo: Some(120.0), time_signature: None };
         analyzer.process(&samples, &samples, &t, &mut |r| reports.push(r));
         let one = reports.into_iter().find(|r| r.beat == 1).unwrap();
-        (from..to).map(|beat| BeatReport { beat, ..one }).collect()
+        // Not `BeatReport { beat, ..one }` in a closure: that crashes rustc 1.88 (our MSRV).
+        (from..to)
+            .map(|beat| {
+                let mut report = one;
+                report.beat = beat;
+                report
+            })
+            .collect()
     }
 
     fn fields(pairs: Value) -> Map<String, Value> {
