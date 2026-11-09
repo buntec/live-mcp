@@ -4,13 +4,15 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use live_mcp_analysis::{BAND_NAMES, BarAnalyzer, BarReport, ProgrammeLoudness, SignalMeter, Sums, Transport};
+use live_mcp_analysis::{
+    BAND_NAMES, BarAnalyzer, BarReport, BeatAnalyzer, BeatReport, ProgrammeLoudness, SignalMeter, Sums, Transport,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::audio_file::{self, Decoded};
-use crate::ear::{compact_bar, round1, round2};
+use crate::ear::{Focus, Music, bar_entries, hear_music, round1, round2};
 use crate::live::default_true;
 use crate::snapshots::{Kind, SnapshotStore};
 
@@ -36,6 +38,10 @@ pub struct AnalyzeFileParams {
     /// List the bars or sections (default true); false gives only the whole-file summary.
     #[serde(default = "default_true")]
     pub bars: bool,
+    /// Also read the music (default true): key, chords, bass, pitch classes, range, tonalness
+    /// and, with a bpm, the rhythm. Without a bpm, chords are per quarter of a section.
+    #[serde(default = "default_true")]
+    pub music: bool,
 }
 
 pub async fn analyze_file(store: &SnapshotStore, params: AnalyzeFileParams) -> Result<Value> {
@@ -64,9 +70,26 @@ pub async fn analyze_file(store: &SnapshotStore, params: AnalyzeFileParams) -> R
             (beats_per_bar * 60.0 / seconds, "section")
         }
     };
-    let analysis = tokio::task::spawn_blocking(move || measure(&decoded, tempo, (num, den), first_downbeat))
-        .await
-        .context("the analysis panicked")?;
+    let want_music = params.music;
+    let analysis =
+        tokio::task::spawn_blocking(move || measure(&decoded, tempo, (num, den), first_downbeat, want_music))
+            .await
+            .context("the analysis panicked")?;
+    let music = if want_music {
+        let reports: Vec<&BarReport> = analysis.bars.iter().filter(|r| r.coverage >= 0.5).collect();
+        hear_music(&reports, &analysis.beats, None).map(|mut m| {
+            if unit == "section" {
+                // Without the tempo the 16th grid means nothing.
+                m.summary.remove("rhythm");
+                for fields in m.bars.values_mut() {
+                    fields.remove("rhythm");
+                }
+            }
+            m
+        })
+    } else {
+        None
+    };
 
     let seconds_per_beat = 60.0 / tempo;
     let mut out = json!({
@@ -76,17 +99,20 @@ pub async fn analyze_file(store: &SnapshotStore, params: AnalyzeFileParams) -> R
         "channels": analysis.channels,
         "summary": analysis.summary,
     });
+    if let Some(m) = &music {
+        out["music"] = Value::Object(m.summary.clone());
+    }
     if unit == "bar" {
         out["tempo"] = json!(tempo);
         out["time_signature"] = json!(format!("{num}/{den}"));
     }
     if params.bars {
-        let listed: Vec<Value> = analysis
-            .bars
+        let shown: Vec<&BarReport> = analysis.bars.iter().take(MAX_LISTED_BARS).collect();
+        let entries = bar_entries(&shown, Focus::All, music.as_ref());
+        let listed: Vec<Value> = shown
             .iter()
-            .take(MAX_LISTED_BARS)
-            .map(|r| {
-                let mut entry = compact_bar(r);
+            .zip(entries)
+            .map(|(r, mut entry)| {
                 if unit == "section" {
                     entry.as_object_mut().expect("object").remove("bar");
                     entry["section"] = json!(r.bar);
@@ -103,7 +129,8 @@ pub async fn analyze_file(store: &SnapshotStore, params: AnalyzeFileParams) -> R
     }
     let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
     let label = if unit == "bar" { format!("{name} at {tempo} BPM") } else { name };
-    out["snapshot"] = json!(store.add(Kind::File, label, unit, analysis.bars));
+    let snapshot_music = music.as_ref().map(Music::snapshot);
+    out["snapshot"] = json!(store.add(Kind::File, label, unit, analysis.bars, snapshot_music));
     Ok(out)
 }
 
@@ -112,10 +139,11 @@ struct Analysis {
     sample_rate: u32,
     channels: usize,
     bars: Vec<BarReport>,
+    beats: Vec<BeatReport>,
     summary: Value,
 }
 
-fn measure(decoded: &Decoded, tempo: f64, time_signature: (u32, u32), first_downbeat: f64) -> Analysis {
+fn measure(decoded: &Decoded, tempo: f64, time_signature: (u32, u32), first_downbeat: f64, music: bool) -> Analysis {
     let sr = decoded.sample_rate as f64;
     let mut programme = ProgrammeLoudness::new(sr);
     let mut whole = SignalMeter::new(sr);
@@ -126,7 +154,9 @@ fn measure(decoded: &Decoded, tempo: f64, time_signature: (u32, u32), first_down
     // Bars start at the first downbeat; the analyzer sees a transport playing from beat 0 there.
     let start = (first_downbeat * sr).round() as usize;
     let mut analyzer = BarAnalyzer::new(decoded.sample_rate as f32);
+    let mut beat_analyzer = music.then(|| BeatAnalyzer::new(decoded.sample_rate as f32));
     let mut bars = Vec::new();
+    let mut beats = Vec::new();
     let mut i = start;
     while i < decoded.left.len() {
         let end = (i + CHUNK).min(decoded.left.len());
@@ -134,9 +164,15 @@ fn measure(decoded: &Decoded, tempo: f64, time_signature: (u32, u32), first_down
         let transport =
             Transport { playing: true, beat: Some(beat), tempo: Some(tempo), time_signature: Some(time_signature) };
         analyzer.process(&decoded.left[i..end], &decoded.right[i..end], &transport, &mut |r| bars.push(r));
+        if let Some(b) = beat_analyzer.as_mut() {
+            b.process(&decoded.left[i..end], &decoded.right[i..end], &transport, &mut |r| beats.push(r));
+        }
         i = end;
     }
     analyzer.flush(&mut |r| bars.push(r));
+    if let Some(b) = beat_analyzer.as_mut() {
+        b.flush(&mut |r| beats.push(r));
+    }
 
     let stats = whole_sums.stats();
     let mut bands = Map::new();
@@ -161,7 +197,14 @@ fn measure(decoded: &Decoded, tempo: f64, time_signature: (u32, u32), first_down
     if stats.clipped_samples > 0 {
         summary["clipped"] = json!(stats.clipped_samples);
     }
-    Analysis { seconds: decoded.seconds(), sample_rate: decoded.sample_rate, channels: decoded.channels, bars, summary }
+    Analysis {
+        seconds: decoded.seconds(),
+        sample_rate: decoded.sample_rate,
+        channels: decoded.channels,
+        bars,
+        beats,
+        summary,
+    }
 }
 
 fn expand_home(path: &str) -> Result<PathBuf> {

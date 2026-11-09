@@ -1,10 +1,14 @@
 //! Messages from the LiveMCP Ear plugin to the MCP server: newline-delimited JSON over TCP on
 //! 127.0.0.1. The plugin connects to the server (the server listens), so plugins can come and go.
 
-use live_mcp_analysis::BarReport;
+use live_mcp_analysis::{BarReport, BeatReport};
 use serde::{Deserialize, Serialize};
 
-pub const EAR_PROTOCOL_VERSION: u32 = 1;
+/// Version 2 added [`EarMessage::Beat`]; version 3 added the bass line to beat reports
+/// (`bass_notes`, `bass_cents`, `bass_confidence`, empty when parsed from version 2).
+pub const EAR_PROTOCOL_VERSION: u32 = 3;
+/// The oldest plugin protocol the server still accepts. Version 1 plugins report bars only.
+pub const EAR_MIN_PROTOCOL_VERSION: u32 = 1;
 
 /// Default port the MCP server listens on for plugins. `~/.live-mcp/config.json` can set
 /// `{"ear_port": N}` (0 = any free port); the server advertises the port it actually bound in
@@ -33,6 +37,8 @@ pub enum EarMessage {
     Heartbeat { tag: u32, playing: bool, beat: Option<f64> },
     /// One finished bar.
     Bar { tag: u32, report: BarReport },
+    /// One finished beat: pitch and onset features (protocol 2).
+    Beat { tag: u32, report: BeatReport },
 }
 
 /// Contents of `~/.live-mcp/ear.json`, written by the server once it listens for plugins.

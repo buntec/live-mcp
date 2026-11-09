@@ -90,6 +90,13 @@ async fn tracks_and_clips_round_trip() {
             {"pitch": 48, "start": 2.0, "duration": 0.5, "velocity": 100.0, "probability": 0.5},
         ])
     );
+    // The musical reading: single bass notes are no chord; the onsets land on beats 1–3.
+    let music = &read["music"];
+    assert_eq!(music["progression"], "N", "{music}");
+    assert_eq!(music["scale"], json!({"set": "C Major", "outside": []}));
+    assert_eq!(music["bars"][0]["rhythm"], "X... X... X... ....", "{music}");
+    assert_eq!(music["bars"][0]["range"], "C1–C2");
+    assert_eq!(music["bars"][0]["bass"], "C");
 
     // Replacing (the default) clears the old notes; replace=false adds to them.
     h.ok("write_clip", json!({"track": 2, "slot": 0, "notes": [{"pitch": 60, "start": 0, "duration": 1}]})).await;

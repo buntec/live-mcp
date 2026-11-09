@@ -194,7 +194,14 @@ impl LiveServer {
     }
 
     #[tool(
-        description = "Read a clip: name, length, loop and markers, and its MIDI notes.",
+        description = "Read a clip: name, length, loop and markers, and its MIDI notes. For MIDI clips, `music` \
+                       reads the notes that play (the loop, or start to end marker) musically: key with confidence, \
+                       chord progression (\"N\" = no chord), and per bar the chord(s) with confidence and \
+                       alternatives, bass, the lowest notes on the 16th grid (\"bass_line\": note where one \
+                       starts, - held, . none), pitch classes (\"pcs\", weight relative to the bar's strongest), a \
+                       16th-note onset grid (X strong, x weaker, . none; a space between beats), the note range \
+                       (Live's names, C3 = MIDI 60), and pitch classes outside the set's scale. Bars count from the \
+                       clip's start.",
         annotations(read_only_hint = true)
     )]
     async fn read_clip(&self, Parameters(p): Parameters<ReadClipParams>) -> ToolResult {
@@ -247,9 +254,20 @@ impl LiveServer {
         description = "Listen to the set through a LiveMCP Ear plugin (default: the one on the master track): plays \
                        `bars` bars from `start_bar` in real time and returns per-bar loudness (LUFS), peak, RMS, \
                        crest, five frequency bands (low <120 Hz, low_mid 120-500, mid 500-2k, high_mid 2-6k, high \
-                       >6k, dBFS), stereo correlation and width, plus a section summary. With `tracks` (a list, \
-                       or [\"all\"]) it listens through several Ears at once and reports which tracks share each \
-                       frequency band (masking)."
+                       >6k, dBFS), stereo correlation and width, plus a section summary. It also hears the music \
+                       (`focus` \"all\", the default, or \"music\" alone, or \"mix\" alone): per bar the \
+                       chord(s) with confidence and alternatives (\"N\" = no chord: silence, noise, drums, a \
+                       single note or a bass line), bass, the bass line on the 16th grid (\"bass_line\": note \
+                       where one starts, - held, . none; from a pitch tracker, so it is the fundamental, not \
+                       harmonics), pitch classes (\"pcs\", weight relative to the bar's strongest), a \
+                       16th-note onset grid (X strong, x weaker, . none, - not heard; a space between beats), \
+                       octave range (Live's names, C3 = MIDI 60) and tonalness (0 noise … 1 pitched); and for the \
+                       section the key with confidence, the progression, tuning if off by 10+ cents, rhythm \
+                       pattern, density and syncopation, and pitch classes outside the set's scale. Chords from \
+                       audio are estimates: weigh the confidence and the pitch classes behind them. With `tracks` \
+                       (a list, or [\"all\"]) it listens through several Ears at once and reports which tracks \
+                       share each frequency band (masking), the chords the tracks make together, semitone \
+                       clashes between them, and octaves crowded by three or more tracks."
     )]
     async fn listen(&self, Parameters(p): Parameters<ListenParams>) -> ToolResult {
         respond(ear::listen(&self.live, &self.hub, &self.snapshots, p).await)

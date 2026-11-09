@@ -195,7 +195,10 @@ mod tests {
         let mut next = || serde_json::from_str::<EarMessage>(&lines.next().unwrap().unwrap()).unwrap();
         match next() {
             EarMessage::Hello { token, instance, sample_rate, protocol, .. } => {
-                assert_eq!((token.as_str(), instance, sample_rate, protocol), ("secret", 77, 44_100.0, 1));
+                assert_eq!(
+                    (token.as_str(), instance, sample_rate, protocol),
+                    ("secret", 77, 44_100.0, EAR_PROTOCOL_VERSION)
+                );
             }
             other => panic!("expected hello, got {other:?}"),
         }
