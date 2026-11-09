@@ -303,7 +303,12 @@ fn key_json(estimate: &KeyEstimate) -> Value {
     out
 }
 
-fn key_changes(section: &Section, ranges: &[std::ops::Range<usize>]) -> Vec<(i64, Key)> {
+/// The chords of the pitched beats at `positions` that are not bass lines.
+fn heard_chords(beats: &[Beat], labels: &chords::Labels, positions: std::ops::Range<usize>) -> Vec<chords::Chord> {
+    positions.filter(|&t| beats[t].pitched && !beats[t].bass_only).filter_map(|t| labels.chord(t)).collect()
+}
+
+fn key_changes(section: &Section, ranges: &[std::ops::Range<usize>], labels: &chords::Labels) -> Vec<(i64, Key)> {
     let n = section.bars.len();
     if n < KEY_CHANGE_MIN_BARS {
         return Vec::new();
@@ -317,7 +322,8 @@ fn key_changes(section: &Section, ranges: &[std::ops::Range<usize>]) -> Vec<(i64
             let last = ranges[from..to].iter().map(|r| r.end).max().unwrap_or(first);
             let beats: Vec<&Beat> = section.beats[first..last.max(first)].iter().collect();
             let hint = downbeat_bass(beats.iter().copied(), section.bars);
-            key::estimate_with_tonic_hint(&key_profile(beats.iter().copied(), section.bars), hint.as_ref())
+            let chords = heard_chords(section.beats, labels, first..last.max(first));
+            key::estimate_with_harmony(&key_profile(beats.iter().copied(), section.bars), hint.as_ref(), &chords)
                 .map(|e| e.key)
         })
         .collect();
@@ -387,13 +393,8 @@ pub fn analyze(section: &Section) -> Analysis {
     let ranges = bar_ranges(beats, section.bars);
     let enough = pitched_beats >= KEY_MIN_PITCHED && pitched_beats as f32 >= KEY_MIN_PITCHED_SHARE * beats.len() as f32;
     let hint = downbeat_bass(beats.iter(), section.bars);
-    let estimate = if enough {
-        key::estimate_with_tonic_hint(&key_profile(beats.iter(), section.bars), hint.as_ref())
-    } else {
-        None
-    };
-    let key = estimate.map(|e| e.key);
-    let spelling = spelling(key);
+    let key_weights = key_profile(beats.iter(), section.bars);
+    let mut estimate = if enough { key::estimate_with_tonic_hint(&key_weights, hint.as_ref()) } else { None };
 
     let mut change_cost = vec![CHANGE_ELSEWHERE; beats.len()];
     for (bar, range) in section.bars.iter().zip(&ranges) {
@@ -408,7 +409,19 @@ pub fn analyze(section: &Section) -> Analysis {
             };
         }
     }
-    let labels = chords::label_beats(beats, &change_cost, key, section.source);
+    let mut labels = chords::label_beats(beats, &change_cost, estimate.map(|e| e.key), section.source);
+    // Again with the chords as evidence for the key, and the chords again if the key changed (it
+    // decides which chords get the in-key bonus).
+    if enough {
+        let heard = heard_chords(beats, &labels, 0..beats.len());
+        let refined = key::estimate_with_harmony(&key_weights, hint.as_ref(), &heard);
+        if refined.map(|e| e.key) != estimate.map(|e| e.key) {
+            labels = chords::label_beats(beats, &change_cost, refined.map(|e| e.key), section.source);
+        }
+        estimate = refined;
+    }
+    let key = estimate.map(|e| e.key);
+    let spelling = spelling(key);
     let (rhythm_bars, rhythm) = rhythm::analyze(beats, section.bars);
     let onset_reference = rhythm::reference(beats);
 
@@ -480,7 +493,7 @@ pub fn analyze(section: &Section) -> Analysis {
     let mut summary = Map::new();
     if pitched {
         summary.insert("key".into(), estimate.as_ref().map_or(Value::Null, key_json));
-        let changes = key_changes(section, &ranges);
+        let changes = key_changes(section, &ranges, &labels);
         if !changes.is_empty() {
             let list: Vec<Value> = changes.iter().map(|(bar, key)| json!({"bar": bar, "key": key.name()})).collect();
             summary.insert("key_changes".into(), json!(list));
