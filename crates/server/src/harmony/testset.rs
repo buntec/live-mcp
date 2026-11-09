@@ -975,3 +975,194 @@ fn key_weight_search() {
         println!("{:28} {of:>4} {}", format!("{group} ({split:?})").to_lowercase(), cells.join(""));
     }
 }
+
+/// The bass line of the rendered loops, 16th by 16th: what the plugin's tracker reported and what
+/// the server kept, against the notes played. Interval classes: exact, octave (±12, ±24), fifth
+/// (±7, ±19: a note heard at 2/3 or 3/2 of its frequency), other, none.
+#[test]
+#[ignore = "needs recordings: HEARD=<run folder>[:<run folder>…]"]
+fn bass_diagnostics() {
+    let Ok(dirs) = std::env::var("HEARD") else { return };
+    let set = load_set();
+    let mut latest: BTreeMap<String, Recording> = BTreeMap::new();
+    for dir in dirs.split(':') {
+        let dir = Path::new(dir);
+        let takes: BTreeMap<String, String> = std::fs::read_to_string(dir.join("takes.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        for rec in load(dir) {
+            if let Some(id) = takes.get(&rec.id) {
+                latest.insert(id.clone(), rec);
+            }
+        }
+    }
+    let class = |got: Option<u8>, want: u8| -> &'static str {
+        match got.map(|g| g as i32 - want as i32) {
+            None => "none",
+            Some(0) => "exact",
+            Some(12 | -12 | 24 | -24) => "octave",
+            Some(7 | -7 | 19 | -19) => "fifth",
+            Some(5 | -5 | 17 | -17) => "fourth",
+            Some(_) => "other",
+        }
+    };
+    let classes = ["exact", "octave", "fifth", "fourth", "other", "none"];
+    let mut total_raw: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut total_kept: BTreeMap<&str, usize> = BTreeMap::new();
+    // Why a raw note is missing: the tracker had none, or it was too unsure, or the beat too quiet.
+    let mut missing: BTreeMap<&str, usize> = BTreeMap::new();
+    // (raw − played, kept − played) in semitones → 16ths.
+    let mut moves: BTreeMap<(String, String), usize> = BTreeMap::new();
+    println!("{:26} {:>4}  raw: {}  |  kept: {}", "loop", "16ths", classes.join(" "), classes.join(" "));
+    for l in set.iter().filter(|l| l.render.as_ref().is_some_and(|r| r.bass)) {
+        let Some(rec) = latest.get(&l.id) else { continue };
+        let truth: BTreeMap<i64, super::Beat> =
+            midi::beats(&notes(l), 0.0, l.bars as f64 * l.beats_per_bar()).into_iter().map(|b| (b.index, b)).collect();
+        let (kept, _) = audio::beats(&rec.beats);
+        let kept: BTreeMap<i64, &super::Beat> = kept.iter().map(|b| (b.index, b)).collect();
+        let mut raw_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut kept_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut n = 0;
+        for r in &rec.beats {
+            let Some(want) = truth.get(&r.beat) else { continue };
+            for s in 0..4 {
+                let Some(w) = want.bass_line[s] else { continue };
+                n += 1;
+                let raw = (r.bass_notes[s] > 0).then_some(r.bass_notes[s]);
+                *raw_counts.entry(class(raw, w.pitch)).or_default() += 1;
+                let got = kept.get(&r.beat).and_then(|b| b.bass_line[s]).map(|b| b.pitch);
+                *kept_counts.entry(class(got, w.pitch)).or_default() += 1;
+                let signed =
+                    |g: Option<u8>| g.map_or("none".to_owned(), |g| format!("{:+}", g as i32 - w.pitch as i32));
+                *moves.entry((signed(raw), signed(got))).or_default() += 1;
+                if got.is_none() {
+                    let why = if r.bass_notes[s] == 0 {
+                        "tracker had no note"
+                    } else if r.bass_confidence[s] < 64 {
+                        "below confidence 64"
+                    } else if r.level_db < -50.0 {
+                        "beat below -50 dB"
+                    } else {
+                        "dropped by the server"
+                    };
+                    *missing.entry(why).or_default() += 1;
+                }
+            }
+        }
+        let cells = |c: &BTreeMap<&str, usize>| {
+            classes.iter().map(|k| format!("{:>4}", c.get(k).copied().unwrap_or(0))).collect::<Vec<_>>().join(" ")
+        };
+        println!("{:26} {n:>4}  raw: {}  |  kept: {}", l.id, cells(&raw_counts), cells(&kept_counts));
+        for (k, v) in raw_counts {
+            *total_raw.entry(k).or_default() += v;
+        }
+        for (k, v) in kept_counts {
+            *total_kept.entry(k).or_default() += v;
+        }
+    }
+    let cells = |c: &BTreeMap<&str, usize>| {
+        classes.iter().map(|k| format!("{:>4}", c.get(k).copied().unwrap_or(0))).collect::<Vec<_>>().join(" ")
+    };
+    println!("{:26} {:>4}  raw: {}  |  kept: {}", "ALL", "", cells(&total_raw), cells(&total_kept));
+    println!("why kept notes are missing: {missing:?}");
+    let mut moves: Vec<_> = moves.into_iter().collect();
+    moves.sort_by_key(|m| std::cmp::Reverse(m.1));
+    println!("raw → kept (semitones from the note played), commonest first:");
+    for ((raw, kept), n) in moves.iter().take(16) {
+        println!("  {raw:>5} → {kept:>5}: {n}");
+    }
+}
+
+/// One line per tracked bass 16th of a rendered loop, for working out octave and fifth corrections
+/// offline: split, loop, raw − played (semitones), the raw note, its confidence, energy per octave
+/// (share of the beat's strongest) and the bass chroma (share of its strongest), folded in tune.
+#[test]
+#[ignore = "writes BASS_DUMP=<file> from HEARD=<run folder>"]
+fn bass_dump() {
+    let (Ok(dirs), Ok(out)) = (std::env::var("HEARD"), std::env::var("BASS_DUMP")) else { return };
+    let set = load_set();
+    let mut latest: BTreeMap<String, Recording> = BTreeMap::new();
+    for dir in dirs.split(':') {
+        let dir = Path::new(dir);
+        let takes: BTreeMap<String, String> = std::fs::read_to_string(dir.join("takes.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        for rec in load(dir) {
+            if let Some(id) = takes.get(&rec.id) {
+                latest.insert(id.clone(), rec);
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    for l in set.iter().filter(|l| l.render.as_ref().is_some_and(|r| r.bass)) {
+        let Some(rec) = latest.get(&l.id) else { continue };
+        let truth: BTreeMap<i64, super::Beat> =
+            midi::beats(&notes(l), 0.0, l.bars as f64 * l.beats_per_bar()).into_iter().map(|b| (b.index, b)).collect();
+        for r in &rec.beats {
+            let Some(want) = truth.get(&r.beat) else { continue };
+            let max_octave = r.octaves.iter().copied().max().unwrap_or(0).max(1) as f32;
+            let bass: Vec<f32> = r.bass.iter().map(|bins| bins.iter().map(|&v| v as f32).sum()).collect();
+            let max_bass = bass.iter().copied().fold(0.0, f32::max).max(1.0);
+            for s in 0..4 {
+                let (Some(w), true) = (want.bass_line[s], r.bass_notes[s] > 0) else { continue };
+                let octaves: Vec<String> = r.octaves.iter().map(|&o| format!("{:.2}", o as f32 / max_octave)).collect();
+                let chroma: Vec<String> = bass.iter().map(|&v| format!("{:.2}", v / max_bass)).collect();
+                lines.push(format!(
+                    "{:?}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    l.split,
+                    l.id,
+                    r.bass_notes[s] as i32 - w.pitch as i32,
+                    r.bass_notes[s],
+                    r.bass_confidence[s],
+                    octaves.join(","),
+                    chroma.join(",")
+                ));
+            }
+        }
+    }
+    std::fs::write(out, lines.join("\n") + "\n").unwrap();
+}
+
+/// The bass notes the server keeps, per loop and 16th, for comparing two versions of the code on
+/// loops without bass labels: KEPT_DUMP=<file>.
+#[test]
+#[ignore = "writes KEPT_DUMP=<file> from HEARD=<run folder>[:…]"]
+fn bass_kept_dump() {
+    let (Ok(dirs), Ok(out)) = (std::env::var("HEARD"), std::env::var("KEPT_DUMP")) else { return };
+    let set = load_set();
+    let mut latest: BTreeMap<String, Recording> = BTreeMap::new();
+    for dir in dirs.split(':') {
+        let dir = Path::new(dir);
+        let takes: BTreeMap<String, String> = std::fs::read_to_string(dir.join("takes.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        for rec in load(dir) {
+            if let Some(id) = takes.get(&rec.id) {
+                latest.insert(id.clone(), rec);
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    for l in &set {
+        let Some(rec) = latest.get(&l.id) else { continue };
+        let beats = audio::beats(&rec.beats).0;
+        let analysis = analyze(&Section { bars: &rec.bars, beats: &beats, source: Source::Audio, scale: None });
+        for b in &beats {
+            let tones: Vec<String> = analysis
+                .chords
+                .get(&b.index)
+                .copied()
+                .flatten()
+                .map(|c| c.tones().map(|t| t.to_string()).collect())
+                .unwrap_or_default();
+            for (s, n) in b.bass_line.iter().enumerate() {
+                let pitch = n.map_or(0, |n| n.pitch);
+                lines.push(format!("{}\t{}\t{}\t{}\t{pitch}\t{}", l.category, l.id, b.index, s, tones.join(",")));
+            }
+        }
+    }
+    std::fs::write(out, lines.join("\n") + "\n").unwrap();
+}
