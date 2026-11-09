@@ -134,8 +134,25 @@ sparser there than on the bass track's own Ear.
 Re-recording the bass loops through the new Ear showed three more things, now
 handled. Chords and bright tones make YIN report the residue pitch, the period the
 partials share, an octave or two below the lowest real note (a guitar's A read as
-A0, its B as B-1). Notes are lifted while their octave holds almost no energy and
-the one above holds more. Bass notes are re-rounded against the section's tuning.
+A0, its B as B-1). Bass notes are re-rounded against the section's tuning.
+
+The test set showed how the bass tracker slips under chords, and the server now
+corrects it (`correct_subharmonics` in `audio.rs`). Of the rendered loops' bass
+16ths the tracker reported 358 right, 596 an octave off and 136 a fifth off,
+nearly all too low: YIN settles on a period two, three or four times the note's,
+where the chord's partials repeat together. A subharmonic sits in an octave with
+almost no energy, and after a slip to a third of the frequency its pitch class is
+missing from the bass register while the fifth above is there. So a report whose
+pitch class has under 0.4 of the bass register's strongest, while the fifth (or
+major third) above has 0.7, moves up to it; and a note moves up an octave while
+the octave above holds 30 times its octave's energy. The earlier rule compared a
+note's octave with the beat's strongest, which a chord over a correct bass note
+fills too, so it lifted correct notes; it is kept below C1 only, with its drop of
+notes in near-empty octaves (mains hum). The thresholds come from the tune split.
+Exact bass notes went from 459 to 778 of 1746 16ths: from 25% to 50% on the tune
+split and from 28% to 38% on holdout. On the pack loops,
+which have no bass labels, 38% more bass notes are kept with the same share of
+chord tones (85–86%). Plain bass loops are all but unchanged (22 of 608 16ths).
 And correlation with key profiles cannot name the tonic of a bass line that leaves
 out the deciding note (a D minor line with no F fits G minor as well), so the
 pitch-class profile weights bass notes by metric position, and each key gets a
@@ -194,18 +211,20 @@ inversions, two chords per bar, sustained chords, stabs and arpeggios, 3/4, 6/8,
 "tune". The same rendered loops read from their MIDI give a ceiling for what can
 be heard of them.
 
-Scores (2026-11-09), per beat for chords and per 16th for the bass; keys before
-and after the chords' fit was added:
+Scores (2026-11-09), per beat for chords and per 16th for the bass:
 
-| | loops | key, before | key, with chords | chord root | root and third | bass line |
-| --- | --- | --- | --- | --- | --- | --- |
-| Pack loops, loop's own key | 115 | 21/52 | 25/52 | 87% | 77% | - |
-| Pack loops, kit's key | | 14/43 | 15/43 | | | |
-| Rendered, heard | 32 | 24/30 | 28/30 | 89% | 87% | 46% pitch class, 26% exact note |
-| Rendered, from MIDI | 32 | 22/30 | 30/30 | 100% | 100% | 100% |
+| | loops | key, first | with chords | now | chord root | root and third | bass line, first → now |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Pack loops, loop's own key | 115 | 21/52 | 25/52 | 24/52 | 87% | 77% | - |
+| Pack loops, kit's key | | 14/43 | 15/43 | 13/43 | | | |
+| Rendered, heard | 32 | 24/30 | 28/30 | 29/30 | 89% | 87% | exact note 26% → 45%, pitch class 46% → 52% |
+| Rendered, from MIDI | 32 | 22/30 | 30/30 | 30/30 | 100% | 100% | 100% |
 
-Of the holdout split, which the weight was not chosen on, the pack loops' own
-keys went from 13 to 16 of 30 and the rendered ones from 11 to 13 of 14.
+"With chords" adds the chords' fit to the key; "now" also corrects the bass
+tracker's subharmonics (see the bass line above), which moves keys a little, since
+bass notes count towards them. Of the holdout split, which the key weight was not
+chosen on, the pack loops' own keys went from 13 to 16 of 30 and the rendered ones
+from 11 to 13 of 14 with chords.
 
 What this shows:
 
@@ -223,9 +242,11 @@ What this shows:
   arpeggio in the bass tracker's range, which is taken for a bass line and given
   no chord. Low chords on a piano and palm-muted guitar chugs are read as bass
   lines too, and a chord that has decayed (piano, pluck) reads as "N".
-- The bass line under chords is poor, though a bass loop alone is tracked well:
+- The bass line under chords was poor, though a bass loop alone is tracked well:
   octave errors, a note heard at two thirds of its frequency (A1 as D1), and many
-  16ths with no note when the bass decays or is short.
+  16ths with no note when the bass decays or is short. Correcting subharmonics
+  (above) fixed most of the octave and fifth errors; the 16ths with no note at all
+  (487 of 1746, where the tracker reports nothing) remain, and need the plugin.
 - Sus chords are called too readily in sparse textures, and loops tuned a quarter
   tone off (±48 cents) fall between two keys. Of four drum loops, three get no
   key; one with tuned kicks gets F# minor at 0.31.

@@ -176,8 +176,16 @@ async fn listen_through_an_ear_on_the_master_track() {
     let again = h.ok("listen", json!({"start_bar": 2, "bars": 1})).await;
     assert_eq!(again["bars"][0]["bar"], 2, "{again}");
 
-    // listen started playback, so it stopped it again.
-    let state = h.ok("transport", json!({})).await;
+    // listen started playback, so it stopped it again. Live reports is_playing a tick after the
+    // stop, so a slow machine can still read it as playing straight away.
+    let mut state = h.ok("transport", json!({})).await;
+    for _ in 0..20 {
+        if state["playing"] == false {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state = h.ok("transport", json!({})).await;
+    }
     assert_eq!(state["playing"], false, "{state}");
 
     // A second Ear: tags stay unique, and the existing one keeps its tag.

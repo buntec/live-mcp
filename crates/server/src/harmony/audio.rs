@@ -147,18 +147,31 @@ fn retune_bass(beats: &mut [Beat], tuning: f32) {
     }
 }
 
-/// Of a beat's energy per octave, the share an octave needs before a bass note is believed to
-/// sound in it.
-const RESIDUE_OCTAVE_MIN: f32 = 0.25;
-/// A bass note whose octave (after lifting) holds less than this share is dropped.
+/// Under chords, the bass tracker's commonest slip is to a subharmonic: YIN settles on a period
+/// two, three or four times the note's (where the chord's partials repeat together) and reports
+/// the note an octave, an octave and a fifth, or two octaves too low. Such a report sits in an
+/// octave with hardly any energy, and after a slip to a third (or fifth) of the frequency its
+/// pitch class is missing from the bass register while the fifth (major third) above is there.
+///
+/// A report whose pitch class has less than this share of the bass register's strongest...
+const SUBHARMONIC_ABSENT: f32 = 0.4;
+/// ...while the fifth or major third above has at least this share moves to it.
+const SUBHARMONIC_PRESENT: f32 = 0.7;
+/// A note moves up an octave while the octave above holds this many times its octave's energy.
+/// (Comparing with the octave above alone, not the beat's strongest octave: a chord fills the
+/// octaves above a correct bass note too.)
+const EMPTY_OCTAVE_RATIO: f32 = 30.0;
+/// Below C1, as before: a note moves up while its octave holds less than this share of the beat's
+/// strongest and the octave above more than twice as much...
+const LOW_OCTAVE_LIFT: f32 = 0.25;
+/// ...and is dropped if its octave still holds less than this: mains hum under a guitar, rumble.
 const BASS_NOTE_OCTAVE_MIN: f32 = 0.1;
+const LOW_OCTAVE_TOP: u8 = 36;
 
-/// Moves bass notes up an octave (at most two) when hardly any energy is in their octave but the
-/// octave above has more: chords and bright tones make YIN report the residue pitch, the period
-/// the partials share, an octave or two below the lowest real note (A and E together repeat at A
-/// an octave down).
-fn lift_residue_octaves(beats: &mut [Beat]) {
-    for beat in beats.iter_mut() {
+/// Corrects subharmonic reports (see [`SUBHARMONIC_ABSENT`]). `bass_shares` is each beat's
+/// bass-register energy per pitch class, as a share of its strongest.
+fn correct_subharmonics(beats: &mut [Beat], bass_shares: &[[f32; 12]]) {
+    for (beat, shares) in beats.iter_mut().zip(bass_shares) {
         let octaves = beat.octaves;
         let max = octaves.iter().copied().fold(0.0, f32::max);
         if max <= 0.0 {
@@ -170,20 +183,29 @@ fn lift_residue_octaves(beats: &mut [Beat]) {
         };
         for slot in beat.bass_line.iter_mut() {
             let Some(note) = slot.as_mut() else { continue };
-            for _ in 0..2 {
+            let pc = |pitch: u8| (pitch % 12) as usize;
+            if shares[pc(note.pitch)] < SUBHARMONIC_ABSENT
+                && let Some(up) = [7u8, 16].into_iter().find(|up| shares[pc(note.pitch + up)] >= SUBHARMONIC_PRESENT)
+                && note.pitch + up <= 84
+            {
+                note.pitch += up;
+            }
+            for _ in 0..3 {
                 let (here, above) = (energy(note.pitch), energy(note.pitch + 12));
-                // Below the lowest octave measured (C0), any energy above counts.
-                let below_range = note.pitch < 24 && above > 0.0;
-                if here < RESIDUE_OCTAVE_MIN && (above > here * 2.0 || below_range) && note.pitch + 12 <= 72 {
+                if above > EMPTY_OCTAVE_RATIO * here && note.pitch + 12 <= 72 {
                     note.pitch += 12;
                 } else {
                     break;
                 }
             }
-            // A note in an octave with hardly any of the beat's energy is not the part's bass:
-            // mains hum under a guitar, rumble under a pad.
-            if energy(note.pitch) < BASS_NOTE_OCTAVE_MIN {
-                *slot = None;
+            if note.pitch < LOW_OCTAVE_TOP {
+                let (here, above) = (energy(note.pitch), energy(note.pitch + 12));
+                if here < LOW_OCTAVE_LIFT && above > 2.0 * here {
+                    note.pitch += 12;
+                }
+                if energy(note.pitch) < BASS_NOTE_OCTAVE_MIN {
+                    *slot = None;
+                }
             }
         }
     }
@@ -246,9 +268,12 @@ fn smooth_bass_only(beats: &mut [Beat]) {
 pub fn beats(reports: &[BeatReport]) -> (Vec<Beat>, Option<f32>) {
     let tuning = tuning_cents(reports);
     let cents = tuning.unwrap_or(0.0);
-    let mut beats: Vec<Beat> = reports
+    let mut beats: Vec<(Beat, [f32; 12])> = reports
         .iter()
         .map(|r| {
+            let low = fold(&r.bass, cents);
+            let strongest = low.iter().copied().fold(0.0, f32::max);
+            let shares = if strongest > 0.0 { low.map(|v| v / strongest) } else { [0.0; 12] };
             let (chroma, strength) = contrast(fold(&r.treble, cents));
             let (bass, _) = contrast(fold(&r.bass, cents));
             let peaked = strength > 0.0 && (in_tune_peak(&r.treble, cents) >= MIN_PEAK || strength >= STRONG_CONTRAST);
@@ -256,7 +281,7 @@ pub fn beats(reports: &[BeatReport]) -> (Vec<Beat>, Option<f32>) {
             let has_line = line.iter().any(Option::is_some);
             let upper = r.octaves[3..].iter().map(|&v| v as f32).sum::<f32>() / 255.0;
             let upper_quiet = upper < BASS_ONLY_UPPER || (has_line && upper < BASS_ONLY_UPPER_WITH_LINE);
-            Beat {
+            let beat = Beat {
                 index: r.beat,
                 coverage: r.coverage,
                 weight: amplitude(r.level_db),
@@ -271,12 +296,14 @@ pub fn beats(reports: &[BeatReport]) -> (Vec<Beat>, Option<f32>) {
                 onsets: r.onsets.map(|v| if (v as f32) < ONSET_FLOOR { 0.0 } else { v as f32 }),
                 span: None,
                 tonal: Some(r.tonal),
-            }
+            };
+            (beat, shares)
         })
         .collect();
-    beats.sort_by_key(|b| b.index);
+    beats.sort_by_key(|(b, _)| b.index);
+    let (mut beats, shares): (Vec<Beat>, Vec<[f32; 12]>) = beats.into_iter().unzip();
     retune_bass(&mut beats, cents);
-    lift_residue_octaves(&mut beats);
+    correct_subharmonics(&mut beats, &shares);
     smooth_octaves(&mut beats);
     smooth_bass_only(&mut beats);
     (beats, tuning)
@@ -467,6 +494,41 @@ mod tests {
         assert_eq!(bar1["bass"], "D");
         assert_eq!(bar1["range"], "D1–C2");
         assert_eq!(bar1["chord"], "N", "a bass line is not a chord");
+    }
+
+    /// A beat whose bass line reports `pitch` on every 16th, with this energy per octave.
+    fn reported(pitch: u8, octaves: [f32; 7]) -> Beat {
+        let note = Some(BassNote { pitch, cents: 0.0, confidence: 1.0 });
+        Beat { pitched: true, octaves, bass_line: [note; 4], ..Beat::default() }
+    }
+
+    fn corrected(pitch: u8, octaves: [f32; 7], shares: [f32; 12]) -> Option<u8> {
+        let mut beats = [reported(pitch, octaves)];
+        correct_subharmonics(&mut beats, &[shares]);
+        beats[0].bass_line[0].map(|n| n.pitch)
+    }
+
+    #[test]
+    fn subharmonic_bass_reports_are_corrected() {
+        // A chord over a C1 bass: octaves 0–6 from C0. The bass's own octave holds little of the
+        // beat's energy next to the chord above it, but it is not empty.
+        let chord_over_bass = [0.0, 0.2, 0.6, 1.0, 0.5, 0.0, 0.0];
+        let mut c_strong = [0.2; 12];
+        c_strong[0] = 1.0;
+        assert_eq!(corrected(36, chord_over_bass, c_strong), Some(36), "a correct C1 stays");
+        // The tracker's C0 for that C1: its octave is empty.
+        assert_eq!(corrected(24, chord_over_bass, c_strong), Some(36), "an octave low");
+        // A G1 reported as C0 (a third of its frequency): C is missing from the bass register,
+        // G strong.
+        let g1 = [0.0, 0.3, 0.6, 1.0, 0.5, 0.0, 0.0];
+        let mut g_strong = [0.1; 12];
+        g_strong[7] = 1.0;
+        assert_eq!(corrected(24, g1, g_strong), Some(43), "an octave and a fifth low");
+        // Mains hum at G0 under a guitar: nothing in its octave or the one above.
+        let guitar = [0.03, 0.04, 0.5, 1.0, 0.6, 0.1, 0.0];
+        let mut g_hum = [0.1; 12];
+        g_hum[7] = 1.0;
+        assert_eq!(corrected(31, guitar, g_hum), None, "hum");
     }
 
     #[test]
