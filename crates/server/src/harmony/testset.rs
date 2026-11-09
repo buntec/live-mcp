@@ -978,6 +978,173 @@ fn key_diagnostics() {
     }
 }
 
+/// The latest recording of each loop in `dirs` (`:`-separated), by loop id.
+fn latest_recordings(dirs: &str) -> BTreeMap<String, Recording> {
+    let mut latest = BTreeMap::new();
+    for dir in dirs.split(':') {
+        let dir = Path::new(dir);
+        let takes: BTreeMap<String, String> = std::fs::read_to_string(dir.join("takes.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        for rec in load(dir) {
+            if let Some(id) = takes.get(&rec.id) {
+                latest.insert(id.clone(), rec);
+            }
+        }
+    }
+    latest
+}
+
+/// The key `analyze` names for these beats, if any.
+fn key_of(bars: &[BarSpan], beats: &[super::Beat]) -> Option<Key> {
+    let analysis = analyze(&Section { bars, beats, source: Source::Audio, scale: None });
+    analysis.summary.get("key").and_then(|k| k.get("name")).and_then(Value::as_str).and_then(heard_key)
+}
+
+/// How steady each loop's key is against the bass tracker's typical errors: the key heard again
+/// with some of the bass line's 16ths dropped (notes the tracker misses), and with some moved down
+/// a fifth (the subharmonic it reports instead), `TRIALS` times each (default 20) at rate `RATE`
+/// (default 0.15). Also against a second hearing of the same audio, `HEARD_B` (e.g. another
+/// tracker's, via `score_audio`'s `AUDIO_OUT`). Prints per group and split the keys right, the
+/// share of perturbed hearings that keep the key, and agreement with `HEARD_B`; `VERBOSE` lists
+/// the loops below 90%.
+#[test]
+#[ignore = "needs recordings: HEARD=<run folder>[:<run folder>…] [HEARD_B=…]"]
+fn key_stability() {
+    let Ok(dirs) = std::env::var("HEARD") else { return };
+    let trials: usize = std::env::var("TRIALS").ok().and_then(|t| t.parse().ok()).unwrap_or(20);
+    let rate: f64 = std::env::var("RATE").ok().and_then(|t| t.parse().ok()).unwrap_or(0.15);
+    let verbose = std::env::var("VERBOSE").is_ok();
+    let set = load_set();
+    let a = latest_recordings(&dirs);
+    let b = std::env::var("HEARD_B").ok().map(|d| latest_recordings(&d));
+    // A small deterministic generator, so runs compare.
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut uniform = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    #[derive(Default)]
+    struct Tally {
+        loops: usize,
+        right: usize,
+        kept_drop: usize,
+        kept_fifth: usize,
+        trials: usize,
+        b_loops: usize,
+        b_agree: usize,
+        b_right: usize,
+    }
+    let mut tally: BTreeMap<(String, Split), Tally> = BTreeMap::new();
+    for l in &set {
+        let Some(want) = l.key.as_deref().and_then(expected_key) else { continue };
+        if want == Expect::NoKey {
+            continue;
+        }
+        let Some(rec) = a.get(&l.id) else { continue };
+        let group = match (l.render.is_some(), l.key_source.unwrap_or(KeySource::Loop)) {
+            (true, _) => "rendered",
+            (false, KeySource::Loop) => "pack, own key",
+            (false, KeySource::Kit) => "pack, kit key",
+        };
+        let is_right = |k: Option<Key>| match want {
+            Expect::Key(w) => k == Some(w),
+            Expect::Tonic(t) => k.is_some_and(|k| k.tonic == t),
+            Expect::NoKey => unreachable!(),
+        };
+        let (beats, _) = audio::beats(&rec.beats);
+        let base = key_of(&rec.bars, &beats);
+        let t = tally.entry((group.into(), l.split)).or_default();
+        t.loops += 1;
+        t.right += is_right(base) as usize;
+        let (mut kept_drop, mut kept_fifth) = (0, 0);
+        for _ in 0..trials {
+            let mut dropped = beats.clone();
+            let mut fifth = beats.clone();
+            for (d, f) in dropped.iter_mut().zip(fifth.iter_mut()) {
+                for s in 0..4 {
+                    if d.bass_line[s].is_some() && uniform() < rate {
+                        d.bass_line[s] = None;
+                    }
+                    if let Some(n) = f.bass_line[s].as_mut()
+                        && n.pitch >= 7
+                        && uniform() < rate
+                    {
+                        n.pitch -= 7;
+                    }
+                }
+            }
+            kept_drop += (key_of(&rec.bars, &dropped) == base) as usize;
+            kept_fifth += (key_of(&rec.bars, &fifth) == base) as usize;
+        }
+        t.kept_drop += kept_drop;
+        t.kept_fifth += kept_fifth;
+        t.trials += trials;
+        let other = b.as_ref().and_then(|b| b.get(&l.id)).map(|r| key_of(&r.bars, &audio::beats(&r.beats).0));
+        if let Some(other) = other {
+            t.b_loops += 1;
+            t.b_agree += (other == base) as usize;
+            t.b_right += is_right(other) as usize;
+        }
+        let steady = (kept_drop + kept_fifth) as f64 / (2 * trials) as f64;
+        if verbose && (steady < 0.9 || other.is_some_and(|o| o != base)) {
+            let name = |k: Option<Key>| k.map_or("-".to_owned(), |k| format!("{k:?}"));
+            println!(
+                "{:30} {group:14} want={:10} key={:28} {} drop {:>3.0}% fifth {:>3.0}%{}",
+                l.id,
+                l.key.as_deref().unwrap_or(""),
+                name(base),
+                if is_right(base) { "ok" } else { "  " },
+                100.0 * kept_drop as f64 / trials as f64,
+                100.0 * kept_fifth as f64 / trials as f64,
+                other.map_or(String::new(), |o| format!("  B: {}", name(o))),
+            );
+        }
+    }
+    println!(
+        "\n{:28} {:>5} {:>6} {:>7} {:>7} {:>8} {:>8}",
+        "group (split)", "loops", "right", "drop", "fifth", "B agree", "B right"
+    );
+    let mut all = Tally::default();
+    for ((group, split), t) in &tally {
+        let pct = |n: usize, of: usize| {
+            if of == 0 { "-".to_owned() } else { format!("{:.0}%", 100.0 * n as f64 / of as f64) }
+        };
+        println!(
+            "{:28} {:>5} {:>6} {:>7} {:>7} {:>8} {:>8}",
+            format!("{group} ({split:?})").to_lowercase(),
+            t.loops,
+            t.right,
+            pct(t.kept_drop, t.trials),
+            pct(t.kept_fifth, t.trials),
+            if t.b_loops == 0 { "-".to_owned() } else { format!("{}/{}", t.b_agree, t.b_loops) },
+            if t.b_loops == 0 { "-".to_owned() } else { format!("{}/{}", t.b_right, t.b_loops) },
+        );
+        all.loops += t.loops;
+        all.right += t.right;
+        all.kept_drop += t.kept_drop;
+        all.kept_fifth += t.kept_fifth;
+        all.trials += t.trials;
+        all.b_loops += t.b_loops;
+        all.b_agree += t.b_agree;
+        all.b_right += t.b_right;
+    }
+    let pct = |n: usize, of: usize| format!("{:.0}%", 100.0 * n as f64 / of.max(1) as f64);
+    println!(
+        "{:28} {:>5} {:>6} {:>7} {:>7} {:>8} {:>8}",
+        "ALL",
+        all.loops,
+        all.right,
+        pct(all.kept_drop, all.trials),
+        pct(all.kept_fifth, all.trials),
+        format!("{}/{}", all.b_agree, all.b_loops),
+        format!("{}/{}", all.b_right, all.b_loops)
+    );
+}
+
 /// Key accuracy for a range of weights of the chords' harmonic fit (`key::HARMONY_WEIGHT`), by
 /// group and split: choose on "tune", report "holdout".
 #[test]

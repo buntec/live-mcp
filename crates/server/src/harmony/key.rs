@@ -165,10 +165,7 @@ pub(crate) fn ranking_weighted(
     chords: &[Chord],
     harmony_weight: f32,
 ) -> Option<Vec<(Key, f32)>> {
-    let total: f32 = profile.iter().sum();
-    let max = profile.iter().copied().fold(0.0, f32::max);
-    let present = profile.iter().filter(|w| **w >= PRESENT * max).count();
-    if total.is_nan() || total <= 0.0 || max * 12.0 <= total * 1.0001 || present < MIN_PITCH_CLASSES {
+    if !enough_pitch_classes(profile) {
         return None;
     }
     let mut scored: Vec<(Key, f32)> = Vec::with_capacity(24);
@@ -187,6 +184,14 @@ pub(crate) fn ranking_weighted(
     }
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
     Some(scored)
+}
+
+/// Whether a profile can name a key: not empty, not flat, with enough pitch classes present.
+pub(crate) fn enough_pitch_classes(profile: &[f32; 12]) -> bool {
+    let total: f32 = profile.iter().sum();
+    let max = profile.iter().copied().fold(0.0, f32::max);
+    let present = profile.iter().filter(|w| **w >= PRESENT * max).count();
+    !(total.is_nan() || total <= 0.0 || max * 12.0 <= total * 1.0001 || present < MIN_PITCH_CLASSES)
 }
 
 /// Added to a key's correlation in proportion to the hint's share on its tonic.

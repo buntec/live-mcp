@@ -201,10 +201,27 @@ fn profile<'a>(beats: impl Iterator<Item = &'a Beat>, with_bass: bool) -> [f32; 
 /// than between beats: the tonic tends to sit there, which pitch counts alone do not show.
 const KEY_DOWNBEAT_WEIGHT: f32 = 3.0;
 const KEY_BEAT_WEIGHT: f32 = 1.5;
+/// Share of a beat's bass that is its spectral bass chroma rather than its bass-line notes, for
+/// the key. The tracker misses notes and reports subharmonics (a fifth below) now and then, and
+/// one such 16th, shaped to a whole beat's weight, could tip a close key; the chroma comes from
+/// the spectrum, not the tracker. On the test set, keys held against the tracker's typical errors
+/// and against another tracker's hearing of the same audio far more often, with no fewer right.
+const KEY_SPECTRAL_BASS: f32 = 0.75;
 
 /// The pitch-class profile the key is estimated from: like `profile(_, true)`, but bass-line
-/// notes are weighted by where in the bar they fall.
+/// notes are weighted by where in the bar they fall, and mixed with the bass chroma.
 fn key_profile<'a>(beats: impl Iterator<Item = &'a Beat>, bars: &[BarSpan]) -> [f32; 12] {
+    key_profile_with(beats, bars, KEY_SPECTRAL_BASS)
+}
+
+/// Whether these beats have the pitch content a key needs, judged from the bass line as heard
+/// (without the bass chroma, which a kick spreads over several pitch classes): the chroma only
+/// helps decide which key, not whether there is one.
+fn key_evidence<'a>(beats: impl Iterator<Item = &'a Beat>, bars: &[BarSpan]) -> bool {
+    key::enough_pitch_classes(&key_profile_with(beats, bars, 0.0))
+}
+
+fn key_profile_with<'a>(beats: impl Iterator<Item = &'a Beat>, bars: &[BarSpan], spectral_bass: f32) -> [f32; 12] {
     let mut sum = [0.0f32; 12];
     for beat in beats.filter(|b| b.pitched) {
         let mut line = [0.0f32; 12];
@@ -221,7 +238,12 @@ fn key_profile<'a>(beats: impl Iterator<Item = &'a Beat>, bars: &[BarSpan]) -> [
             }
         }
         let has_line = line.iter().any(|v| *v > 0.0);
-        let bass = if has_line { shape(&line) } else { shape(&beat.bass) };
+        let bass = if has_line {
+            let (line, spectral) = (shape(&line), shape(&beat.bass));
+            std::array::from_fn(|pc| (1.0 - spectral_bass) * line[pc] + spectral_bass * spectral[pc])
+        } else {
+            shape(&beat.bass)
+        };
         let chroma = if beat.bass_only && has_line { bass } else { shape(&beat.chroma) };
         for pc in 0..12 {
             let value = if beat.bass_only { 2.0 * bass[pc] } else { chroma[pc] + bass[pc] };
@@ -323,6 +345,9 @@ fn key_changes(section: &Section, ranges: &[std::ops::Range<usize>], labels: &ch
             let beats: Vec<&Beat> = section.beats[first..last.max(first)].iter().collect();
             let hint = downbeat_bass(beats.iter().copied(), section.bars);
             let chords = heard_chords(section.beats, labels, first..last.max(first));
+            if !key_evidence(beats.iter().copied(), section.bars) {
+                return None;
+            }
             key::estimate_with_harmony(&key_profile(beats.iter().copied(), section.bars), hint.as_ref(), &chords)
                 .map(|e| e.key)
         })
@@ -391,7 +416,9 @@ pub fn analyze(section: &Section) -> Analysis {
     let pitched_beats = beats.iter().filter(|b| b.pitched).count();
     let pitched = pitched_beats > 0;
     let ranges = bar_ranges(beats, section.bars);
-    let enough = pitched_beats >= KEY_MIN_PITCHED && pitched_beats as f32 >= KEY_MIN_PITCHED_SHARE * beats.len() as f32;
+    let enough = pitched_beats >= KEY_MIN_PITCHED
+        && pitched_beats as f32 >= KEY_MIN_PITCHED_SHARE * beats.len() as f32
+        && key_evidence(beats.iter(), section.bars);
     let hint = downbeat_bass(beats.iter(), section.bars);
     let key_weights = key_profile(beats.iter(), section.bars);
     let mut estimate = if enough { key::estimate_with_tonic_hint(&key_weights, hint.as_ref()) } else { None };
