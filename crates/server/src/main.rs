@@ -227,7 +227,7 @@ fn install(options: &Options, user_library: Option<PathBuf>, vst3_dir: Option<Pa
         }
         None => println!(
             "This build doesn't include the LiveMCP Ear plugin, so `listen` won't have anything to hear\n\
-             through. Build with `just build` to include it (see the README)."
+             through. Build with `just build` to include it (see docs/development.md)."
         ),
     }
 
