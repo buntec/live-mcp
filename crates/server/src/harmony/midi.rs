@@ -59,13 +59,13 @@ fn beat(notes: &[MidiNote], index: i64, lo: f64, hi: f64) -> Beat {
         }
     }
     // The bass line: the lowest note sounding just after each 16th starts.
-    for s in 0..4 {
+    for (s, slot) in beat.bass_line.iter_mut().enumerate() {
         let t = index as f64 + s as f64 / 4.0 + 0.01;
         if t < lo || t >= hi {
             continue;
         }
         let lowest = notes.iter().filter(|n| n.start <= t && t < n.start + n.duration).min_by_key(|n| n.pitch);
-        beat.bass_line[s] = lowest.map(|n| BassNote { pitch: n.pitch, cents: 0.0, confidence: 1.0 });
+        *slot = lowest.map(|n| BassNote { pitch: n.pitch, cents: 0.0, confidence: 1.0 });
     }
     beat.weight = beat.chroma.iter().sum();
     beat.pitched = beat.weight > 0.0;
