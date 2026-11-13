@@ -194,7 +194,8 @@ impl LiveServer {
     }
 
     #[tool(
-        description = "Read a clip: name, length, loop and markers, and its MIDI notes. For MIDI clips, `music` \
+        description = "Read a clip: name, length (of the loop when looping), loop and markers, an Arrangement \
+                       clip's start and end on the timeline, and its MIDI notes. For MIDI clips, `music` \
                        reads the notes that play (the loop, or start to end marker) musically: key with confidence, \
                        chord progression (\"N\" = no chord), and per bar the chord(s) with confidence and \
                        alternatives, bass, the lowest notes on the 16th grid (\"bass_line\": note where one \

@@ -196,6 +196,7 @@ const CLIP_FIELDS: &[&str] = &[
     "start_marker",
     "end_marker",
     "start_time",
+    "end_time",
     "signature_numerator",
     "signature_denominator",
 ];
@@ -232,6 +233,7 @@ pub async fn read_clip(live: &Live, params: ReadClipParams) -> Result<Value> {
     }
     if params.arrangement_index.is_some() {
         out["start"] = json!(field_f64(&info, "start_time"));
+        out["end"] = json!(field_f64(&info, "end_time"));
     }
     if field_bool(&info, "is_playing") == Some(true) {
         out["playing"] = json!(true);

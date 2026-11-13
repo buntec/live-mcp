@@ -122,6 +122,18 @@ async fn tracks_and_clips_round_trip() {
     assert_eq!(read["start"], 8.0);
     let s = h.ok("session", json!({"arrangement": true})).await;
     assert_eq!(s["tracks"][0]["arrangement_clips"], json!([{"name": "", "start": 8.0, "length": 8.0}]));
+    // A looping clip with a shorter loop still covers its whole span on the timeline.
+    h.ok("set", json!({"target": "live_set tracks 0 arrangement_clips 0", "prop": "loop_end", "value": 4.0})).await;
+    let s = h.ok("session", json!({"arrangement": true})).await;
+    assert_eq!(
+        s["tracks"][0]["arrangement_clips"],
+        json!([{"name": "", "start": 8.0, "length": 8.0, "loop_length": 4.0}])
+    );
+    let read = h.ok("read_clip", json!({"track": 0, "arrangement_index": 0, "notes": false, "music": false})).await;
+    assert_eq!(
+        (read["start"].clone(), read["end"].clone(), read["length"].clone()),
+        (json!(8.0), json!(16.0), json!(4.0))
+    );
     assert_eq!(s["tracks"][2]["clips"], json!([{"slot": 0, "name": "Groove", "length": 4.0}]));
 
     // Errors come back as tool errors with useful messages.

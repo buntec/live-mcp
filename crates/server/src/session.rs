@@ -10,7 +10,8 @@ use crate::live::{Live, field_bool, field_f64, field_str, get_fields, get_props,
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SessionParams {
-    /// Also list each track's Arrangement View clips.
+    /// Also list each track's Arrangement View clips: start and length on the timeline, plus
+    /// `loop_length` when a looping clip repeats a shorter loop.
     #[serde(default)]
     pub arrangement: bool,
 }
@@ -57,7 +58,7 @@ pub async fn session(live: &Live, params: SessionParams) -> Result<Value> {
         if params.arrangement {
             ops.push(get_fields(
                 &Target::path(format!("live_set tracks {i} arrangement_clips")),
-                &["name", "start_time", "length"],
+                &["name", "start_time", "end_time", "length", "looping"],
             ));
         }
     }
@@ -133,11 +134,21 @@ pub async fn session(live: &Live, params: SessionParams) -> Result<Value> {
                 let arrangement: Vec<Value> = items(&track_parts[i][2])
                     .iter()
                     .map(|c| {
-                        json!({
-                            "name": field_str(c, "name"),
-                            "start": field_f64(c, "start_time"),
-                            "length": field_f64(c, "length"),
-                        })
+                        // A clip's `length` is its loop's length; on the timeline it spans
+                        // start_time to end_time, repeating the loop when it is looping.
+                        let start = field_f64(c, "start_time");
+                        let span = match (start, field_f64(c, "end_time")) {
+                            (Some(s), Some(e)) => Some(e - s),
+                            _ => field_f64(c, "length"),
+                        };
+                        let mut clip = json!({"name": field_str(c, "name"), "start": start, "length": span});
+                        if field_bool(c, "looping") == Some(true)
+                            && let (Some(loop_len), Some(span)) = (field_f64(c, "length"), span)
+                            && (loop_len - span).abs() > 1e-9
+                        {
+                            clip["loop_length"] = json!(loop_len);
+                        }
+                        clip
                     })
                     .collect();
                 entry.insert("arrangement_clips".into(), json!(arrangement));

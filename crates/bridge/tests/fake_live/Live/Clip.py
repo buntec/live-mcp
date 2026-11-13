@@ -41,6 +41,7 @@ class Clip(LiveObject):
     def __init__(self, length, start_time=0.0):
         self._name = ""
         self._length = float(length)
+        self._loop_end = float(length)
         self._start_time = float(start_time)
         self._notes = []
         self._next_id = 1
@@ -59,11 +60,25 @@ class Clip(LiveObject):
         if changed:
             self._notify("name")
 
-    length = property(lambda self: (guard(), self._length)[1])
+    # Like Live, `length` is the loop's length; an Arrangement clip's span on the
+    # timeline (start_time to end_time) stays put when its loop is shortened.
+    length = property(lambda self: (guard(), self._loop_end)[1])
     start_time = property(lambda self: (guard(), self._start_time)[1])
     end_time = property(lambda self: (guard(), self._start_time + self._length)[1])
     loop_start = property(lambda self: (guard(), 0.0)[1])
-    loop_end = property(lambda self: (guard(), self._length)[1])
+
+    @property
+    def loop_end(self):
+        guard()
+        return self._loop_end
+
+    @loop_end.setter
+    def loop_end(self, value):
+        guard()
+        if not 0 < value <= self._length:
+            raise ValueError("loop_end out of range")
+        self._loop_end = float(value)
+
     start_marker = property(lambda self: (guard(), 0.0)[1])
     end_marker = property(lambda self: (guard(), self._length)[1])
     looping = property(lambda self: (guard(), True)[1])
