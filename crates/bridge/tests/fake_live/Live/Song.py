@@ -272,6 +272,7 @@ class Song(LiveObject):
     def __init__(self):
         self._tracks = [Track("1-MIDI"), Track("2-Audio", is_midi=False)]
         self._tracks[0]._devices.append(Device.instrument("Drift"))
+        self._tracks[0]._devices[0]._parameters[1]._automation_state = 1  # Filter Freq
         self._return_tracks = [Track("A-Reverb", is_midi=False, kind="return")]
         self._return_tracks[0]._devices.append(Device.effect("Reverb"))
         self._master_track = Track("Main", is_midi=False, kind="master")

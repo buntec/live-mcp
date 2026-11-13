@@ -173,7 +173,10 @@ impl LiveServer {
 
     #[tool(
         description = "Overview of the Live set: tempo, time signature, transport, loop, tracks (kind, mute/solo/arm, \
-                       devices, Session clips), return tracks, master devices and scenes.",
+                       devices, Session clips), return tracks, master devices and scenes. `automated` lists \
+                       parameters with Arrangement automation (\"Device: Parameter\", or \"Mixer: ...\"; devices \
+                       inside Racks are not checked). Live's API cannot read or move those curves, so moving \
+                       or rewriting notes leaves them where they are.",
         annotations(read_only_hint = true)
     )]
     async fn session(&self, Parameters(p): Parameters<SessionParams>) -> ToolResult {
@@ -226,7 +229,8 @@ impl LiveServer {
 
     #[tool(
         description = "List a device's parameters with values, ranges or options, and display strings; for a Rack, also its \
-                       chains and their devices.",
+                       chains and their devices. `automation` marks a parameter with Arrangement automation: \
+                       \"automated\", or \"overridden\" after a manual change until automation is re-enabled.",
         annotations(read_only_hint = true)
     )]
     async fn device_parameters(&self, Parameters(p): Parameters<DeviceParametersParams>) -> ToolResult {

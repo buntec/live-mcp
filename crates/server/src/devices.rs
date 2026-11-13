@@ -99,7 +99,8 @@ pub struct DeviceParametersParams {
     pub query: Option<String>,
 }
 
-const PARAM_FIELDS: &[&str] = &["name", "value", "min", "max", "is_quantized", "value_items", "is_enabled"];
+const PARAM_FIELDS: &[&str] =
+    &["name", "value", "min", "max", "is_quantized", "value_items", "is_enabled", "automation_state"];
 
 pub async fn device_parameters(live: &Live, params: DeviceParametersParams) -> Result<Value> {
     let track = params.track.resolve(live).await?;
@@ -133,6 +134,16 @@ pub async fn device_parameters(live: &Live, params: DeviceParametersParams) -> R
             }
             if field_bool(p, "is_enabled") == Some(false) {
                 entry.insert("enabled".into(), json!(false));
+            }
+            // Arrangement automation: 1 plays it, 2 is overridden by a manual change until re-enabled.
+            match field(p, "automation_state").and_then(Value::as_i64) {
+                Some(1) => {
+                    entry.insert("automation".into(), json!("automated"));
+                }
+                Some(2) => {
+                    entry.insert("automation".into(), json!("overridden"));
+                }
+                _ => {}
             }
             if field_bool(p, "is_quantized") == Some(true) {
                 entry.insert("options".into(), field(p, "value_items").cloned().unwrap_or_default());

@@ -1,12 +1,12 @@
 //! `session`: an overview of the whole Live set in three batched requests.
 
 use anyhow::Result;
-use live_mcp_protocol::Target;
+use live_mcp_protocol::{BatchOp, Target};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::live::{Live, field_bool, field_f64, field_str, get_fields, get_props, items};
+use crate::live::{Live, field, field_bool, field_f64, field_str, get_fields, get_props, items};
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SessionParams {
@@ -108,6 +108,31 @@ pub async fn session(live: &Live, params: SessionParams) -> Result<Value> {
     }
 
     let names = |list: &Value| -> Vec<String> { items(list).iter().map(|d| field_str(d, "name").to_owned()).collect() };
+
+    // Fourth pass: which parameters have Arrangement automation (Live's API can't read the curves).
+    let master_device_names = master_devices.map(|d| names(&d)).unwrap_or_default();
+    let mut owners: Vec<(String, Vec<String>, bool)> = Vec::new();
+    for (i, parts) in track_parts.iter().enumerate() {
+        owners.push((format!("live_set tracks {i}"), names(&parts[0]), false));
+    }
+    for (r, devices) in return_devices.iter().enumerate() {
+        owners.push((format!("live_set return_tracks {r}"), names(devices), false));
+    }
+    owners.push(("live_set master_track".to_owned(), master_device_names.clone(), true));
+    let mut ops = Vec::new();
+    let mut counts = Vec::new();
+    for (path, devices, master) in &owners {
+        let owner_ops = automation_ops(path, devices.len(), *master);
+        counts.push(owner_ops.len());
+        ops.extend(owner_ops);
+    }
+    let mut results = live.batch_lenient(ops).await?.into_iter().map(|r| r.unwrap_or_default());
+    let mut automation: Vec<Vec<String>> = owners
+        .iter()
+        .zip(counts)
+        .map(|((_, devices, _), n)| automated(&results.by_ref().take(n).collect::<Vec<_>>(), devices))
+        .collect();
+    let master_automation = automation.pop().unwrap_or_default();
     let tracks_out: Vec<Value> = tracks
         .iter()
         .enumerate()
@@ -130,6 +155,9 @@ pub async fn session(live: &Live, params: SessionParams) -> Result<Value> {
             }
             entry.insert("devices".into(), json!(names(&track_parts[i][0])));
             entry.insert("clips".into(), Value::Array(std::mem::take(&mut clips_by_track[i])));
+            if !automation[i].is_empty() {
+                entry.insert("automated".into(), json!(automation[i]));
+            }
             if params.arrangement {
                 let arrangement: Vec<Value> = items(&track_parts[i][2])
                     .iter()
@@ -159,9 +187,20 @@ pub async fn session(live: &Live, params: SessionParams) -> Result<Value> {
     let returns_out: Vec<Value> = returns
         .iter()
         .enumerate()
-        .map(|(r, t)| json!({"index": r, "name": field_str(t, "name"), "devices": names(&return_devices[r])}))
+        .map(|(r, t)| {
+            let mut entry = json!({"index": r, "name": field_str(t, "name"), "devices": names(&return_devices[r])});
+            if let Some(list) = automation.get(tracks.len() + r).filter(|l| !l.is_empty()) {
+                entry["automated"] = json!(list);
+            }
+            entry
+        })
         .collect();
     let scenes_out: Vec<String> = scenes.map(|s| names(&s)).unwrap_or_default();
+
+    let mut master_out = json!({"devices": master_device_names});
+    if !master_automation.is_empty() {
+        master_out["automated"] = json!(master_automation);
+    }
 
     let num = song_props["signature_numerator"].as_i64().unwrap_or(4);
     let den = song_props["signature_denominator"].as_i64().unwrap_or(4);
@@ -173,9 +212,47 @@ pub async fn session(live: &Live, params: SessionParams) -> Result<Value> {
         "loop": {"enabled": song_props["loop"], "start": song_props["loop_start"], "length": song_props["loop_length"]},
         "tracks": tracks_out,
         "returns": returns_out,
-        "master": {"devices": master_devices.map(|d| names(&d)).unwrap_or_default()},
+        "master": master_out,
         "scenes": scenes_out,
     }))
+}
+
+/// Reads of the parameters `session` checks for automation on one track: each of its devices'
+/// own parameters (not those of devices inside Racks), then the mixer's.
+fn automation_ops(path: &str, devices: usize, master: bool) -> Vec<BatchOp> {
+    const FIELDS: &[&str] = &["name", "automation_state"];
+    let mut ops: Vec<BatchOp> =
+        (0..devices).map(|d| get_fields(&Target::path(format!("{path} devices {d} parameters")), FIELDS)).collect();
+    let mixer: &[&str] = if master {
+        &["volume", "panning", "song_tempo", "crossfader", "cue_volume"]
+    } else {
+        &["volume", "panning", "sends", "track_activator"]
+    };
+    ops.extend(mixer.iter().map(|m| get_fields(&Target::path(format!("{path} mixer_device {m}")), FIELDS)));
+    ops
+}
+
+/// The automated parameters in the results of `automation_ops`, as "Device: Parameter", marked
+/// "(overridden)" when a manual change has switched the automation off until it is re-enabled.
+fn automated(results: &[Value], devices: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, result) in results.iter().enumerate() {
+        let owner = devices.get(i).map_or("Mixer", String::as_str);
+        let params: Vec<&Value> = match result {
+            Value::Array(list) => list.iter().collect(),
+            Value::Object(_) => vec![result],
+            _ => Vec::new(),
+        };
+        for p in params {
+            let name = field_str(p, "name");
+            match field(p, "automation_state").and_then(Value::as_i64) {
+                Some(1) => out.push(format!("{owner}: {name}")),
+                Some(2) => out.push(format!("{owner}: {name} (overridden)")),
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// Beats per bar for the set's time signature.

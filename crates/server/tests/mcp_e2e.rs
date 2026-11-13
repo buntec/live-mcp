@@ -57,7 +57,10 @@ async fn session_overview() {
     assert_eq!(s["time_signature"], "4/4");
     assert_eq!(
         s["tracks"][0],
-        json!({"index": 0, "name": "1-MIDI", "kind": "midi", "devices": ["Drift"], "clips": []})
+        json!({
+            "index": 0, "name": "1-MIDI", "kind": "midi", "devices": ["Drift"], "clips": [],
+            "automated": ["Drift: Filter Freq"]
+        })
     );
     assert_eq!(s["tracks"][1]["kind"], "audio");
     assert_eq!(s["returns"], json!([{"index": 0, "name": "A-Reverb", "devices": ["Reverb"]}]));
@@ -182,8 +185,12 @@ async fn device_parameters_and_setting_them() {
     let list = params["parameters"].as_array().unwrap();
     assert_eq!(
         list[1],
-        json!({"index": 1, "name": "Filter Freq", "value": 0.5, "display": "0.50 kHz", "min": 0.0, "max": 1.0})
+        json!({
+            "index": 1, "name": "Filter Freq", "value": 0.5, "display": "0.50 kHz", "automation": "automated",
+            "min": 0.0, "max": 1.0
+        })
     );
+    assert!(list[2].get("automation").is_none());
     assert_eq!(list[2]["options"], json!(["Sine", "Saw", "Square"]));
 
     let filtered = h.ok("device_parameters", json!({"track": 0, "device": 0, "query": "osc"})).await;
@@ -195,6 +202,14 @@ async fn device_parameters_and_setting_them() {
 
     let set = h.ok("set_parameter", json!({"track": 0, "device": 0, "parameter": "Filter Freq", "value": 0.8})).await;
     assert_eq!(set["display"], "0.80 kHz");
+    // Changing an automated parameter overrides its automation until it is re-enabled.
+    let now = h.ok("device_parameters", json!({"track": 0, "device": 0, "query": "filter"})).await;
+    assert_eq!(now["parameters"][0]["automation"], "overridden");
+    let s = h.ok("session", json!({})).await;
+    assert_eq!(s["tracks"][0]["automated"], json!(["Drift: Filter Freq (overridden)"]));
+    h.ok("call", json!({"target": "live_set tracks 0 devices 0 parameters 1", "method": "re_enable_automation"})).await;
+    let s = h.ok("session", json!({})).await;
+    assert_eq!(s["tracks"][0]["automated"], json!(["Drift: Filter Freq"]));
     let set = h.ok("set_parameter", json!({"track": 0, "device": "Drift", "parameter": 2, "value": "saw"})).await;
     assert_eq!((set["value"].clone(), set["display"].clone()), (json!(1.0), json!("Saw")));
     let e = h.err("set_parameter", json!({"track": 0, "device": 0, "parameter": 1, "value": 3})).await;

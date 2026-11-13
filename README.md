@@ -52,7 +52,7 @@ Each client starts its own server, and only the first one gets the Ear port, so
 
 | Tool                                      | What it does                                                                  |
 | ----------------------------------------- | ----------------------------------------------------------------------------- |
-| `session`                                 | Overview: tempo, transport, tracks with devices and clips, returns, scenes    |
+| `session`                                 | Overview: tempo, transport, tracks with devices, clips and automation, scenes |
 | `create_track`                            | New MIDI, audio or return track                                               |
 | `write_clip`, `read_clip`                 | MIDI notes in Session slots or on the Arrangement timeline                    |
 | `browser`, `load_device`                  | List or search Live's browser, load an item onto a track                      |

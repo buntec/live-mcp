@@ -12,6 +12,8 @@ class DeviceParameter(LiveObject):
         self._items = tuple(items or ())
         self._unit = unit
         self._enabled = True  # Live disables a parameter that a macro is mapped to
+        # Arrangement automation: 0 none, 1 playing, 2 overridden by a manual change.
+        self._automation_state = 0
 
     name = property(lambda self: (guard(), self._name)[1])
     min = property(lambda self: (guard(), self._min)[1])
@@ -19,6 +21,7 @@ class DeviceParameter(LiveObject):
     is_quantized = property(lambda self: (guard(), bool(self._items))[1])
     value_items = property(lambda self: (guard(), self._items)[1])
     is_enabled = property(lambda self: (guard(), self._enabled)[1])
+    automation_state = property(lambda self: (guard(), self._automation_state)[1])
 
     @property
     def value(self):
@@ -34,6 +37,13 @@ class DeviceParameter(LiveObject):
         if not self._min <= value <= self._max:
             raise ValueError("Invalid value")
         self._value = value
+        if self._automation_state == 1:
+            self._automation_state = 2
+
+    def re_enable_automation(self):
+        guard()
+        if self._automation_state == 2:
+            self._automation_state = 1
 
     def str_for_value(self, value):
         guard()
